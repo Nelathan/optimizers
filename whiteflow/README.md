@@ -277,7 +277,7 @@ For massive layers like LLaMA 70B MLP (28672×8192):
 
 ### Minimum Viable Product (MVP)
 - ✅ Memory usage ≤ 1.5x Adam (vs 2x SPlus)
-- ✅ Convergence speed ≥ 0.8x Adam by step 100  
+- ✅ Convergence speed ≥ 0.8x Adam by step 100
 - ✅ No training instabilities over 1000 steps
 - ✅ Implementation runs without errors
 
