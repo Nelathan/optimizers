@@ -388,7 +388,7 @@ class FactoredEMA:
 # -------------------- Optimizer --------------------
 
 
-class HybridMuonAdaFactorBS1(Optimizer):
+class StellaStiefel(Optimizer):
     """
     Hybrid optimizer for bs=1 full finetuning (compile-friendly).
     - 2D "hidden" weights: Muon update with Newton–Schulz preconditioning via factored AdaFactor.
@@ -414,6 +414,7 @@ class HybridMuonAdaFactorBS1(Optimizer):
         wd_other: float = 2e-3,  # decoupled WD for fallback group
         stochastic_bf16: bool = True,
         compile_loops: bool = True,
+        metrics_enabled: bool = False,
     ):
         # Optional per-head meta for attention params
         self.attn_head_meta: Dict[int, Dict[str, int]] = {}
@@ -487,6 +488,10 @@ class HybridMuonAdaFactorBS1(Optimizer):
         # Step index
         self.step_idx = torch.zeros((), dtype=torch.long)
 
+        # Optional lightweight metrics (off by default)
+        self.metrics_enabled = metrics_enabled
+        self.last_metrics: Dict[str, Dict[str, float]] = {}
+
         # Optionally compile loops
         if compile_loops:
             self._step_muonable_impl = torch.compile(
@@ -501,6 +506,15 @@ class HybridMuonAdaFactorBS1(Optimizer):
     @torch.no_grad()
     def _step_muonable_impl(self):
         step = int(self.step_idx.item())
+
+        # Metrics accumulators (CPU floats; only used when not compiled)
+        collect_metrics = self.metrics_enabled and (not self._compiled_loops)
+        if collect_metrics:
+            preclip_sq_sum = 0.0
+            preclip_count = 0
+            resid_num = 0.0
+            resid_den = 0.0
+
         for group in self.param_groups:
             if group.get("name") != "muonable":
                 continue
@@ -523,23 +537,36 @@ class HybridMuonAdaFactorBS1(Optimizer):
                     out_f = int(meta["out_features"])
 
                     if proj in ("q", "k", "v"):
-                        # [H, R=hd, C=in_f]
-                        g_head = g32.view(nh, hd, in_f)
+                        g_head = g32.view(nh, hd, in_f)  # [H, R=hd, C=in_f]
                     else:
-                        # o-proj: [H, R=out_f, C=hd]
-                        g_head = g32.view(out_f, nh, hd).permute(1, 0, 2)
+                        g_head = g32.view(out_f, nh, hd).permute(
+                            1, 0, 2
+                        )  # [H, R=out_f, C=hd]
 
                     denom_inv = self.af_factored.denom_inv_headwise(p, g_head, step)
-                    g_pre_head = g_head * denom_inv
+                    g_pre_head = g_head * denom_inv  # unclipped preconditioned grad
 
+                    # Metrics: pre-clip RMS (cheap, one reduction)
+                    if collect_metrics:
+                        preclip_sq_sum += float(g_pre_head.pow(2).sum().item())
+                        preclip_count += g_pre_head.numel()
+
+                    # Optional RMS clip (in-place scale)
                     if self.clip_update_rms is not None:
                         rms = g_pre_head.pow(2).mean().sqrt()
                         if rms > self.clip_update_rms:
                             g_pre_head.mul_(self.clip_update_rms / (rms + 1e-12))
 
+                    # NS on (possibly clipped) g_pre_head
                     update_head = _zeropower_via_newtonschulz_batched(
                         g_pre_head, self.ns_coefficients, self.ns_steps, self.eps
                     )
+
+                    # Metrics: orth residual on actual NS input (post-clip)
+                    if collect_metrics:
+                        diff = (update_head - g_pre_head).float()
+                        resid_num += float(diff.pow(2).sum().item())
+                        resid_den += float(g_pre_head.float().pow(2).sum().item())
 
                     if proj in ("q", "k", "v"):
                         update = update_head.reshape(nh * hd, in_f)
@@ -549,17 +576,29 @@ class HybridMuonAdaFactorBS1(Optimizer):
                 else:
                     # Tensor-wise path (MLP)
                     denom_inv = self.af_factored.denom_inv(p, g32, step)
-                    g_pre = g32 * denom_inv
+                    g_pre = g32 * denom_inv  # unclipped preconditioned grad
 
+                    # Metrics: pre-clip RMS
+                    if collect_metrics:
+                        preclip_sq_sum += float(g_pre.pow(2).sum().item())
+                        preclip_count += g_pre.numel()
+
+                    # Optional RMS clip
                     if self.clip_update_rms is not None:
                         rms = g_pre.pow(2).mean().sqrt()
                         if rms > self.clip_update_rms:
                             g_pre.mul_(self.clip_update_rms / (rms + 1e-12))
 
-                    # Call batched NS on 2D
+                    # NS on (possibly clipped) g_pre
                     update = _zeropower_via_newtonschulz_batched(
                         g_pre, self.ns_coefficients, self.ns_steps, self.eps
                     )
+
+                    # Metrics: orth residual
+                    if collect_metrics:
+                        diff = (update - g_pre).float()
+                        resid_num += float(diff.pow(2).sum().item())
+                        resid_den += float(g_pre.float().pow(2).sum().item())
 
                 adjusted_lr = _adjust_lr(lr, self.adjust_lr_fn, p.shape)
                 if p.dtype == torch.bfloat16 and self.stochastic_bf16:
@@ -567,6 +606,17 @@ class HybridMuonAdaFactorBS1(Optimizer):
                     p.copy_(to_bf16_stochastic_in_graph(x))
                 else:
                     p.add_(update, alpha=-adjusted_lr)
+
+        # Finalize metrics
+        if collect_metrics and preclip_count > 0 and resid_den > 0.0:
+            rms_pre = (preclip_sq_sum / preclip_count) ** 0.5
+            orth_resid = (resid_num / resid_den) ** 0.5
+            self.last_metrics = {
+                "muonable": {
+                    "rms_pre": float(rms_pre),
+                    "orth_residual": float(orth_resid),
+                }
+            }
 
     @torch.no_grad()
     def _step_fallback_impl(self):
@@ -618,6 +668,12 @@ class HybridMuonAdaFactorBS1(Optimizer):
                     p.addcdiv_(m, denom, value=-step_size)
 
     # ---------- public API ----------
+
+    def set_step(self, step: int) -> None:
+        self.step_idx.fill_(int(step))
+
+    def get_step(self) -> int:
+        return int(self.step_idx.item())
 
     @torch.no_grad()
     def step(self, closure=None):

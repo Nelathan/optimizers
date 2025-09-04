@@ -15,7 +15,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
     Adafactor,
 )
-from .hybrid_muon_adafactor_bs1 import HybridMuonAdaFactorBS1
+from .hybrid_muon_adafactor_bs1 import StellaStiefel
 
 # ------------------- CONFIG -------------------
 MODEL_ID = "Qwen/Qwen3-0.6B"

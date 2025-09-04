@@ -1,7 +1,7 @@
 # test.py
 import torch
 import torch.nn as nn
-from .hybrid_muon_adafactor_bs1 import HybridMuonAdaFactorBS1
+from .hybrid_muon_adafactor_bs1 import StellaStiefel
 
 # Enable TF32 fast math on matmul and cuDNN (Ampere+)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -70,7 +70,7 @@ def main():
 
     named_params = [(n, p) for n, p in model.named_parameters()]
     # Build optimizer; pass model to collect attention head meta
-    opt = HybridMuonAdaFactorBS1(
+    opt = StellaStiefel(
         named_params,
         model=model,
         lr_hidden=1e-5,

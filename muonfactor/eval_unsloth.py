@@ -5,7 +5,7 @@ from unsloth import FastLanguageModel, get_chat_template
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from .data_utils import get_sugarquill
-from .hybrid_muon_adafactor_bs1 import HybridMuonAdaFactorBS1
+from .hybrid_muon_adafactor_bs1 import StellaStiefel
 
 # ------------------- CONFIG -------------------
 MODEL_ID = "Qwen/Qwen3-0.6B"
@@ -92,7 +92,7 @@ args = SFTConfig(
     save_total_limit=1,
 )
 
-opt = HybridMuonAdaFactorBS1(
+opt = StellaStiefel(
     model.named_parameters(),
     lr_hidden=5e-4,
     lr_other_scale=0.5,
