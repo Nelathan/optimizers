@@ -31,7 +31,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Support left-basis projection for `m < n`.
 - [x] Clamp rank to valid matrix dimensions.
 - [x] Initialize basis with exact SVD.
-- [ ] Add random orthogonal initialization for performance/algo-path measurement.
+- [x] Add random orthogonal initialization for performance/algo-path measurement.
 - [x] Implement `project()` and `project_back()` shape tests.
 - [x] Test basis orthonormality after initialization.
 - [x] Test dtype/device preservation.
@@ -53,7 +53,8 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Fallback path: update non-2D params with local AdamW baseline.
 - [x] Add config for `rank=32`, `beta`, `recovery_scale`, `orthogonalization`, and refresh scheduling.
 - [x] Implement exact-SVD orthogonalization inside projected space for correctness mode.
-- [ ] Implement HeavyBall Newton-Schulz/polar orthogonalization for speed mode.
+- [x] Wire HeavyBall Newton-Schulz/polar orthogonalization for eager experiments.
+- [ ] Integrate HeavyBall Newton-Schulz/polar orthogonalization without disabling compile.
 - [ ] Add optional Nesterov projected momentum.
 - [x] Add optional perpendicular gradient recovery.
 - [x] Verify state dict save/load round trip.
@@ -79,7 +80,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 ## Phase 6: performance work
 
 - [x] Count profiler CUDA events for a representative optimizer step.
-- [ ] Profile exact SVD orthogonalization vs Newton-Schulz/polar.
+- [ ] Profile exact SVD orthogonalization vs compiled HeavyBall Newton-Schulz/polar.
 - [ ] Bucket same-shape projected moments for batched NS.
 - [ ] Investigate bucketing refreshed modules by shape for batched `eigh`/SVD if refresh spikes matter.
 - [ ] Measure whether round-robin refresh makes batched decompositions unnecessary.
@@ -90,19 +91,21 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 - [x] Tiny linear regression sanity check.
 - [x] Cached pretrained-LLM SYNTH smoke test.
-- [ ] Update LLM SYNTH smoke to train all non-embedding 2D matrices by default.
+- [x] Update LLM SYNTH smoke to train all non-embedding 2D matrices by default.
 - [ ] Add full-parameter post-training mode that trains embeddings and non-2D fallback params explicitly.
-- [ ] Exclude or separately account for tiny 3D conv/linear-attention kernels.
-- [ ] Measure only post-warmup steps for short no-compile runs.
+- [x] Exclude or separately account for tiny 3D conv/linear-attention kernels.
+- [x] Add warmup/measurement split for no-compile smoke runs.
 - [ ] Tiny MLP classification sanity check.
 - [ ] Tiny transformer language-modeling smoke test.
+- [x] Compare against torch AdamW as an infeasible quality anchor on LFM matrix scope.
 - [ ] Compare against HeavyBall AdamW, Muon, PSGDLRA, and possibly SOAP if memory allows.
 - [ ] Measure peak VRAM, optimizer state bytes, tokens/sec, and loss curves.
 - [ ] Test rank `16`, `32`, `64`.
-- [ ] Test rank `64`, `128`, `256` on cached pretrained-LLM SYNTH/post-training smoke.
+- [x] Test rank `64`, `128`, `256` on cached pretrained-LLM SYNTH/post-training smoke.
 - [ ] Test refresh budget `1`, `2`, `4`.
 - [ ] Test recovery scale `0`, `0.1`, `0.25`, `0.5`, `1.0`.
-- [ ] Test orthogonalization `svd` vs `newtonschulz`.
+- [x] Test orthogonalization `svd` vs `none` for SUMO-vs-SubTrack ablation.
+- [ ] Test compiled HeavyBall `newtonschulz` / `thinky_polar_express` orthogonalization.
 - [ ] Test freshly initialized attention module with rest frozen.
 
 ## Phase 8: projected-gradient hooks, later and dangerous

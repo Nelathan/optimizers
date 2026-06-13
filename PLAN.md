@@ -107,6 +107,10 @@ Given the measured state sizes, rank `32` is a conservative default rather than 
 
 Performance smoke tests should use random orthogonal subspace initialization so timing measures the optimizer path rather than a wall of first-step SVDs. Convergence-quality comparisons should use SVD initialization explicitly, because good initialization is part of the algorithmic question. Do not time cold-start SVD as representative steady-state performance.
 
+Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In a rank-64, SVD-init, non-embedding-matrix LFM run, orthogonalized `SubspaceMuon` at HeavyBall's Muon-scale default LR (`0.0025`) beat the no-orthogonalization projected-momentum ablation even after a no-ortho LR probe. Treat this as positive directional evidence, not final optimizer proof.
+
+AdamW is a quality anchor, not a target budget. Full 2x-fp32 optimizer state is outside the intended feasibility envelope; the product goal is to make broad/full fine-tuning possible on consumer GPUs where users would otherwise retreat to memory-frugal LoRA/Unsloth-style paths. Compare against AdamW to understand quality, but do not let AdamW's state budget define success.
+
 Short LLM tests should use a real pretrained model and local SYNTH shards, not toy newborn models. `LiquidAI/LFM2.5-1.2B-Base` is the current practical default on this box. Train broad parameter scopes for actual post-training behavior; one-layer attention-only tests are useful only for plumbing and are not meaningful state-size evidence.
 
 For now, ignore 3D convolution/linear-attention kernels in the matrix path. They are small compared with projection and MLP matrices: LFM's conv kernels are `[2048, 1, 3]`, while Qwen3.5's linear-attention conv kernels are `[6144, 1, 4]`. The 2D matrices carry the memory and geometry story.
@@ -129,9 +133,11 @@ Likely performance ladder:
 
 1. Correct eager implementation.
 2. Use HeavyBall chainable transforms enough to inherit ECC/update behavior.
-3. Replace exact SVD orthogonalization with Newton-Schulz/polar for the hot path.
+3. Replace exact SVD orthogonalization with HeavyBall Newton-Schulz/polar for the hot path, checking HeavyBall's PolarExpress mode rather than inventing a local substitute.
 4. Bucket same-shape projected moments for batched NS or batched eig/SVD where useful.
 5. Only then consider invasive autograd tricks.
+
+Orthogonalization and LR are coupled. Muon-style orthogonalized updates can want LR scales far above classic LLM AdamW defaults; use HeavyBall defaults as the first prior and tune around them. Equal LR comparisons between no-ortho projected momentum and orthogonalized projected momentum are diagnostic but not final fairness.
 
 ## Future memory frontier: projected activations
 
