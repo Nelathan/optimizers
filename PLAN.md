@@ -105,6 +105,12 @@ Short fresh-initialization tests are a poor primary signal for this optimizer fa
 
 Given the measured state sizes, rank `32` is a conservative default rather than a ceiling. Real evaluations should include rank `64`, `128`, and possibly larger ranks before concluding that the subspace is too restrictive. Grassmann refresh should be the preferred baseline path because it is faster than repeated exact SVD refresh and gives a stable basis update target for later ECC integration.
 
+Performance smoke tests should use random orthogonal subspace initialization so timing measures the optimizer path rather than a wall of first-step SVDs. Convergence-quality comparisons should use SVD initialization explicitly, because good initialization is part of the algorithmic question. Do not time cold-start SVD as representative steady-state performance.
+
+Short LLM tests should use a real pretrained model and local SYNTH shards, not toy newborn models. `LiquidAI/LFM2.5-1.2B-Base` is the current practical default on this box. Train broad parameter scopes for actual post-training behavior; one-layer attention-only tests are useful only for plumbing and are not meaningful state-size evidence.
+
+For now, ignore 3D convolution/linear-attention kernels in the matrix path. They are small compared with projection and MLP matrices: LFM's conv kernels are `[2048, 1, 3]`, while Qwen3.5's linear-attention conv kernels are `[6144, 1, 4]`. The 2D matrices carry the memory and geometry story.
+
 The SubTrack update must be adapted carefully:
 
 - no hard-coded CUDA device strings,

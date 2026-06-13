@@ -31,7 +31,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Support left-basis projection for `m < n`.
 - [x] Clamp rank to valid matrix dimensions.
 - [x] Initialize basis with exact SVD.
-- [ ] Add random orthogonal initialization as an option for ablation.
+- [ ] Add random orthogonal initialization for performance/algo-path measurement.
 - [x] Implement `project()` and `project_back()` shape tests.
 - [x] Test basis orthonormality after initialization.
 - [x] Test dtype/device preservation.
@@ -90,6 +90,10 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 - [x] Tiny linear regression sanity check.
 - [x] Cached pretrained-LLM SYNTH smoke test.
+- [ ] Update LLM SYNTH smoke to train all non-embedding 2D matrices by default.
+- [ ] Add full-parameter post-training mode that trains embeddings and non-2D fallback params explicitly.
+- [ ] Exclude or separately account for tiny 3D conv/linear-attention kernels.
+- [ ] Measure only post-warmup steps for short no-compile runs.
 - [ ] Tiny MLP classification sanity check.
 - [ ] Tiny transformer language-modeling smoke test.
 - [ ] Compare against HeavyBall AdamW, Muon, PSGDLRA, and possibly SOAP if memory allows.
