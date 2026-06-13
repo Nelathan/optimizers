@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "Collection of optimizer ideas"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["torch", "torchvision", "heavyball"]
+dependencies = [
+    "torch",
+    "torchvision",
+    "heavyball",
+    "transformers>=5.12.0",
+    "pyarrow>=24.0.0",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

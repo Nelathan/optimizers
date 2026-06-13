@@ -101,6 +101,10 @@ If the target interval is shorter than the number of eligible modules, overlappi
 
 The Grassmannian update is expected to be central, not decorative. Full SVD refresh is acceptable as a baseline and for initialization, but a good SUMOTrack implementation should prefer SubTrack-style geometry-aware tracking once the shape/state machinery is correct.
 
+Short fresh-initialization tests are a poor primary signal for this optimizer family. Subspace methods can spend the first few thousand steps learning an unhelpful subspace; SubTrack's case is long-range pretraining efficiency, while SUMOTrack's likely advantage is mid-training / post-training stability and reduced forgetting under constrained optimizer state. Treat early toy-regression underperformance as expected unless it reveals a state-shape, numerical, or stability bug.
+
+Given the measured state sizes, rank `32` is a conservative default rather than a ceiling. Real evaluations should include rank `64`, `128`, and possibly larger ranks before concluding that the subspace is too restrictive. Grassmann refresh should be the preferred baseline path because it is faster than repeated exact SVD refresh and gives a stable basis update target for later ECC integration.
+
 The SubTrack update must be adapted carefully:
 
 - no hard-coded CUDA device strings,
@@ -140,7 +144,7 @@ The safe sequence is:
 
 SUMOTrack v1 is worth continuing if it can show:
 
-- stable loss descent on tiny regression and tiny transformer tests,
+- stable loss behavior on short cached pretrained-LLM SYNTH/post-training tests,
 - lower optimizer-state memory than AdamW for matrix-heavy models,
 - credible convergence versus HeavyBall AdamW, Muon, and PSGDLRA,
 - no accidental full-size matrix moments on the matrix path,

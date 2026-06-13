@@ -89,11 +89,13 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 ## Phase 7: experiments
 
 - [x] Tiny linear regression sanity check.
+- [x] Cached pretrained-LLM SYNTH smoke test.
 - [ ] Tiny MLP classification sanity check.
 - [ ] Tiny transformer language-modeling smoke test.
 - [ ] Compare against HeavyBall AdamW, Muon, PSGDLRA, and possibly SOAP if memory allows.
 - [ ] Measure peak VRAM, optimizer state bytes, tokens/sec, and loss curves.
 - [ ] Test rank `16`, `32`, `64`.
+- [ ] Test rank `64`, `128`, `256` on cached pretrained-LLM SYNTH/post-training smoke.
 - [ ] Test refresh budget `1`, `2`, `4`.
 - [ ] Test recovery scale `0`, `0.1`, `0.25`, `0.5`, `1.0`.
 - [ ] Test orthogonalization `svd` vs `newtonschulz`.
