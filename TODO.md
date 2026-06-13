@@ -1,6 +1,6 @@
-# SUMOTrack TODO
+# SumoTrack TODO
 
-This is the next-iteration queue for SUMOTrack / `SubspaceMuon`. Prefer small falsifiable cuts over heroic optimizer theatre.
+This is the next-iteration queue for SumoTrack. Prefer small falsifiable cuts over heroic optimizer theatre.
 
 ## Gates before advancing
 
@@ -8,7 +8,7 @@ Progression is gated by evidence, not by vibes or a locally attractive diff. Eac
 
 - [x] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
 - [x] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
-- [x] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
+- [x] **Optimizer state gate:** `SumoTrack.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [x] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
 - [x] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
 - [x] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
@@ -20,7 +20,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 - [x] Add an editable HeavyBall path dependency in `pyproject.toml`.
 - [x] Create the `sumotrack/` package.
-- [x] Export `SubspaceMuon` from `sumotrack/__init__.py`.
+- [x] Export `SumoTrack` from `sumotrack/__init__.py`.
 - [x] Add a minimal smoke script under `experiments/`.
 - [x] Add a tiny test harness that can run without downloading a large model.
 
@@ -48,7 +48,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Phase 3: minimal optimizer
 
-- [x] Implement first eager `SubspaceMuon` optimizer using normal PyTorch gradients.
+- [x] Implement first eager `SumoTrack` optimizer using normal PyTorch gradients.
 - [x] Matrix path: projected first moment only, no full-size first moment.
 - [x] Fallback path: update non-2D params with local AdamW baseline.
 - [x] Add config for `rank=32`, `beta`, `recovery_scale`, `orthogonalization`, and refresh scheduling.
@@ -128,7 +128,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Open questions
 
-- [ ] Should the first public class be `SubspaceMuon`, `SUMOTrack`, or both aliasing the same implementation?
+- [x] Public optimizer class is `SumoTrack`; no old optimizer-name alias is exported.
 - [ ] Is perpendicular recovery beneficial in the target fine-tuning regime, or does it reintroduce too much noise?
 - [ ] Does rank 32 need faster rotation than higher-rank SubTrack defaults?
 - [ ] Does Grassmann tracking beat periodic SVD refresh at the same wall-clock budget?

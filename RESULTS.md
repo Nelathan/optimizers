@@ -1,4 +1,4 @@
-# SUMOTrack Results
+# SumoTrack Results
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
@@ -13,7 +13,7 @@ Setup:
 - Excluded: 134,219,776 embedding/lm-head params and 61,440 tiny 3D conv params.
 - Sequence/batch: `--seq-len 192 --batch-size 1`.
 - Timing: `--warmup-steps 1 --measure-steps 3`; reported step time excludes warmup and first basis initialization.
-- Optimizer path: `SubspaceMuon`, Grassmann refresh, no torch compile.
+- Optimizer path: `SumoTrack`, Grassmann refresh, no torch compile.
 
 Random-init rank sweep:
 
@@ -58,9 +58,9 @@ Results:
 
 | optimizer | lr | state bytes | peak CUDA bytes | initial val | final val | mean train | step seconds |
 | --- | ---: | ----------: | --------------: | ----------: | --------: | ---------: | -----------: |
-| SubspaceMuon, SVD ortho | 0.001 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.800248 | 2.192415 | 1.981366 |
-| SubspaceMuon, SVD ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.701340 | 2.046949 | 1.976006 |
-| SubspaceMuon, SVD ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 2.625968 | 2.397669 | 1.980586 |
+| SumoTrack, SVD ortho | 0.001 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.800248 | 2.192415 | 1.981366 |
+| SumoTrack, SVD ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.701340 | 2.046949 | 1.976006 |
+| SumoTrack, SVD ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 2.625968 | 2.397669 | 1.980586 |
 | Projected momentum, no ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.975293 | 2.309294 | 1.865864 |
 | Projected momentum, no ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.815476 | 2.182461 | 1.866572 |
 | torch AdamW quality anchor | 0.00002 | 4,143,972,720 | 9,097,523,712 | 2.345853 | 1.655455 | 1.962064 | 0.200987 |
@@ -85,7 +85,7 @@ Setup:
 - Steps: 1 warmup + 40 measured optimizer steps.
 - Tokens/update: 1536 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=8`).
 - Validation texts: 16.
-- Norm logging: enabled. `update_norm` is the actual `SubspaceMuon` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
+- Norm logging: enabled. `update_norm` is the actual `SumoTrack` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
 
 Representative command shape:
 

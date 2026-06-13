@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SubspaceMuon
+from sumotrack import SumoTrack
 
 
 def make_problem() -> tuple[torch.Tensor, torch.Tensor]:
@@ -27,7 +27,7 @@ def run(method: str) -> tuple[float, float, float]:
         torch.nn.Linear(24, 8),
     )
     x, y = make_problem()
-    opt = SubspaceMuon(
+    opt = SumoTrack(
         model.parameters(),
         lr=0.01,
         rank=4,

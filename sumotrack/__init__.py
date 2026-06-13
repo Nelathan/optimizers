@@ -1,12 +1,16 @@
-"""SUMOTrack optimizer experiments.
-
-The first public optimizer is expected to be ``SubspaceMuon``.  Stage one only
-exports the projector machinery; the optimizer itself comes after the math is
-nailed down.
-"""
+"""SumoTrack optimizer experiments."""
 
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
-from .optimizer import SubspaceMuon
+from .optimizer import SumoTrack
 from .rotation import RoundRobinRefreshScheduler
+from .diagnostics import optimizer_state_bytes, optimizer_state_bytes_by_category
 
-__all__ = ["ProjectionSide", "ProjectorInitMethod", "RoundRobinRefreshScheduler", "SubspaceMuon", "SubspaceProjector"]
+__all__ = [
+    "ProjectionSide",
+    "ProjectorInitMethod",
+    "RoundRobinRefreshScheduler",
+    "SumoTrack",
+    "SubspaceProjector",
+    "optimizer_state_bytes",
+    "optimizer_state_bytes_by_category",
+]

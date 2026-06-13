@@ -9,7 +9,7 @@ from torch.profiler import ProfilerActivity, profile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SubspaceMuon
+from sumotrack import SumoTrack
 
 
 def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
@@ -50,7 +50,7 @@ def benchmark(refresh_budget: int, device: torch.device, steps: int = 20) -> dic
     torch.manual_seed(5)
     model = make_model(device)
     x, y = make_batch(device)
-    optimizer = SubspaceMuon(
+    optimizer = SumoTrack(
         model.parameters(),
         lr=0.001,
         rank=8,
@@ -91,7 +91,7 @@ def profile_cuda_events(device: torch.device) -> int:
     torch.manual_seed(6)
     model = make_model(device)
     x, y = make_batch(device)
-    optimizer = SubspaceMuon(
+    optimizer = SumoTrack(
         model.parameters(),
         lr=0.001,
         rank=8,

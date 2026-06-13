@@ -2,14 +2,19 @@ import unittest
 
 import torch
 
-from sumotrack import SubspaceMuon
+import sumotrack
+from sumotrack import SumoTrack, optimizer_state_bytes_by_category
 
 
-class SubspaceMuonTest(unittest.TestCase):
+class SumoTrackTest(unittest.TestCase):
+    def test_public_optimizer_name_has_no_old_alias(self):
+        self.assertIs(sumotrack.SumoTrack, SumoTrack)
+        self.assertFalse(hasattr(sumotrack, "SubspaceMuon"))
+
     def test_step_updates_matrix_and_fallback_params(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
         bias = torch.nn.Parameter(torch.randn(4))
-        opt = SubspaceMuon([weight, bias], lr=0.01, rank=2)
+        opt = SumoTrack([weight, bias], lr=0.01, rank=2)
         opt.diagnostics_enabled = True
         weight_before = weight.detach().clone()
         bias_before = bias.detach().clone()
@@ -26,7 +31,7 @@ class SubspaceMuonTest(unittest.TestCase):
 
     def test_matrix_state_keeps_projected_moment_only(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SubspaceMuon([weight], lr=0.01, rank=2)
+        opt = SumoTrack([weight], lr=0.01, rank=2)
 
         weight.square().mean().backward()
         opt.step()
@@ -42,7 +47,7 @@ class SubspaceMuonTest(unittest.TestCase):
 
     def test_fallback_state_uses_adamw_moments(self):
         bias = torch.nn.Parameter(torch.randn(5))
-        opt = SubspaceMuon([bias], lr=0.01)
+        opt = SumoTrack([bias], lr=0.01)
 
         bias.square().mean().backward()
         opt.step()
@@ -51,10 +56,46 @@ class SubspaceMuonTest(unittest.TestCase):
         self.assertEqual(tuple(state["exp_avg"].shape), tuple(bias.shape))
         self.assertEqual(tuple(state["exp_avg_sq"].shape), tuple(bias.shape))
 
+    def test_bf16_fallback_uses_fp32_heavyball_moments(self):
+        bias = torch.nn.Parameter(torch.randn(5, dtype=torch.bfloat16))
+        opt = SumoTrack([bias], lr=0.01)
+
+        bias.float().square().mean().backward()
+        opt.step()
+
+        state = opt.state[bias]
+        self.assertEqual(state["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
+        self.assertEqual(bias.dtype, torch.bfloat16)
+
+    def test_fallback_matches_heavyball_adamw_one_step(self):
+        import heavyball
+
+        torch.manual_seed(3)
+        grad = torch.randn(5)
+        base = torch.randn(5)
+        sumo_bias = torch.nn.Parameter(base.clone())
+        heavyball_bias = torch.nn.Parameter(base.clone())
+        sumo_opt = SumoTrack([sumo_bias], lr=0.01, fallback_betas=(0.9, 0.99), weight_decay=0.01)
+        heavyball_opt = heavyball.AdamW(
+            [heavyball_bias],
+            lr=0.01,
+            betas=(0.9, 0.99),
+            weight_decay=0.01,
+            compile_step=False,
+        )
+
+        sumo_bias.grad = grad.clone()
+        heavyball_bias.grad = grad.clone()
+        sumo_opt.step()
+        heavyball_opt.step()
+
+        self.assertTrue(torch.allclose(sumo_bias, heavyball_bias))
+
     def test_state_dict_round_trip_preserves_state_shapes(self):
         weight = torch.nn.Parameter(torch.randn(7, 4))
         bias = torch.nn.Parameter(torch.randn(4))
-        opt = SubspaceMuon([weight, bias], lr=0.01, rank=2)
+        opt = SumoTrack([weight, bias], lr=0.01, rank=2)
 
         (weight.square().mean() + bias.square().mean()).backward()
         opt.step()
@@ -62,7 +103,7 @@ class SubspaceMuonTest(unittest.TestCase):
 
         new_weight = torch.nn.Parameter(weight.detach().clone())
         new_bias = torch.nn.Parameter(bias.detach().clone())
-        new_opt = SubspaceMuon([new_weight, new_bias], lr=0.01, rank=2)
+        new_opt = SumoTrack([new_weight, new_bias], lr=0.01, rank=2)
         new_opt.load_state_dict(saved)
 
         new_matrix_state = new_opt.state[new_weight]
@@ -76,17 +117,46 @@ class SubspaceMuonTest(unittest.TestCase):
         new_opt.step()
         self.assertEqual(tuple(new_opt.state[new_weight]["projected_exp_avg"].shape), (7, 2))
 
+    def test_mixed_path_state_dict_resume_changes_params_after_reload(self):
+        torch.manual_seed(0)
+        weight = torch.nn.Parameter(torch.randn(7, 4))
+        bias = torch.nn.Parameter(torch.randn(4))
+        opt = SumoTrack([weight, bias], lr=0.01, rank=2, orthogonalization="none")
+
+        (weight.square().mean() + bias.square().mean()).backward()
+        opt.step()
+        saved = opt.state_dict()
+
+        new_weight = torch.nn.Parameter(weight.detach().clone())
+        new_bias = torch.nn.Parameter(bias.detach().clone())
+        new_opt = SumoTrack([new_weight, new_bias], lr=0.01, rank=2, orthogonalization="none")
+        new_opt.load_state_dict(saved)
+        weight_before = new_weight.detach().clone()
+        bias_before = new_bias.detach().clone()
+
+        new_opt.zero_grad()
+        (new_weight.square().mean() + new_bias.square().mean()).backward()
+        new_opt.step()
+
+        self.assertFalse(torch.equal(new_weight, weight_before))
+        self.assertFalse(torch.equal(new_bias, bias_before))
+        self.assertEqual(tuple(new_opt.state[new_weight]["projected_exp_avg"].shape), (7, 2))
+        self.assertEqual(tuple(new_opt.state[new_bias]["exp_avg"].shape), (4,))
+        state_bytes = optimizer_state_bytes_by_category(new_opt)
+        self.assertGreater(state_bytes["matrix"], 0)
+        self.assertGreater(state_bytes["fallback"], 0)
+
     def test_ecc_options_fail_loudly_until_heavyball_integration(self):
         weight = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
 
         with self.assertRaises(NotImplementedError):
-            SubspaceMuon([weight], ecc="bf16+8")
+            SumoTrack([weight], ecc="bf16+8")
         with self.assertRaises(NotImplementedError):
-            SubspaceMuon([weight], param_ecc="bf16+8")
+            SumoTrack([weight], param_ecc="bf16+8")
 
     def test_random_subspace_init_wires_into_matrix_state(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SubspaceMuon([weight], lr=0.01, rank=2, subspace_init="random", subspace_update_method="grassmann")
+        opt = SumoTrack([weight], lr=0.01, rank=2, subspace_init="random", subspace_update_method="grassmann")
 
         weight.grad = torch.randn_like(weight)
         opt.step()
@@ -100,7 +170,7 @@ class SubspaceMuonTest(unittest.TestCase):
 
     def test_no_orthogonalization_uses_projected_momentum_direction(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SubspaceMuon([weight], lr=0.01, rank=2, orthogonalization="none")
+        opt = SumoTrack([weight], lr=0.01, rank=2, orthogonalization="none")
 
         weight.grad = torch.randn_like(weight)
         opt.step()
@@ -118,8 +188,8 @@ class SubspaceMuonTest(unittest.TestCase):
         base = torch.randn(8, 5)
         plain = torch.nn.Parameter(base.clone())
         ortho = torch.nn.Parameter(base.clone())
-        plain_opt = SubspaceMuon([plain], lr=0.01, rank=2, orthogonalization="none")
-        ortho_opt = SubspaceMuon([ortho], lr=0.01, rank=2, orthogonalization="svd")
+        plain_opt = SumoTrack([plain], lr=0.01, rank=2, orthogonalization="none")
+        ortho_opt = SumoTrack([ortho], lr=0.01, rank=2, orthogonalization="svd")
 
         plain.grad = grad.clone()
         ortho.grad = grad.clone()
@@ -132,15 +202,15 @@ class SubspaceMuonTest(unittest.TestCase):
         update = torch.ones(1024, 64)
         ortho = torch.ones_like(update)
 
-        projected_scaled = SubspaceMuon._scale_orthogonalized_update(update, ortho, "scale", (1024, 512))
-        muon_scaled = SubspaceMuon._scale_orthogonalized_update(update, ortho, "muon", (1024, 512))
+        projected_scaled = SumoTrack._scale_orthogonalized_update(update, ortho, "scale", (1024, 512))
+        muon_scaled = SumoTrack._scale_orthogonalized_update(update, ortho, "muon", (1024, 512))
 
         self.assertAlmostEqual(float(projected_scaled[0, 0]), 4.0)
         self.assertAlmostEqual(float(muon_scaled[0, 0]), 2.0**0.5)
 
     def test_heavyball_orthogonalization_keeps_projected_state_shape(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SubspaceMuon([weight], lr=0.01, rank=2, orthogonalization="heavyball")
+        opt = SumoTrack([weight], lr=0.01, rank=2, orthogonalization="heavyball")
 
         weight.grad = torch.randn_like(weight)
         opt.step()
@@ -152,7 +222,7 @@ class SubspaceMuonTest(unittest.TestCase):
 
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SubspaceMuon(
+        opt = SumoTrack(
             [weight],
             lr=0.01,
             rank=2,

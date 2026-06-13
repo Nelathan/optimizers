@@ -12,13 +12,13 @@ from heavyball import utils as heavyball_utils
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
 
 
-class SubspaceMuon(Optimizer):
-    """Eager SUMOTrack baseline optimizer.
+class SumoTrack(Optimizer):
+    """Eager SumoTrack baseline optimizer.
 
     Matrix parameters keep optimizer state in projected space: an orthonormal
-    basis plus a projected first moment. Non-matrix parameters use a small local
-    AdamW fallback so biases/norms still train without contaminating the matrix
-    state invariant.
+    basis plus a projected first moment. Non-matrix parameters use HeavyBall's
+    fused AdamW update path so biases/norms still train without contaminating
+    the matrix state invariant.
     """
 
     def __init__(
@@ -26,7 +26,7 @@ class SubspaceMuon(Optimizer):
         params: Iterable[Tensor],
         lr: float = 1e-3,
         beta: float = 0.9,
-        fallback_betas: tuple[float, float] = (0.9, 0.999),
+        fallback_betas: tuple[float, float] = (0.9, 0.99),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         rank: int = 32,
@@ -44,8 +44,8 @@ class SubspaceMuon(Optimizer):
     ) -> None:
         if ecc is not None or param_ecc is not None:
             raise NotImplementedError(
-                "SubspaceMuon does not yet support HeavyBall ECC/param-ECC. "
-                "Use the eager baseline without ECC, or wait for the HeavyBall-native integration gate."
+                "SumoTrack does not yet support HeavyBall ECC/param-ECC. "
+                "Fallback updates use HeavyBall fused AdamW math, but ECC requires HeavyBall's ChainOpt state hooks."
             )
         if lr <= 0:
             raise ValueError(f"lr must be positive, got {lr}")
@@ -122,7 +122,7 @@ class SubspaceMuon(Optimizer):
                     continue
                 grad = p.grad
                 if grad.is_sparse:
-                    raise RuntimeError("SubspaceMuon does not support sparse gradients")
+                    raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
                     self._step_matrix_param(p, grad, group, id(p) in refresh_ids, diagnostics)
                 else:
@@ -187,24 +187,30 @@ class SubspaceMuon(Optimizer):
         exp_avg = state.get("exp_avg")
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg is None:
-            exp_avg = torch.zeros_like(p)
-            exp_avg_sq = torch.zeros_like(p)
-        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            exp_avg = torch.zeros_like(p, dtype=torch.float32)
+            exp_avg_sq = torch.zeros_like(p, dtype=torch.float32)
         state["exp_avg"] = exp_avg
         state["exp_avg_sq"] = exp_avg_sq
-
-        if group["weight_decay"]:
-            p.mul_(1.0 - group["lr"] * group["weight_decay"])
-
-        bias_correction1 = 1.0 - beta1 ** state["step"]
-        bias_correction2 = 1.0 - beta2 ** state["step"]
-        denom = exp_avg_sq.sqrt().div_(bias_correction2**0.5).add_(group["eps"])
-        update = (exp_avg / bias_correction1) / denom
+        before = p.detach().clone() if diagnostics is not None else None
+        update = grad.detach().clone()
+        heavyball_utils.fused_adam_(
+            [p],
+            [exp_avg],
+            [exp_avg_sq],
+            [update],
+            [grad],
+            beta1,
+            beta2,
+            state["step"],
+            group["lr"],
+            group["eps"],
+            group["weight_decay"],
+            False,
+        )
         if diagnostics is not None:
-            diagnostics["fallback_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
+            delta = p.detach().float() - before.float()
+            diagnostics["fallback_update_norm_sq"] += float(delta.norm().square().detach().cpu())
             diagnostics["fallback_params"] += p.numel()
-        p.add_(update, alpha=-group["lr"])
 
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict) -> None:
         old_projected_exp_avg = state.get("projected_exp_avg")
@@ -238,14 +244,14 @@ class SubspaceMuon(Optimizer):
         if group["orthogonalization"] == "none":
             return update
         if group["orthogonalization"] == "svd":
-            return SubspaceMuon._scale_orthogonalized_update(
+            return SumoTrack._scale_orthogonalized_update(
                 update,
-                SubspaceMuon._orthogonalize_svd(update),
+                SumoTrack._orthogonalize_svd(update),
                 group["orthogonalization_scale_mode"],
                 original_shape,
             )
         if group["orthogonalization"] == "heavyball":
-            return SubspaceMuon._orthogonalize_heavyball(update, group, original_shape)
+            return SumoTrack._orthogonalize_heavyball(update, group, original_shape)
         raise AssertionError(f"unexpected orthogonalization mode: {group['orthogonalization']}")
 
     @staticmethod
@@ -265,7 +271,7 @@ class SubspaceMuon(Optimizer):
             scale_mode="none" if scale_mode == "muon" else scale_mode,
         )
         if scale_mode == "muon":
-            work = SubspaceMuon._scale_orthogonalized_update(update, work, scale_mode, original_shape)
+            work = SumoTrack._scale_orthogonalized_update(update, work, scale_mode, original_shape)
         return work
 
     @staticmethod

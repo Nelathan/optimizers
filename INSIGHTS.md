@@ -1,17 +1,17 @@
-# SUMOTrack Insights
+# SumoTrack Insights
 
-Brief durable findings for continuing SUMOTrack / `SubspaceMuon` without re-deriving the terrain.
+Brief durable findings for continuing SumoTrack without re-deriving the terrain.
 
 ## Current implementation
 
-- `SubspaceMuon` exists as an eager PyTorch optimizer with projected first moments for 2D matrix params and local AdamW fallback for non-2D params.
+- `SumoTrack` exists as an eager PyTorch optimizer with projected first moments for 2D matrix params and HeavyBall-backed fused AdamW fallback for non-2D params.
 - Matrix params do not store full-size first or second moments in the main path.
 - Basis initialization supports exact SVD by default and random QR as an opt-out for ablation/performance-path measurement.
 - Basis refresh supports exact SVD and a device-safe Grassmann/Stiefel tangent update with QR retraction.
 - Projected moments are transported across basis changes by lifting through the old basis and projecting into the new basis. This uses a temporary full tensor but does not store a full moment.
 - Projected update modes now include `orthogonalization="svd"`, `"none"`, and a compiled HeavyBall-backed Newton-Schulz path. The local Fedora machine needed `python3-devel` so Torch/Inductor could find `/usr/include/python3.14/Python.h`; after installing it, HeavyBall compiled orthogonalization runs on CUDA.
 - `orthogonalization_scale_mode="muon"` means SUMO orthogonalizes in projected space but scales as HeavyBall Muon would have scaled the original full matrix: `sqrt(max(1, rows / cols))`. This is distinct from `"scale"`, which applies HeavyBall's rule to the projected tensor and can accidentally introduce a `sqrt(full_dim / rank)` multiplier.
-- HeavyBall ECC/param-ECC is not integrated into `SubspaceMuon`; unsupported options fail loudly. HeavyBall itself can run bf16 ECC in this environment when its compile wrappers are disabled in-test.
+- HeavyBall ECC/param-ECC is not integrated into `SumoTrack`; unsupported options fail loudly. The fallback path uses HeavyBall's `fused_adam_` math and fp32 moments for bf16 params, but ECC still requires HeavyBall `ChainOpt` state hooks. HeavyBall itself can run bf16 ECC in this environment when its compile wrappers are disabled in-test.
 
 ## Evaluation stance
 
@@ -40,23 +40,22 @@ Brief durable findings for continuing SUMOTrack / `SubspaceMuon` without re-deri
 ## Empirical signals so far
 
 - LFM/SYNTH one-attention-layer smoke with rank 128 ran successfully offline on CUDA.
-- On that narrow slice, SubspaceMuon state was about 3.4 MB versus AdamW about 41.9 MB for the same 10.5M trainable params.
+- On that narrow slice, SumoTrack state was about 3.4 MB versus AdamW about 41.9 MB for the same 10.5M trainable params.
 - That one-layer state-size result is only a plumbing signal, not meaningful evidence for whole-model post-training.
 - Grassmann refresh was faster than repeated exact SVD refresh in tiny local comparisons and is the preferred baseline path.
 - LFM matrix-scope rank sweep with random init ran at ranks 64/128/256 over 92 non-embedding 2D tensors, about 1.036B trainable params. Optimizer state scaled linearly: about 88.9 MB, 177.7 MB, and 355.5 MB.
-- SUMO orthogonalization has first positive evidence: rank-64 SVD-init orthogonalized `SubspaceMuon` at LR `0.0025` beat the no-orthogonalization projected-momentum ablation at tested LRs over 20 LFM/SYNTH optimizer steps.
+- SUMO orthogonalization has first positive evidence: rank-64 SVD-init orthogonalized `SumoTrack` at LR `0.0025` beat the no-orthogonalization projected-momentum ablation at tested LRs over 20 LFM/SYNTH optimizer steps.
 - Longer norm-logged LFM/SYNTH runs keep the SUMO signal alive but sharpen the caveat: no-ortho projected momentum was under-tuned at low LR and improves up to about LR `0.04`; best tested SUMO still won (`1.593341` final val vs no-ortho `1.612252`) over 40 measured steps at 1536 tokens/update.
 - Norm telemetry suggests SUMO is not merely winning by taking a bigger raw projected-momentum step. No-ortho at LR `0.08` degraded while its mean update norm stayed below SUMO LR `0.0025`, so the geometry change remains the interesting signal.
 - HeavyBall Newton-Schulz with full-Muon scaling now tracks exact SVD orthogonalization closely on the LFM/SYNTH rank-64 setup while being faster in the measured loop (`~0.48s` vs `~0.56s` per step). This makes HeavyBall NS the practical hot path; exact SVD remains the correctness rail.
 - Torch AdamW on the same matrix-only scope reached slightly better short-run validation loss but used about 4.14 GB optimizer state and 9.1 GB peak CUDA. Treat AdamW as a quality anchor, not a feasible target budget.
 - HeavyBall AdamW OOMed on the same matrix-only scope during a one-step plumbing check. HeavyBall integration remains important for fallback/ECC machinery, but full AdamW state is outside the target regime.
+- Broad no-embedding LFM/SYNTH plumbing smoke now runs with HeavyBall Newton-Schulz, rank-64 random init, and `orthogonalization_scale_mode="muon"`. One warmup + one measured 64-token step selected 1.036B trainable params across 146 tensors: 92 matrix tensors and 54 fallback tensors, with embeddings/lm-head frozen. State accounting reported ~88.9 MB matrix state, ~1.0 MB fallback state, ~89.9 MB total optimizer state, ~4.76 GB peak CUDA, and measured update/param ratio ~0.00179. This is topology/accounting evidence, not convergence evidence.
 
 ## Next cuts
 
-1. Move from matrix-only experiments to a full/broad fine-tuning path. The next decisive question is whether SUMOTrack survives real model parameter topology while keeping the matrix-state memory promise.
-2. Implement HeavyBall-backed fallback semantics for non-2D/full-parameter mode, with ECC/param-ECC compatibility and no state quantization unless explicitly chosen.
-3. Add explicit LLM harness parameter scopes that account separately for matrix params, fallback params, embeddings/lm-head, tiny 3D kernels, and frozen params.
-4. Add optimizer state byte accounting by category: matrix projected state, fallback state, total state.
-5. Add a mixed-path save/load/resume smoke: matrix projected moments and bases reload with the same shapes, fallback state reloads, and the next step changes parameters.
-6. Run a full/broad LFM/SYNTH smoke with HeavyBall Newton-Schulz + `orthogonalization_scale_mode="muon"`, reporting loss, state bytes by category, peak CUDA, step time after compile warmup, and matrix update norms.
-7. Only after the full/broad path is real, run longer LR-aware quality comparisons. Longer matrix-only runs are useful but no longer the highest-leverage proof.
+1. Move from matrix-only experiments to a full/broad fine-tuning path. The next decisive question is whether SumoTrack survives real model parameter topology while keeping the matrix-state memory promise.
+2. Keep the current implementation eager as the algorithm rail. Later, evaluate a HeavyBall-native SumoTrack variant for ECC/param-ECC. Current eager code cannot honestly bolt on ECC because the required state hooks live in HeavyBall's optimizer lifecycle.
+3. Run longer LR-aware broad-scope quality comparisons now that the full/broad path is real. Use HeavyBall Newton-Schulz + `orthogonalization_scale_mode="muon"`; compare against matrix-only history and feasible anchors, not full AdamW state budgets.
+4. Add fuller accounting for frozen params by category in the harness output if broad/full product claims need denominator clarity: embeddings/lm-head frozen bytes, tiny 3D fallback bytes, norms/biases fallback bytes.
+5. Stress mixed-path restart on CUDA/bf16 after several steps, not only the current unit smoke.

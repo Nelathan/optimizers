@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SubspaceMuon
+from sumotrack import SumoTrack, optimizer_state_bytes_by_category
 
 
 PREFERRED_MODELS = (
@@ -24,7 +24,7 @@ PREFERRED_MODELS = (
     "Qwen/Qwen3-4B",
 )
 
-ParamScope = Literal["full", "matrices-no-embeddings"]
+ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 
 
 def cached_model_snapshots(model_name: str) -> list[Path]:
@@ -32,15 +32,6 @@ def cached_model_snapshots(model_name: str) -> list[Path]:
     if not cache_dir.exists():
         return []
     return sorted([path for path in cache_dir.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True)
-
-
-def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
-    return sum(
-        value.numel() * value.element_size()
-        for state in optimizer.state.values()
-        for value in state.values()
-        if torch.is_tensor(value)
-    )
 
 
 @torch.no_grad()
@@ -147,13 +138,13 @@ def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> 
     for name, param in model.named_parameters():
         if param_scope == "full":
             wants_param = True
-        elif param_scope == "matrices-no-embeddings":
+        elif param_scope in {"broad-no-embeddings", "matrices-no-embeddings"}:
             is_embedding = is_embedding_like_name(name)
-            wants_param = param.ndim == 2 and not is_embedding
+            wants_param = not is_embedding if param_scope == "broad-no-embeddings" else param.ndim == 2 and not is_embedding
             if is_embedding:
                 stats["excluded_embedding_tensors"] += 1
                 stats["excluded_embedding_params"] += param.numel()
-            if param.ndim == 3:
+            if param.ndim == 3 and not wants_param:
                 stats["excluded_3d_tensors"] += 1
                 stats["excluded_3d_params"] += param.numel()
         else:  # pragma: no cover - argparse constrains this
@@ -252,9 +243,12 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
 
     if optimizer_name == "subspace":
-        optimizer = SubspaceMuon(
+        optimizer_name = "sumotrack"
+
+    if optimizer_name == "sumotrack":
+        optimizer = SumoTrack(
             trainable,
-            lr=args.subspace_lr,
+            lr=args.sumotrack_lr,
             rank=args.rank,
             beta=args.beta,
             orthogonalization=args.orthogonalization,
@@ -299,13 +293,14 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     measured_param_norms = [step["param_norm"] for step in measured_steps]
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
+    state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
         "param_scope": args.param_scope,
-        "subspace_init": args.subspace_init if optimizer_name == "subspace" else "n/a",
-        "orthogonalization": args.orthogonalization if optimizer_name == "subspace" else "n/a",
-        "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "subspace" else "n/a",
-        "heavyball_orthogonalization_mode": args.heavyball_orthogonalization_mode if optimizer_name == "subspace" else "n/a",
+        "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
+        "orthogonalization": args.orthogonalization if optimizer_name == "sumotrack" else "n/a",
+        "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "sumotrack" else "n/a",
+        "heavyball_orthogonalization_mode": args.heavyball_orthogonalization_mode if optimizer_name == "sumotrack" else "n/a",
         "grad_accum_steps": args.grad_accum_steps,
         "norm_logging": int(args.log_norms),
         "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
@@ -317,7 +312,9 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "trainable_fallback_tensors": param_stats["selected_fallback_tensors"],
         "excluded_embedding_params": param_stats["excluded_embedding_params"],
         "excluded_3d_params": param_stats["excluded_3d_params"],
-        "state_bytes": optimizer_state_bytes(optimizer),
+        "matrix_state_bytes": state_bytes["matrix"],
+        "fallback_state_bytes": state_bytes["fallback"],
+        "state_bytes": state_bytes["total"],
         "initial_val_loss": initial_val,
         "final_val_loss": final_val,
         "first_warmup_loss": warmup_losses[0] if warmup_losses else float("nan"),
@@ -410,11 +407,11 @@ def print_shape_summary(model_name: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SUMOTrack")
+    parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SumoTrack")
     parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
-    parser.add_argument("--optimizers", default="subspace", help="comma-separated: subspace,torch_adamw,heavyball_adamw")
-    parser.add_argument("--param-scope", choices=("full", "matrices-no-embeddings"), default="matrices-no-embeddings")
+    parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw,heavyball_adamw")
+    parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="matrices-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=192)
@@ -426,12 +423,13 @@ def main() -> None:
     parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball"), default="svd")
     parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
     parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
-    parser.add_argument("--subspace-lr", type=float, default=0.0025)
+    parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
+    parser.add_argument("--subspace-lr", dest="sumotrack_lr", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--subspace-refresh-budget", type=int, default=1)
-    parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SubspaceMuon update norms; adds reduction overhead")
+    parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SumoTrack update norms; adds reduction overhead")
     parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
     args = parser.parse_args()
 
@@ -463,6 +461,8 @@ def main() -> None:
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
+        if optimizer_name == "subspace":
+            optimizer_name = "sumotrack"
         result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, device)
         prefix = optimizer_name
         for key, value in result.items():

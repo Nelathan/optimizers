@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SubspaceMuon
+from sumotrack import SumoTrack
 
 
 def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
@@ -37,7 +37,7 @@ def train(optimizer_name: str) -> tuple[float, float, int]:
     x, y = make_problem()
 
     if optimizer_name == "sumotrack":
-        optimizer = SubspaceMuon(model.parameters(), lr=0.01, rank=4, beta=0.9, subspace_refresh_budget=1)
+        optimizer = SumoTrack(model.parameters(), lr=0.01, rank=4, beta=0.9, subspace_refresh_budget=1)
     elif optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     else:  # pragma: no cover - local script guard
@@ -64,9 +64,9 @@ def main() -> None:
     print(f"sumotrack_state_bytes={sumo_state_bytes}")
     print(f"adamw_state_bytes={adam_state_bytes}")
     if not sumo_final < sumo_initial:
-        raise SystemExit("SubspaceMuon smoke failed: loss did not descend")
+        raise SystemExit("SumoTrack smoke failed: loss did not descend")
     if not sumo_state_bytes < adam_state_bytes:
-        raise SystemExit("SubspaceMuon smoke failed: state bytes were not below AdamW")
+        raise SystemExit("SumoTrack smoke failed: state bytes were not below AdamW")
 
 
 if __name__ == "__main__":

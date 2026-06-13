@@ -2,13 +2,13 @@
 
 ## Repo purpose
 
-This repo is a lab for home-scale machine-learning optimizers. The current main thread is **SUMOTrack**, with public optimizer name **SubspaceMuon** unless a better name earns its keep.
+This repo is a lab for home-scale machine-learning optimizers. The current main thread and public optimizer name are **SumoTrack**.
 
-SUMOTrack targets high effectiveness on mid-range consumer NVIDIA GPUs, especially memory-constrained cards such as the RTX 4070 Super. The aim is to make full fine-tuning or continued pretraining practical where users would otherwise retreat to LoRA for memory reasons.
+SumoTrack targets high effectiveness on mid-range consumer NVIDIA GPUs, especially memory-constrained cards such as the RTX 4070 Super. The aim is to make full fine-tuning or continued pretraining practical where users would otherwise retreat to LoRA for memory reasons.
 
 ## Current design direction
 
-Build SUMOTrack directly on top of `../HeavyBall`. HeavyBall is a sibling repo and should be treated as the primary optimizer substrate. Prefer an editable path dependency over vendoring, forking, or submodules.
+Build SumoTrack directly on top of `../HeavyBall`. HeavyBall is a sibling repo and should be treated as the primary optimizer substrate. Prefer an editable path dependency over vendoring, forking, or submodules.
 
 The intended synthesis:
 
@@ -24,7 +24,7 @@ Prefer signal over ceremony. A useful progress report should say what changed in
 
 Do not silently work around the user's stated framing. If the user says to ignore warmup/cold-start cost, do not optimize the report or experiment around excluding it as though that were the primary concern. If that framing seems wrong, stop and discuss the disagreement explicitly.
 
-For SUMOTrack specifically, do not become overfocused on first-step SVD cost. Exact SVD initialization is allowed and often desirable because it may start stronger; random initialization exists to opt out when measuring the algorithmic/performance path. Torch compile latency can dominate first-step SVD cost in practice, so treat cold-start complaints proportionally.
+For SumoTrack specifically, do not become overfocused on first-step SVD cost. Exact SVD initialization is allowed and often desirable because it may start stronger; random initialization exists to opt out when measuring the algorithmic/performance path. Torch compile latency can dominate first-step SVD cost in practice, so treat cold-start complaints proportionally.
 
 ## Ground rules
 
@@ -68,7 +68,7 @@ The first useful implementation is not the fanciest one. Build in this order:
 
 Past optimizer experiments hit a kernel-launch wall. Too many tiny decompositions or per-module kernels can dominate runtime. Batching by module shape and using batched `eigh`/SVD helped in previous implementations.
 
-For SUMOTrack, round-robin refresh may reduce decomposition pressure because only rotations are staggered. However, projection and orthogonalization still happen every step, so watch kernel-launch count and module-count scaling.
+For SumoTrack, round-robin refresh may reduce decomposition pressure because only rotations are staggered. However, projection and orthogonalization still happen every step, so watch kernel-launch count and module-count scaling.
 
 Prefer matmul-shaped hot paths. HeavyBall's optimized Newton-Schulz/polar implementation is likely faster than decomposition-based orthogonalization because it is mostly matmuls.
 
@@ -108,7 +108,7 @@ If validation cannot be run, say exactly what remains unverified.
 
 ## Naming
 
-Use **SUMOTrack** for the project/optimizer family and **SubspaceMuon** for the first public optimizer class unless the user chooses otherwise. Avoid churny renaming once code exists.
+Use **SumoTrack** for the project/optimizer family and public optimizer class. Avoid churny renaming once code exists.
 
 ## Style
 

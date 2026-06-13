@@ -1,6 +1,6 @@
-# SUMOTrack Plan
+# SumoTrack Plan
 
-SUMOTrack is an experimental optimizer line for memory-constrained full fine-tuning and continued pretraining on consumer GPUs. The public optimizer class should probably be named `SubspaceMuon`: clear, searchable, and honest. The project name `SUMOTrack` names the core synthesis: SUMO-style moment orthogonalization inside a SubTrack-style tracked gradient subspace, implemented on top of HeavyBall.
+SumoTrack is an experimental optimizer line for memory-constrained full fine-tuning and continued pretraining on consumer GPUs. The public optimizer class is `SumoTrack`. The name marks the core synthesis: SUMO-style moment orthogonalization inside a SubTrack-style tracked gradient subspace, implemented on top of HeavyBall.
 
 The target hardware is mid-range consumer NVIDIA cards, especially cards in the RTX 4070 Super / 12 GB class and adjacent 16-24 GB cards. The target use cases are:
 
@@ -20,7 +20,7 @@ The first implementation should live here, probably under:
 ```text
 sumotrack/
   __init__.py
-  optimizer.py              # SubspaceMuon public optimizer
+  optimizer.py              # SumoTrack public optimizer
   projector.py              # SubTrack/SUMO projector state
   rotation.py               # round-robin subspace refresh scheduler
   param_groups.py           # matrix/fallback grouping helpers
@@ -36,9 +36,9 @@ If the design stabilizes and its transform fits cleanly into HeavyBall's chainab
 
 HeavyBall already integrates the most important FlashOptim idea for this work: 24-bit-like error correction through `ecc="bf16+8"` and `param_ecc="bf16+8"`. Use that path first. Do not mix FlashOptim kernels into v1.
 
-HeavyBall also already provides Muon-style orthogonalization through `heavyball.chainable.orthogonalize_update` and polar/Newton-Schulz utilities in `heavyball.utils`. SUMOTrack's novelty is not full-matrix Muon. The novelty is orthogonalization inside a tracked low-rank gradient subspace, with memory-shaped state.
+HeavyBall also already provides Muon-style orthogonalization through `heavyball.chainable.orthogonalize_update` and polar/Newton-Schulz utilities in `heavyball.utils`. SumoTrack's novelty is not full-matrix Muon. The novelty is orthogonalization inside a tracked low-rank gradient subspace, with memory-shaped state.
 
-HeavyBall's `PSGDLRA` is relevant but not equivalent. It is a low-rank PSGD preconditioner. SUMOTrack should track per-matrix gradient subspaces and maintain projected first moments, closer to SubTrack + SUMO.
+HeavyBall's `PSGDLRA` is relevant but not equivalent. It is a low-rank PSGD preconditioner. SumoTrack should track per-matrix gradient subspaces and maintain projected first moments, closer to SubTrack + SUMO.
 
 ## Core algorithm v1
 
@@ -99,15 +99,15 @@ If the target interval is shorter than the number of eligible modules, overlappi
 
 ## Strong belief: Grassmann update
 
-The Grassmannian update is expected to be central, not decorative. Full SVD refresh is acceptable as a baseline and for initialization, but a good SUMOTrack implementation should prefer SubTrack-style geometry-aware tracking once the shape/state machinery is correct.
+The Grassmannian update is expected to be central, not decorative. Full SVD refresh is acceptable as a baseline and for initialization, but a good SumoTrack implementation should prefer SubTrack-style geometry-aware tracking once the shape/state machinery is correct.
 
-Short fresh-initialization tests are a poor primary signal for this optimizer family. Subspace methods can spend the first few thousand steps learning an unhelpful subspace; SubTrack's case is long-range pretraining efficiency, while SUMOTrack's likely advantage is mid-training / post-training stability and reduced forgetting under constrained optimizer state. Treat early toy-regression underperformance as expected unless it reveals a state-shape, numerical, or stability bug.
+Short fresh-initialization tests are a poor primary signal for this optimizer family. Subspace methods can spend the first few thousand steps learning an unhelpful subspace; SubTrack's case is long-range pretraining efficiency, while SumoTrack's likely advantage is mid-training / post-training stability and reduced forgetting under constrained optimizer state. Treat early toy-regression underperformance as expected unless it reveals a state-shape, numerical, or stability bug.
 
 Given the measured state sizes, rank `32` is a conservative default rather than a ceiling. Real evaluations should include rank `64`, `128`, and possibly larger ranks before concluding that the subspace is too restrictive. Grassmann refresh should be the preferred baseline path because it is faster than repeated exact SVD refresh and gives a stable basis update target for later ECC integration.
 
 Performance smoke tests should use random orthogonal subspace initialization so timing measures the optimizer path rather than a wall of first-step SVDs. Convergence-quality comparisons should use SVD initialization explicitly, because good initialization is part of the algorithmic question. Do not time cold-start SVD as representative steady-state performance.
 
-Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In rank-64, SVD-init, non-embedding-matrix LFM runs, orthogonalized `SubspaceMuon` at HeavyBall's Muon-scale default LR (`0.0025`) remains the best tested point after a wider no-ortho LR sweep. The caveat is useful: raw projected momentum was under-tuned at low LR and improves up to about `0.04`, so future comparisons must be LR-aware. Norm telemetry suggests SUMO's advantage is not explained by raw update norm alone; no-ortho begins degrading while its update norm is still below SUMO's. Treat this as positive directional evidence, not final optimizer proof.
+Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In rank-64, SVD-init, non-embedding-matrix LFM runs, orthogonalized `SumoTrack` at HeavyBall's Muon-scale default LR (`0.0025`) remains the best tested point after a wider no-ortho LR sweep. The caveat is useful: raw projected momentum was under-tuned at low LR and improves up to about `0.04`, so future comparisons must be LR-aware. Norm telemetry suggests SUMO's advantage is not explained by raw update norm alone; no-ortho begins degrading while its update norm is still below SUMO's. Treat this as positive directional evidence, not final optimizer proof.
 
 AdamW is a quality anchor, not a target budget. Full 2x-fp32 optimizer state is outside the intended feasibility envelope; the product goal is to make broad/full fine-tuning possible on consumer GPUs where users would otherwise retreat to memory-frugal LoRA/Unsloth-style paths. Compare against AdamW to understand quality, but do not let AdamW's state budget define success.
 
@@ -125,7 +125,7 @@ The SubTrack update must be adapted carefully:
 
 ## Performance risks
 
-The main performance enemy is not just FLOPs; it is kernel-launch spray. Past experiments showed that bucketing similarly shaped modules and calling batched eigendecompositions improved speed. SUMOTrack should keep this in mind, but not prematurely optimize v1.
+The main performance enemy is not just FLOPs; it is kernel-launch spray. Past experiments showed that bucketing similarly shaped modules and calling batched eigendecompositions improved speed. SumoTrack should keep this in mind, but not prematurely optimize v1.
 
 Round-robin refresh reduces decomposition pressure because only rotations are sparse in time. Projection and orthogonalization still run every step, so they should be matmul-shaped and batchable where practical.
 
@@ -154,7 +154,7 @@ The safe sequence is:
 
 ## First success criteria
 
-SUMOTrack v1 is worth continuing if it can show:
+SumoTrack v1 is worth continuing if it can show:
 
 - stable loss behavior on short cached pretrained-LLM SYNTH/post-training tests,
 - lower optimizer-state memory than AdamW for matrix-heavy models,
@@ -167,9 +167,9 @@ Do not declare victory from a green unit test. The observable downstream signals
 
 ## Next strategic arc: full/broad fine-tuning path
 
-The current matrix-only LFM/SYNTH evidence has done its first job: SUMO-style projected moment orthogonalization has signal, HeavyBall Newton-Schulz can replace exact projected-space SVD as the hot path, and full-matrix Muon scaling is now separated from projected-rank scaling. The next goal is not a slightly longer matrix-only run. The next goal is to make SUMOTrack a credible full/broad fine-tuning optimizer rather than a clean matrix-path ablation.
+The current matrix-only LFM/SYNTH evidence has done its first job: SUMO-style projected moment orthogonalization has signal, HeavyBall Newton-Schulz can replace exact projected-space SVD as the hot path, and full-matrix Muon scaling is now separated from projected-rank scaling. The next goal is not a slightly longer matrix-only run. The next goal is to make SumoTrack a credible full/broad fine-tuning optimizer rather than a clean matrix-path ablation.
 
-The key question is whether SUMOTrack survives real model parameter topology while preserving the memory invariant:
+The key question is whether SumoTrack survives real model parameter topology while preserving the memory invariant:
 
 - 2D matrix params use projected first moments and projector state, with no full-size first or second moments.
 - Non-2D params, embeddings, heads, norms, biases, and tiny kernels are either explicitly frozen or handled by a boring fallback optimizer path.
@@ -177,11 +177,11 @@ The key question is whether SUMOTrack survives real model parameter topology whi
 
 The next implementation arc should deliver:
 
-1. **HeavyBall-backed fallback semantics.** Replace the local toy AdamW fallback where practical with HeavyBall-backed AdamW/LaProp-style behavior, including clear ECC/param-ECC behavior. Unsupported combinations should fail loudly, not silently ignore configuration.
-2. **Explicit broad parameter scopes.** Extend the LLM harness beyond `matrices-no-embeddings` with modes that make embeddings, lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors visible in the accounting.
-3. **State accounting by category.** Report matrix projected state bytes, fallback state bytes, and total optimizer state bytes. The product claim depends on where memory goes, not only on a single total.
-4. **Mixed-path restart proof.** Add a save/load/resume smoke after at least one mixed matrix+fallback step. The check should prove projected moment and basis shapes survive, fallback state survives, and the next step changes parameters.
-5. **Full/broad LFM/SYNTH smoke.** Run HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` on a representative broad parameter scope and report loss movement, state bytes by category, peak CUDA, post-compile step time, and matrix update norms.
+1. **HeavyBall-backed fallback semantics.** Replace the local toy AdamW fallback where practical with HeavyBall-backed AdamW/LaProp-style behavior, including clear ECC/param-ECC behavior. Unsupported combinations should fail loudly, not silently ignore configuration. Current status: non-2D fallback uses HeavyBall `fused_adam_` with fp32 moments for bf16 params; ECC/param-ECC still fail loudly because honest support needs HeavyBall `ChainOpt` state hooks.
+2. **Explicit broad parameter scopes.** Extend the LLM harness beyond `matrices-no-embeddings` with modes that make embeddings, lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors visible in the accounting. Current status: `broad-no-embeddings` trains matrices plus fallback topology while freezing embeddings/lm-head.
+3. **State accounting by category.** Report matrix projected state bytes, fallback state bytes, and total optimizer state bytes. The product claim depends on where memory goes, not only on a single total. Current status: harness reports matrix/fallback/total optimizer state bytes.
+4. **Mixed-path restart proof.** Add a save/load/resume smoke after at least one mixed matrix+fallback step. The check should prove projected moment and basis shapes survive, fallback state survives, and the next step changes parameters. Current status: unit coverage exists for mixed matrix+fallback reload and subsequent parameter movement.
+5. **Full/broad LFM/SYNTH smoke.** Run HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` on a representative broad parameter scope and report loss movement, state bytes by category, peak CUDA, post-compile step time, and matrix update norms. Current status: one warmup + one measured broad no-embedding LFM/SYNTH plumbing smoke runs on CUDA and reports category state bytes, peak CUDA, step time, and update norms.
 
 Only after that path exists should longer LR-aware quality evaluations become the main work again. Longer matrix-only evals can refine the geometry story, but they do not prove the optimizer is usable for the product goal: broad/full fine-tuning on consumer GPUs where full AdamW state is the thing users cannot afford.
 
