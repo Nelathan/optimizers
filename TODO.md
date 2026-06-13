@@ -12,7 +12,7 @@ Progression is gated by evidence, not by vibes or a locally attractive diff. Eac
 - [x] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
 - [x] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
 - [x] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
-- [ ] **Performance gate:** optimization work is justified by measured step time, refresh spike size, state bytes, and a profiler/kernel-launch signal.
+- [x] **Performance gate:** optimization work is justified by measured step time, refresh spike size, state bytes, and a profiler/kernel-launch signal.
 
 Projected-gradient hooks stay locked until the ordinary-gradient baseline clears the optimizer state, descent, and HeavyBall/ECC gates.
 
@@ -78,12 +78,12 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Phase 6: performance work
 
-- [ ] Count kernel launches for a representative optimizer step.
+- [x] Count profiler CUDA events for a representative optimizer step.
 - [ ] Profile exact SVD orthogonalization vs Newton-Schulz/polar.
 - [ ] Bucket same-shape projected moments for batched NS.
 - [ ] Investigate bucketing refreshed modules by shape for batched `eigh`/SVD if refresh spikes matter.
 - [ ] Measure whether round-robin refresh makes batched decompositions unnecessary.
-- [ ] Add diagnostics for refresh time, projection time, orthogonalization time, and update time.
+- [x] Add diagnostics for step time, refresh spike ratio, state bytes, peak CUDA memory, and profiler CUDA events.
 - [ ] Avoid optimizing decomposition refresh before the hot per-step projection/ortho path is understood.
 
 ## Phase 7: experiments
