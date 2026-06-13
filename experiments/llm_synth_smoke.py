@@ -10,6 +10,7 @@ from typing import Literal
 
 import pyarrow.parquet as pq
 import torch
+import heavyball
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -174,12 +175,16 @@ def evaluate_loss(model, batches) -> float:
     return sum(losses) / len(losses)
 
 
-def train_step(model, optimizer: torch.optim.Optimizer, batch) -> float:
+def train_step(model, optimizer: torch.optim.Optimizer, batches, start_index: int, grad_accum_steps: int) -> float:
     optimizer.zero_grad(set_to_none=True)
-    loss = model(**batch).loss
-    loss.backward()
+    losses = []
+    for offset in range(grad_accum_steps):
+        batch = batches[(start_index + offset) % len(batches)]
+        loss = model(**batch).loss
+        (loss / grad_accum_steps).backward()
+        losses.append(float(loss.detach().float().cpu()))
     optimizer.step()
-    return float(loss.detach().float().cpu())
+    return sum(losses) / len(losses)
 
 
 def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[str], val_texts: list[str], device: torch.device) -> dict[str, float | int | str]:
@@ -198,13 +203,18 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
             lr=args.subspace_lr,
             rank=args.rank,
             beta=args.beta,
+            orthogonalization=args.orthogonalization,
+            orthogonalization_scale_mode=args.orthogonalization_scale_mode,
+            heavyball_orthogonalization_mode=args.heavyball_orthogonalization_mode,
             subspace_init=args.subspace_init,
             subspace_update_method="grassmann",
             grassmann_step_size=args.grassmann_step_size,
             subspace_refresh_budget=args.subspace_refresh_budget,
         )
-    elif optimizer_name == "adamw":
+    elif optimizer_name in {"adamw", "torch_adamw"}:
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
+    elif optimizer_name in {"heavyball_adamw", "hb_adamw"}:
+        optimizer = heavyball.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.99), weight_decay=0.0, compile_step=False)
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
 
@@ -213,16 +223,16 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     measured_losses = []
 
     for step in range(args.warmup_steps):
-        batch = train_batches[step % len(train_batches)]
-        warmup_losses.append(train_step(model, optimizer, batch))
+        batch_index = step * args.grad_accum_steps
+        warmup_losses.append(train_step(model, optimizer, train_batches, batch_index, args.grad_accum_steps))
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     start_time = time.perf_counter()
     for step in range(args.measure_steps):
-        batch = train_batches[(args.warmup_steps + step) % len(train_batches)]
-        measured_losses.append(train_step(model, optimizer, batch))
+        batch_index = (args.warmup_steps + step) * args.grad_accum_steps
+        measured_losses.append(train_step(model, optimizer, train_batches, batch_index, args.grad_accum_steps))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
@@ -232,6 +242,10 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "optimizer": optimizer_name,
         "param_scope": args.param_scope,
         "subspace_init": args.subspace_init if optimizer_name == "subspace" else "n/a",
+        "orthogonalization": args.orthogonalization if optimizer_name == "subspace" else "n/a",
+        "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "subspace" else "n/a",
+        "grad_accum_steps": args.grad_accum_steps,
+        "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
         "trainable_params": param_stats["selected_params"],
         "trainable_tensors": param_stats["selected_tensors"],
         "trainable_matrix_params": param_stats["selected_matrix_params"],
@@ -247,6 +261,9 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "last_warmup_loss": warmup_losses[-1] if warmup_losses else float("nan"),
         "first_measured_train_loss": measured_losses[0],
         "last_measured_train_loss": measured_losses[-1],
+        "mean_measured_train_loss": sum(measured_losses) / len(measured_losses),
+        "min_measured_train_loss": min(measured_losses),
+        "max_measured_train_loss": max(measured_losses),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
@@ -325,15 +342,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SUMOTrack")
     parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
-    parser.add_argument("--optimizers", default="subspace", help="comma-separated: subspace,adamw")
+    parser.add_argument("--optimizers", default="subspace", help="comma-separated: subspace,torch_adamw,heavyball_adamw")
     parser.add_argument("--param-scope", choices=("full", "matrices-no-embeddings"), default="matrices-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=192)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
-    parser.add_argument("--subspace-init", choices=("svd", "random"), default="random")
-    parser.add_argument("--subspace-lr", type=float, default=2e-5)
+    parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
+    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball"), default="svd")
+    parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft"), default="scale")
+    parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
+    parser.add_argument("--subspace-lr", type=float, default=0.0025)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
@@ -345,6 +367,9 @@ def main() -> None:
         raise ValueError("warmup_steps must be non-negative")
     if args.measure_steps <= 0:
         raise ValueError("measure_steps must be positive")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+    args.heavyball_orthogonalization_mode = args.heavyball_orthogonalization_mode or None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = choose_model(args.model or None)
@@ -353,15 +378,16 @@ def main() -> None:
         return
 
     total_train_steps = args.warmup_steps + args.measure_steps
-    train_texts = synth_texts(Path(args.data_dir), "train", limit=max(total_train_steps, 4) * args.batch_size)
-    val_texts = synth_texts(Path(args.data_dir), "val", limit=2 * args.batch_size)
+    train_texts = synth_texts(Path(args.data_dir), "train", limit=max(total_train_steps * args.grad_accum_steps, 4) * args.batch_size)
+    val_texts = synth_texts(Path(args.data_dir), "val", limit=max(args.val_texts, 1) * args.batch_size)
     print(f"device={device}")
     print(f"model={model_name}")
     print(f"data_dir={args.data_dir}")
     print(f"train_texts={len(train_texts)} val_texts={len(val_texts)}")
     print(
-        f"seq_len={args.seq_len} batch_size={args.batch_size} warmup_steps={args.warmup_steps} "
-        f"measure_steps={args.measure_steps} param_scope={args.param_scope} rank={args.rank} subspace_init={args.subspace_init}"
+        f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
+        f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
+        f"rank={args.rank} subspace_init={args.subspace_init} orthogonalization={args.orthogonalization}"
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:

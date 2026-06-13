@@ -6,6 +6,8 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from heavyball import utils as heavyball_utils
+
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
 
 
@@ -30,6 +32,8 @@ class SubspaceMuon(Optimizer):
         side: ProjectionSide | str = ProjectionSide.AUTO,
         recovery_scale: float = 0.0,
         orthogonalization: str = "svd",
+        orthogonalization_scale_mode: str = "scale",
+        heavyball_orthogonalization_mode: str | None = None,
         subspace_init: str = "svd",
         subspace_update_method: str = "svd_refresh",
         grassmann_step_size: float = 0.01,
@@ -56,8 +60,10 @@ class SubspaceMuon(Optimizer):
             raise ValueError(f"rank must be positive, got {rank}")
         if recovery_scale < 0:
             raise ValueError(f"recovery_scale must be non-negative, got {recovery_scale}")
-        if orthogonalization != "svd":
-            raise ValueError("only orthogonalization='svd' is implemented in the eager baseline")
+        if orthogonalization not in {"none", "svd", "heavyball"}:
+            raise ValueError("orthogonalization must be 'none', 'svd', or 'heavyball'")
+        if orthogonalization_scale_mode not in {"none", "scale", "graft"}:
+            raise ValueError("orthogonalization_scale_mode must be 'none', 'scale', or 'graft'")
         if subspace_update_method not in {"svd_refresh", "grassmann"}:
             raise ValueError("subspace_update_method must be 'svd_refresh' or 'grassmann'")
         subspace_init = ProjectorInitMethod(subspace_init).value
@@ -76,6 +82,8 @@ class SubspaceMuon(Optimizer):
             side=ProjectionSide(side).value,
             recovery_scale=recovery_scale,
             orthogonalization=orthogonalization,
+            orthogonalization_scale_mode=orthogonalization_scale_mode,
+            heavyball_orthogonalization_mode=heavyball_orthogonalization_mode,
             subspace_init=subspace_init,
             subspace_update_method=subspace_update_method,
             grassmann_step_size=grassmann_step_size,
@@ -133,7 +141,7 @@ class SubspaceMuon(Optimizer):
         projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
         state["projected_exp_avg"] = projected_exp_avg
 
-        update_hat = self._orthogonalize_svd(projected_exp_avg)
+        update_hat = self._orthogonalize_update(projected_exp_avg, group)
         update = projector.project_back(update_hat).to(dtype=p.dtype)
 
         recovery_scale = group["recovery_scale"]
@@ -195,10 +203,36 @@ class SubspaceMuon(Optimizer):
                 state.pop("projected_exp_avg", None)
 
     @staticmethod
+    def _orthogonalize_update(update: Tensor, group: dict) -> Tensor:
+        if group["orthogonalization"] == "none":
+            return update
+        if group["orthogonalization"] == "svd":
+            return SubspaceMuon._orthogonalize_svd(update)
+        if group["orthogonalization"] == "heavyball":
+            return SubspaceMuon._orthogonalize_heavyball(update, group)
+        raise AssertionError(f"unexpected orthogonalization mode: {group['orthogonalization']}")
+
+    @staticmethod
     def _orthogonalize_svd(update: Tensor) -> Tensor:
         svd_input = update.float() if update.dtype in (torch.float16, torch.bfloat16) else update
         u, _s, vh = torch.linalg.svd(svd_input, full_matrices=False)
         return (u @ vh).to(dtype=update.dtype, device=update.device)
+
+    @staticmethod
+    def _orthogonalize_heavyball(update: Tensor, group: dict) -> Tensor:
+        work = update.clone()
+        old_compile_mode = heavyball_utils.compile_mode
+        heavyball_utils.compile_mode = None
+        try:
+            heavyball_utils.inplace_orthogonal_(
+                work,
+                mode=group["heavyball_orthogonalization_mode"],
+                out=work,
+                scale_mode=group["orthogonalization_scale_mode"],
+            )
+        finally:
+            heavyball_utils.compile_mode = old_compile_mode
+        return work
 
     @staticmethod
     def _projector_from_state(p: Tensor, group: dict, state: dict) -> SubspaceProjector:

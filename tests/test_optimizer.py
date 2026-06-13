@@ -94,6 +94,48 @@ class SubspaceMuonTest(unittest.TestCase):
         self.assertTrue(torch.allclose(gram, torch.eye(2), atol=1e-5))
         self.assertEqual(opt.param_groups[0]["subspace_init"], "random")
 
+    def test_no_orthogonalization_uses_projected_momentum_direction(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SubspaceMuon([weight], lr=0.01, rank=2, orthogonalization="none")
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        projector = opt._projector_from_state(weight, opt.param_groups[0], state)
+        expected_update = projector.project_back(state["projected_exp_avg"])
+        self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
+        self.assertTrue(torch.allclose(opt._orthogonalize_update(state["projected_exp_avg"], opt.param_groups[0]), state["projected_exp_avg"]))
+        self.assertEqual(tuple(expected_update.shape), tuple(weight.shape))
+
+    def test_orthogonalization_modes_produce_different_updates(self):
+        torch.manual_seed(1)
+        grad = torch.randn(8, 5)
+        base = torch.randn(8, 5)
+        plain = torch.nn.Parameter(base.clone())
+        ortho = torch.nn.Parameter(base.clone())
+        plain_opt = SubspaceMuon([plain], lr=0.01, rank=2, orthogonalization="none")
+        ortho_opt = SubspaceMuon([ortho], lr=0.01, rank=2, orthogonalization="svd")
+
+        plain.grad = grad.clone()
+        ortho.grad = grad.clone()
+        plain_opt.step()
+        ortho_opt.step()
+
+        self.assertFalse(torch.allclose(plain, ortho))
+
+    def test_heavyball_orthogonalization_keeps_projected_state_shape(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SubspaceMuon([weight], lr=0.01, rank=2, orthogonalization="heavyball")
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
+        self.assertNotIn("exp_avg", state)
+        self.assertNotIn("exp_avg_sq", state)
+
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SubspaceMuon(

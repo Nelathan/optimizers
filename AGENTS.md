@@ -18,6 +18,14 @@ The intended synthesis:
 - SUMO for moment orthogonalization inside a low-dimensional subspace.
 - Aurora as a later possible improvement for rectangular/non-square orthogonalization, not a v1 dependency.
 
+## Collaboration and reporting
+
+Prefer signal over ceremony. A useful progress report should say what changed in the system's meaning: which invariant now holds, which bottleneck became visible, which assumption broke, and what the next high-leverage cut is. Avoid process-shaped summaries that merely list files, commits, and validations unless those details carry decision value.
+
+Do not silently work around the user's stated framing. If the user says to ignore warmup/cold-start cost, do not optimize the report or experiment around excluding it as though that were the primary concern. If that framing seems wrong, stop and discuss the disagreement explicitly.
+
+For SUMOTrack specifically, do not become overfocused on first-step SVD cost. Exact SVD initialization is allowed and often desirable because it may start stronger; random initialization exists to opt out when measuring the algorithmic/performance path. Torch compile latency can dominate first-step SVD cost in practice, so treat cold-start complaints proportionally.
+
 ## Ground rules
 
 - Do not fork HeavyBall unless explicitly asked.
@@ -49,10 +57,12 @@ The first useful implementation is not the fanciest one. Build in this order:
 - Matrix parameters should not store full-size first moments.
 - Matrix parameters should not store full-size second moments in the main path.
 - Non-2D params should use a boring fallback optimizer path.
+- Fallback optimizer behavior should be classic AdamW/FlashOptim-style, implemented through HeavyBall where possible, with no moment quantization unless explicitly chosen. ECC/state ECC and param ECC are important compatibility targets.
 - Round-robin scheduling applies to subspace refresh/rotation, not to ordinary per-step optimization.
 - Orthogonalization happens inside the projected subspace.
 - Grassmannian tracking is expected to become the main update method after v1 correctness is established.
-- Exact SVD is acceptable for correctness mode; Newton-Schulz/polar is the likely performance mode.
+- Exact SVD initialization is the default because it may improve early adaptation. Random initialization is an opt-out for ablation and performance-path measurement.
+- Fast orthogonalization should move up quickly: prefer HeavyBall's Newton-Schulz/polar machinery, and check whether HeavyBall is using a PolarExpress-style algorithm before inventing a local substitute.
 
 ## Performance notes
 
@@ -61,6 +71,8 @@ Past optimizer experiments hit a kernel-launch wall. Too many tiny decomposition
 For SUMOTrack, round-robin refresh may reduce decomposition pressure because only rotations are staggered. However, projection and orthogonalization still happen every step, so watch kernel-launch count and module-count scaling.
 
 Prefer matmul-shaped hot paths. HeavyBall's optimized Newton-Schulz/polar implementation is likely faster than decomposition-based orthogonalization because it is mostly matmuls.
+
+Orthogonalization quality and optimizer learning rate are coupled. When swapping exact SVD orthogonalization for a fast approximate path, expect LR tuning to be part of the experiment rather than treating equal LR as a fair comparison.
 
 ## Future projected-gradient path
 
