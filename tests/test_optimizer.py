@@ -10,6 +10,7 @@ class SubspaceMuonTest(unittest.TestCase):
         weight = torch.nn.Parameter(torch.randn(6, 4))
         bias = torch.nn.Parameter(torch.randn(4))
         opt = SubspaceMuon([weight, bias], lr=0.01, rank=2)
+        opt.diagnostics_enabled = True
         weight_before = weight.detach().clone()
         bias_before = bias.detach().clone()
 
@@ -19,6 +20,9 @@ class SubspaceMuonTest(unittest.TestCase):
 
         self.assertFalse(torch.equal(weight, weight_before))
         self.assertFalse(torch.equal(bias, bias_before))
+        self.assertGreater(opt.last_step_diagnostics["update_norm"], 0.0)
+        self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
+        self.assertGreater(opt.last_step_diagnostics["fallback_update_norm"], 0.0)
 
     def test_matrix_state_keeps_projected_moment_only(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
@@ -123,6 +127,16 @@ class SubspaceMuonTest(unittest.TestCase):
         ortho_opt.step()
 
         self.assertFalse(torch.allclose(plain, ortho))
+
+    def test_muon_scale_uses_original_matrix_shape_not_projected_rank(self):
+        update = torch.ones(1024, 64)
+        ortho = torch.ones_like(update)
+
+        projected_scaled = SubspaceMuon._scale_orthogonalized_update(update, ortho, "scale", (1024, 512))
+        muon_scaled = SubspaceMuon._scale_orthogonalized_update(update, ortho, "muon", (1024, 512))
+
+        self.assertAlmostEqual(float(projected_scaled[0, 0]), 4.0)
+        self.assertAlmostEqual(float(muon_scaled[0, 0]), 2.0**0.5)
 
     def test_heavyball_orthogonalization_keeps_projected_state_shape(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))

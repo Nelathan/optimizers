@@ -43,6 +43,34 @@ def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
     )
 
 
+@torch.no_grad()
+def tensor_global_norm(tensors) -> float:
+    norm_sq = 0.0
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        norm = tensor.detach().float().norm()
+        norm_sq += float(norm.square().cpu())
+    return norm_sq**0.5
+
+
+@torch.no_grad()
+def parameter_norm(params: list[torch.nn.Parameter]) -> float:
+    return tensor_global_norm(params)
+
+
+@torch.no_grad()
+def gradient_norm(params: list[torch.nn.Parameter]) -> float:
+    return tensor_global_norm([param.grad for param in params if param.grad is not None])
+
+
+def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float:
+    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
+    if not diagnostics:
+        return float("nan")
+    return float(diagnostics.get("update_norm", float("nan")))
+
+
 def synth_texts(data_dir: Path, split: str, limit: int) -> list[str]:
     shards = sorted(data_dir.glob("synth_*.parquet"))
     if not shards:
@@ -175,7 +203,15 @@ def evaluate_loss(model, batches) -> float:
     return sum(losses) / len(losses)
 
 
-def train_step(model, optimizer: torch.optim.Optimizer, batches, start_index: int, grad_accum_steps: int) -> float:
+def train_step(
+    model,
+    optimizer: torch.optim.Optimizer,
+    trainable: list[torch.nn.Parameter],
+    batches,
+    start_index: int,
+    grad_accum_steps: int,
+    log_norms: bool,
+) -> dict[str, float]:
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
@@ -183,8 +219,26 @@ def train_step(model, optimizer: torch.optim.Optimizer, batches, start_index: in
         loss = model(**batch).loss
         (loss / grad_accum_steps).backward()
         losses.append(float(loss.detach().float().cpu()))
+    grad_norm = gradient_norm(trainable) if log_norms else float("nan")
+    param_norm = parameter_norm(trainable) if log_norms else float("nan")
     optimizer.step()
-    return sum(losses) / len(losses)
+    update_norm = optimizer_update_norm(optimizer) if log_norms else float("nan")
+    return {
+        "loss": sum(losses) / len(losses),
+        "grad_norm": grad_norm,
+        "param_norm": param_norm,
+        "update_norm": update_norm,
+        "update_to_param_ratio": update_norm / param_norm if param_norm > 0 else float("nan"),
+    }
+
+
+def finite_values(values: list[float]) -> list[float]:
+    return [value for value in values if value == value]
+
+
+def mean_or_nan(values: list[float]) -> float:
+    finite = finite_values(values)
+    return sum(finite) / len(finite) if finite else float("nan")
 
 
 def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[str], val_texts: list[str], device: torch.device) -> dict[str, float | int | str]:
@@ -211,6 +265,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
             grassmann_step_size=args.grassmann_step_size,
             subspace_refresh_budget=args.subspace_refresh_budget,
         )
+        optimizer.diagnostics_enabled = args.log_norms
     elif optimizer_name in {"adamw", "torch_adamw"}:
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
     elif optimizer_name in {"heavyball_adamw", "hb_adamw"}:
@@ -219,12 +274,12 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         raise ValueError(optimizer_name)
 
     initial_val = evaluate_loss(model, val_batches)
-    warmup_losses = []
-    measured_losses = []
+    warmup_steps = []
+    measured_steps = []
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
-        warmup_losses.append(train_step(model, optimizer, train_batches, batch_index, args.grad_accum_steps))
+        warmup_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -232,19 +287,27 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     start_time = time.perf_counter()
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
-        measured_losses.append(train_step(model, optimizer, train_batches, batch_index, args.grad_accum_steps))
+        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
     final_val = evaluate_loss(model, val_batches)
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+    warmup_losses = [step["loss"] for step in warmup_steps]
+    measured_losses = [step["loss"] for step in measured_steps]
+    measured_grad_norms = [step["grad_norm"] for step in measured_steps]
+    measured_param_norms = [step["param_norm"] for step in measured_steps]
+    measured_update_norms = [step["update_norm"] for step in measured_steps]
+    measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     result = {
         "optimizer": optimizer_name,
         "param_scope": args.param_scope,
         "subspace_init": args.subspace_init if optimizer_name == "subspace" else "n/a",
         "orthogonalization": args.orthogonalization if optimizer_name == "subspace" else "n/a",
         "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "subspace" else "n/a",
+        "heavyball_orthogonalization_mode": args.heavyball_orthogonalization_mode if optimizer_name == "subspace" else "n/a",
         "grad_accum_steps": args.grad_accum_steps,
+        "norm_logging": int(args.log_norms),
         "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
         "trainable_params": param_stats["selected_params"],
         "trainable_tensors": param_stats["selected_tensors"],
@@ -264,6 +327,14 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "mean_measured_train_loss": sum(measured_losses) / len(measured_losses),
         "min_measured_train_loss": min(measured_losses),
         "max_measured_train_loss": max(measured_losses),
+        "mean_measured_grad_norm": mean_or_nan(measured_grad_norms),
+        "mean_measured_param_norm": mean_or_nan(measured_param_norms),
+        "mean_measured_update_norm": mean_or_nan(measured_update_norms),
+        "mean_measured_update_to_param_ratio": mean_or_nan(measured_update_to_param_ratios),
+        "last_measured_grad_norm": measured_grad_norms[-1],
+        "last_measured_param_norm": measured_param_norms[-1],
+        "last_measured_update_norm": measured_update_norms[-1],
+        "last_measured_update_to_param_ratio": measured_update_to_param_ratios[-1],
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
@@ -353,13 +424,14 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
     parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball"), default="svd")
-    parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft"), default="scale")
+    parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
     parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
     parser.add_argument("--subspace-lr", type=float, default=0.0025)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--subspace-refresh-budget", type=int, default=1)
+    parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SubspaceMuon update norms; adds reduction overhead")
     parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
     args = parser.parse_args()
 

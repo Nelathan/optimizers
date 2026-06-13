@@ -71,4 +71,94 @@ Notes:
 - No-ortho improved when moved from `0.0025` to `0.01`, but still did not catch orthogonalized `0.0025`.
 - Orthogonalized `0.01` overshot badly, so LR tuning matters; HeavyBall's `0.0025` default landed near the useful region for this setup.
 - AdamW remains a quality anchor, not the target budget. Torch fused AdamW fit this matrix-only scope but used about 4.14 GB of optimizer state and 9.1 GB peak CUDA before embeddings/full fallback params. HeavyBall AdamW OOMed on the same scope during a one-step plumbing check.
-- Direct eager HeavyBall orthogonalization is wired, but local compiled HeavyBall paths are blocked by missing `Python.h`. With compile disabled, the first-step SVD initialization dominates tiny one-step checks. Fast HeavyBall polar/NS should be treated as an integration task, not judged from uncompiled one-step smoke timing.
+- At the time of this ablation, local compiled HeavyBall paths were blocked by missing `Python.h`, so HeavyBall polar/NS was treated as a separate integration task rather than judged from uncompiled one-step smoke timing. Later notes below record the machine fix and compiled Newton-Schulz results.
+
+## 2026-06-13: Norm-logged longer SUMO vs projected momentum
+
+Question: after adding grad/param/update norm telemetry, does no-orthogonalization projected momentum catch SUMO when given a wider LR search and more tokens per optimizer update?
+
+Setup:
+
+- Same LFM/SYNTH `matrices-no-embeddings` scope as above: 92 2D tensors, 1,035,993,088 trainable params.
+- Rank: 64.
+- Init: `subspace_init=svd`.
+- Steps: 1 warmup + 40 measured optimizer steps.
+- Tokens/update: 1536 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=8`).
+- Validation texts: 16.
+- Norm logging: enabled. `update_norm` is the actual `SubspaceMuon` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
+
+Representative command shape:
+
+```bash
+HF_HUB_OFFLINE=1 uv run python experiments/llm_synth_smoke.py \
+  --optimizers subspace --param-scope matrices-no-embeddings \
+  --warmup-steps 1 --measure-steps 40 \
+  --seq-len 192 --batch-size 1 --grad-accum-steps 8 --val-texts 16 \
+  --rank 64 --subspace-init svd --orthogonalization <svd|none> \
+  --subspace-lr <lr> --log-norms
+```
+
+Results:
+
+| orthogonalization | lr | final val | mean train | mean grad norm | mean update norm | update/param | step seconds |
+| --- | ---: | --------: | ---------: | -------------: | ---------------: | -----------: | -----------: |
+| SVD SUMO | 0.0025 | 1.593341 | 1.861647 | 10.945538 | 0.191900 | 0.000491 | 0.559974 |
+| SVD SUMO | 0.003 | 1.616218 | 1.863523 | 10.740152 | 0.230280 | 0.000590 | 0.555029 |
+| SVD SUMO | 0.004 | 1.663988 | 1.893716 | 10.412884 | 0.307040 | 0.000786 | 0.553619 |
+| no ortho | 0.01 | 1.699018 | 2.031259 | 11.752147 | 0.023460 | 0.000060 | 0.449519 |
+| no ortho | 0.02 | 1.631776 | 1.948476 | 11.283048 | 0.036870 | 0.000094 | 0.437304 |
+| no ortho | 0.04 | 1.612252 | 1.911619 | 10.968435 | 0.060896 | 0.000156 | 0.437575 |
+| no ortho | 0.08 | 1.639280 | 1.943709 | 10.999331 | 0.108202 | 0.000277 | 0.437675 |
+
+Notes:
+
+- No-ortho was under-tuned in the earlier ablation; it improves substantially when moved above `0.01`, with the best tested point at `0.04`.
+- SUMO still has the best tested validation loss (`1.593341` at LR `0.0025`) at the same 88.9 MB optimizer-state budget.
+- The norm telemetry argues this is not just “take a bigger raw projected-momentum step.” No-ortho degrades by LR `0.08` while its mean update norm (`0.108`) remains well below SUMO LR `0.0025` (`0.192`). SUMO is changing the update geometry and scale together.
+- Eager projected-space SVD costs about 25-30% step time in this norm-logged run (`~0.56s` vs `~0.44s`). This strengthens the case for integrating HeavyBall polar/Newton-Schulz as the next performance cut, but not at the cost of losing the observed SUMO geometry.
+
+## 2026-06-13: Compiled HeavyBall Newton-Schulz orthogonalization
+
+Question: can HeavyBall's compiled Newton-Schulz orthogonalization replace exact projected-space SVD without drifting from the SVD correctness baseline?
+
+Machine fix:
+
+- Torch/Inductor initially failed because `/usr/include/python3.14/Python.h` was missing.
+- Fedora package fix: install `python3-devel` matching Python `3.14.5`.
+- Downstream signal after install: HeavyBall compiled `inplace_orthogonal_` ran on CUDA for `newtonschulz`, `thinky_polar_express`, and `svd` modes.
+
+Scale semantics:
+
+- HeavyBall Muon's `orthogonalize_update` defaults to `scale_mode="scale"`, which flattens the full parameter to `[rows, cols]` and multiplies by `sqrt(max(1, rows / cols))`.
+- Applying that same `"scale"` mode directly to a SUMO projected tensor can multiply by `sqrt(full_dim / rank)`, which is a different and often much larger scale.
+- Added `orthogonalization_scale_mode="muon"`: orthogonalize in projected space, but scale according to the original full matrix shape. This preserves HeavyBall Muon aspect scaling without letting rank become an accidental LR multiplier.
+- HeavyBall's `thinky_polar_express` path is only selected for square matrices; HeavyBall falls back to Newton-Schulz for rectangular tensors. SUMO projected updates are generally rectangular, so the practical HeavyBall hot path here is Newton-Schulz.
+
+Short scale smoke:
+
+| mode | scale mode | final val | mean update norm | note |
+| --- | --- | ---: | ---: | --- |
+| HeavyBall NS | projected `scale` | 2.898771 | 1.513056 | unstable at LR `0.0025`; projected-rank scaling too large |
+| HeavyBall NS | `none` | 2.058131 | 0.095534 | descends, but drops HeavyBall Muon aspect scaling |
+| HeavyBall NS | `muon` | 1.984581 | 0.143622 | descends and preserves full-matrix Muon scaling |
+
+Rank-64 LFM/SYNTH comparison:
+
+- Same matrix-only LFM/SYNTH setup as above.
+- Rank: 64.
+- Init: `subspace_init=svd`.
+- Steps: 1 warmup + 40 measured optimizer steps.
+- Tokens/update: 1536.
+- LR: `0.0025`.
+- Scale mode: `muon`.
+
+| orthogonalization | mode | final val | mean train | mean update norm | update/param | step seconds |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| exact SVD | baseline | 1.632313 | 1.860567 | 0.288551 | 0.000739 | 0.560159 |
+| HeavyBall | newtonschulz | 1.629435 | 1.871363 | 0.287822 | 0.000737 | 0.479736 |
+
+Notes:
+
+- HeavyBall Newton-Schulz closely matches exact SVD quality and update scale in this short run, with lower measured step time.
+- Exact SVD remains valuable as a correctness/debug baseline, but it should no longer be the main performance path.
+- The previous best unscaled SVD run (`1.593341`) is not directly comparable to the Muon-scaled runs; scale and LR are coupled. Muon-scale mode likely needs its own LR sweep.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Iterable
 
 import torch
@@ -32,7 +33,7 @@ class SubspaceMuon(Optimizer):
         side: ProjectionSide | str = ProjectionSide.AUTO,
         recovery_scale: float = 0.0,
         orthogonalization: str = "svd",
-        orthogonalization_scale_mode: str = "scale",
+        orthogonalization_scale_mode: str = "muon",
         heavyball_orthogonalization_mode: str | None = None,
         subspace_init: str = "svd",
         subspace_update_method: str = "svd_refresh",
@@ -62,8 +63,8 @@ class SubspaceMuon(Optimizer):
             raise ValueError(f"recovery_scale must be non-negative, got {recovery_scale}")
         if orthogonalization not in {"none", "svd", "heavyball"}:
             raise ValueError("orthogonalization must be 'none', 'svd', or 'heavyball'")
-        if orthogonalization_scale_mode not in {"none", "scale", "graft"}:
-            raise ValueError("orthogonalization_scale_mode must be 'none', 'scale', or 'graft'")
+        if orthogonalization_scale_mode not in {"none", "scale", "graft", "muon"}:
+            raise ValueError("orthogonalization_scale_mode must be 'none', 'scale', 'graft', or 'muon'")
         if subspace_update_method not in {"svd_refresh", "grassmann"}:
             raise ValueError("subspace_update_method must be 'svd_refresh' or 'grassmann'")
         subspace_init = ProjectorInitMethod(subspace_init).value
@@ -91,6 +92,8 @@ class SubspaceMuon(Optimizer):
             subspace_refresh_cursor=0,
         )
         super().__init__(params, defaults)
+        self.diagnostics_enabled = False
+        self.last_step_diagnostics: dict[str, float] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -98,6 +101,17 @@ class SubspaceMuon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        diagnostics = (
+            {
+                "matrix_update_norm_sq": 0.0,
+                "fallback_update_norm_sq": 0.0,
+                "matrix_params": 0,
+                "fallback_params": 0,
+            }
+            if self.diagnostics_enabled
+            else None
+        )
 
         for group in self.param_groups:
             matrix_params = [p for p in group["params"] if p.grad is not None and p.ndim == 2]
@@ -110,9 +124,19 @@ class SubspaceMuon(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("SubspaceMuon does not support sparse gradients")
                 if p.ndim == 2:
-                    self._step_matrix_param(p, grad, group, id(p) in refresh_ids)
+                    self._step_matrix_param(p, grad, group, id(p) in refresh_ids, diagnostics)
                 else:
-                    self._step_fallback_param(p, grad, group)
+                    self._step_fallback_param(p, grad, group, diagnostics)
+
+        if diagnostics is not None:
+            matrix_update_norm = diagnostics["matrix_update_norm_sq"] ** 0.5
+            fallback_update_norm = diagnostics["fallback_update_norm_sq"] ** 0.5
+            diagnostics["matrix_update_norm"] = matrix_update_norm
+            diagnostics["fallback_update_norm"] = fallback_update_norm
+            diagnostics["update_norm"] = (diagnostics["matrix_update_norm_sq"] + diagnostics["fallback_update_norm_sq"]) ** 0.5
+            self.last_step_diagnostics = diagnostics
+        else:
+            self.last_step_diagnostics = {}
 
         return loss
 
@@ -126,7 +150,7 @@ class SubspaceMuon(Optimizer):
         group["subspace_refresh_cursor"] = (cursor + budget) % len(matrix_params)
         return {id(matrix_params[index]) for index in refresh}
 
-    def _step_matrix_param(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> None:
+    def _step_matrix_param(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool, diagnostics: dict | None) -> None:
         state = self.state[p]
         state["step"] = state.get("step", 0) + 1
 
@@ -141,7 +165,7 @@ class SubspaceMuon(Optimizer):
         projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
         state["projected_exp_avg"] = projected_exp_avg
 
-        update_hat = self._orthogonalize_update(projected_exp_avg, group)
+        update_hat = self._orthogonalize_update(projected_exp_avg, group, tuple(p.shape))
         update = projector.project_back(update_hat).to(dtype=p.dtype)
 
         recovery_scale = group["recovery_scale"]
@@ -151,9 +175,12 @@ class SubspaceMuon(Optimizer):
 
         if group["weight_decay"]:
             p.mul_(1.0 - group["lr"] * group["weight_decay"])
+        if diagnostics is not None:
+            diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
+            diagnostics["matrix_params"] += p.numel()
         p.add_(update, alpha=-group["lr"])
 
-    def _step_fallback_param(self, p: Tensor, grad: Tensor, group: dict) -> None:
+    def _step_fallback_param(self, p: Tensor, grad: Tensor, group: dict, diagnostics: dict | None) -> None:
         state = self.state[p]
         state["step"] = state.get("step", 0) + 1
         beta1, beta2 = group["fallback_betas"]
@@ -173,7 +200,11 @@ class SubspaceMuon(Optimizer):
         bias_correction1 = 1.0 - beta1 ** state["step"]
         bias_correction2 = 1.0 - beta2 ** state["step"]
         denom = exp_avg_sq.sqrt().div_(bias_correction2**0.5).add_(group["eps"])
-        p.addcdiv_(exp_avg / bias_correction1, denom, value=-group["lr"])
+        update = (exp_avg / bias_correction1) / denom
+        if diagnostics is not None:
+            diagnostics["fallback_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
+            diagnostics["fallback_params"] += p.numel()
+        p.add_(update, alpha=-group["lr"])
 
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict) -> None:
         old_projected_exp_avg = state.get("projected_exp_avg")
@@ -203,13 +234,18 @@ class SubspaceMuon(Optimizer):
                 state.pop("projected_exp_avg", None)
 
     @staticmethod
-    def _orthogonalize_update(update: Tensor, group: dict) -> Tensor:
+    def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
         if group["orthogonalization"] == "none":
             return update
         if group["orthogonalization"] == "svd":
-            return SubspaceMuon._orthogonalize_svd(update)
+            return SubspaceMuon._scale_orthogonalized_update(
+                update,
+                SubspaceMuon._orthogonalize_svd(update),
+                group["orthogonalization_scale_mode"],
+                original_shape,
+            )
         if group["orthogonalization"] == "heavyball":
-            return SubspaceMuon._orthogonalize_heavyball(update, group)
+            return SubspaceMuon._orthogonalize_heavyball(update, group, original_shape)
         raise AssertionError(f"unexpected orthogonalization mode: {group['orthogonalization']}")
 
     @staticmethod
@@ -219,20 +255,39 @@ class SubspaceMuon(Optimizer):
         return (u @ vh).to(dtype=update.dtype, device=update.device)
 
     @staticmethod
-    def _orthogonalize_heavyball(update: Tensor, group: dict) -> Tensor:
+    def _orthogonalize_heavyball(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
         work = update.clone()
-        old_compile_mode = heavyball_utils.compile_mode
-        heavyball_utils.compile_mode = None
-        try:
-            heavyball_utils.inplace_orthogonal_(
-                work,
-                mode=group["heavyball_orthogonalization_mode"],
-                out=work,
-                scale_mode=group["orthogonalization_scale_mode"],
-            )
-        finally:
-            heavyball_utils.compile_mode = old_compile_mode
+        scale_mode = group["orthogonalization_scale_mode"]
+        heavyball_utils.inplace_orthogonal_(
+            work,
+            mode=group["heavyball_orthogonalization_mode"],
+            out=work,
+            scale_mode="none" if scale_mode == "muon" else scale_mode,
+        )
+        if scale_mode == "muon":
+            work = SubspaceMuon._scale_orthogonalized_update(update, work, scale_mode, original_shape)
         return work
+
+    @staticmethod
+    def _scale_orthogonalized_update(
+        original_update: Tensor,
+        orthogonalized_update: Tensor,
+        scale_mode: str,
+        original_shape: tuple[int, ...] | None,
+    ) -> Tensor:
+        if scale_mode == "none":
+            return orthogonalized_update
+        if scale_mode == "scale":
+            return orthogonalized_update * math.sqrt(max(1.0, original_update.shape[-2] / original_update.shape[-1]))
+        if scale_mode == "graft":
+            return orthogonalized_update * (original_update.norm() / orthogonalized_update.norm().clamp(min=1e-6))
+        if scale_mode == "muon":
+            if original_shape is None or len(original_shape) < 2:
+                raise ValueError("muon scale mode requires the original parameter shape")
+            rows = original_shape[0]
+            cols = math.prod(original_shape[1:])
+            return orthogonalized_update * math.sqrt(max(1.0, rows / cols))
+        raise AssertionError(f"unexpected orthogonalization scale mode: {scale_mode}")
 
     @staticmethod
     def _projector_from_state(p: Tensor, group: dict, state: dict) -> SubspaceProjector:

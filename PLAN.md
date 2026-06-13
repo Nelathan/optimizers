@@ -107,7 +107,7 @@ Given the measured state sizes, rank `32` is a conservative default rather than 
 
 Performance smoke tests should use random orthogonal subspace initialization so timing measures the optimizer path rather than a wall of first-step SVDs. Convergence-quality comparisons should use SVD initialization explicitly, because good initialization is part of the algorithmic question. Do not time cold-start SVD as representative steady-state performance.
 
-Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In a rank-64, SVD-init, non-embedding-matrix LFM run, orthogonalized `SubspaceMuon` at HeavyBall's Muon-scale default LR (`0.0025`) beat the no-orthogonalization projected-momentum ablation even after a no-ortho LR probe. Treat this as positive directional evidence, not final optimizer proof.
+Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In rank-64, SVD-init, non-embedding-matrix LFM runs, orthogonalized `SubspaceMuon` at HeavyBall's Muon-scale default LR (`0.0025`) remains the best tested point after a wider no-ortho LR sweep. The caveat is useful: raw projected momentum was under-tuned at low LR and improves up to about `0.04`, so future comparisons must be LR-aware. Norm telemetry suggests SUMO's advantage is not explained by raw update norm alone; no-ortho begins degrading while its update norm is still below SUMO's. Treat this as positive directional evidence, not final optimizer proof.
 
 AdamW is a quality anchor, not a target budget. Full 2x-fp32 optimizer state is outside the intended feasibility envelope; the product goal is to make broad/full fine-tuning possible on consumer GPUs where users would otherwise retreat to memory-frugal LoRA/Unsloth-style paths. Compare against AdamW to understand quality, but do not let AdamW's state budget define success.
 
@@ -133,11 +133,11 @@ Likely performance ladder:
 
 1. Correct eager implementation.
 2. Use HeavyBall chainable transforms enough to inherit ECC/update behavior.
-3. Replace exact SVD orthogonalization with HeavyBall Newton-Schulz/polar for the hot path, checking HeavyBall's PolarExpress mode rather than inventing a local substitute.
+3. Replace exact SVD orthogonalization with HeavyBall Newton-Schulz for the hot path. HeavyBall's PolarExpress mode is square-matrix-only in practice because rectangular tensors route through Newton-Schulz, and SUMO projected updates are usually rectangular.
 4. Bucket same-shape projected moments for batched NS or batched eig/SVD where useful.
 5. Only then consider invasive autograd tricks.
 
-Orthogonalization and LR are coupled. Muon-style orthogonalized updates can want LR scales far above classic LLM AdamW defaults; use HeavyBall defaults as the first prior and tune around them. Equal LR comparisons between no-ortho projected momentum and orthogonalized projected momentum are diagnostic but not final fairness.
+Orthogonalization, scaling, and LR are coupled. HeavyBall Muon scales full-matrix orthogonalized updates by `sqrt(max(1, rows / cols))`. In SUMO, applying that rule directly to the projected tensor can accidentally introduce a `sqrt(full_dim / rank)` multiplier; prefer the explicit `orthogonalization_scale_mode="muon"` semantic, which orthogonalizes in projected space but scales from the original full matrix shape. Muon-style orthogonalized updates can want LR scales far above classic LLM AdamW defaults; use HeavyBall defaults as the first prior and tune around them. Equal LR comparisons between no-ortho projected momentum and orthogonalized projected momentum are diagnostic but not final fairness.
 
 ## Future memory frontier: projected activations
 
@@ -164,6 +164,26 @@ SUMOTrack v1 is worth continuing if it can show:
 - refresh spikes that are visible but tolerable.
 
 Do not declare victory from a green unit test. The observable downstream signals are loss curves, peak memory, step time, state size, and restart correctness.
+
+## Next strategic arc: full/broad fine-tuning path
+
+The current matrix-only LFM/SYNTH evidence has done its first job: SUMO-style projected moment orthogonalization has signal, HeavyBall Newton-Schulz can replace exact projected-space SVD as the hot path, and full-matrix Muon scaling is now separated from projected-rank scaling. The next goal is not a slightly longer matrix-only run. The next goal is to make SUMOTrack a credible full/broad fine-tuning optimizer rather than a clean matrix-path ablation.
+
+The key question is whether SUMOTrack survives real model parameter topology while preserving the memory invariant:
+
+- 2D matrix params use projected first moments and projector state, with no full-size first or second moments.
+- Non-2D params, embeddings, heads, norms, biases, and tiny kernels are either explicitly frozen or handled by a boring fallback optimizer path.
+- Fallback state is accounted separately so embeddings/lm-head cannot hide inside an attractive total-state number.
+
+The next implementation arc should deliver:
+
+1. **HeavyBall-backed fallback semantics.** Replace the local toy AdamW fallback where practical with HeavyBall-backed AdamW/LaProp-style behavior, including clear ECC/param-ECC behavior. Unsupported combinations should fail loudly, not silently ignore configuration.
+2. **Explicit broad parameter scopes.** Extend the LLM harness beyond `matrices-no-embeddings` with modes that make embeddings, lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors visible in the accounting.
+3. **State accounting by category.** Report matrix projected state bytes, fallback state bytes, and total optimizer state bytes. The product claim depends on where memory goes, not only on a single total.
+4. **Mixed-path restart proof.** Add a save/load/resume smoke after at least one mixed matrix+fallback step. The check should prove projected moment and basis shapes survive, fallback state survives, and the next step changes parameters.
+5. **Full/broad LFM/SYNTH smoke.** Run HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` on a representative broad parameter scope and report loss movement, state bytes by category, peak CUDA, post-compile step time, and matrix update norms.
+
+Only after that path exists should longer LR-aware quality evaluations become the main work again. Longer matrix-only evals can refine the geometry story, but they do not prove the optimizer is usable for the product goal: broad/full fine-tuning on consumer GPUs where full AdamW state is the thing users cannot afford.
 
 ## Progression gates
 
