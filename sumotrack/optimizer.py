@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from .projector import ProjectionSide, SubspaceProjector
+from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
 
 
 class SubspaceMuon(Optimizer):
@@ -30,6 +30,7 @@ class SubspaceMuon(Optimizer):
         side: ProjectionSide | str = ProjectionSide.AUTO,
         recovery_scale: float = 0.0,
         orthogonalization: str = "svd",
+        subspace_init: str = "svd",
         subspace_update_method: str = "svd_refresh",
         grassmann_step_size: float = 0.01,
         subspace_refresh_budget: int = 1,
@@ -59,6 +60,7 @@ class SubspaceMuon(Optimizer):
             raise ValueError("only orthogonalization='svd' is implemented in the eager baseline")
         if subspace_update_method not in {"svd_refresh", "grassmann"}:
             raise ValueError("subspace_update_method must be 'svd_refresh' or 'grassmann'")
+        subspace_init = ProjectorInitMethod(subspace_init).value
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
         if subspace_refresh_budget <= 0:
@@ -74,6 +76,7 @@ class SubspaceMuon(Optimizer):
             side=ProjectionSide(side).value,
             recovery_scale=recovery_scale,
             orthogonalization=orthogonalization,
+            subspace_init=subspace_init,
             subspace_update_method=subspace_update_method,
             grassmann_step_size=grassmann_step_size,
             subspace_refresh_budget=subspace_refresh_budget,
@@ -168,11 +171,13 @@ class SubspaceMuon(Optimizer):
         old_projected_exp_avg = state.get("projected_exp_avg")
         old_projector = None
         if projector.is_initialized and old_projected_exp_avg is not None:
-            old_projector = SubspaceProjector(rank=projector.rank, side=projector.side)
+            old_projector = SubspaceProjector(rank=projector.rank, side=projector.side, init_method=projector.init_method)
             old_projector.basis = projector.basis
             old_projector.resolved_side = projector.resolved_side
 
-        if not projector.is_initialized or group["subspace_update_method"] == "svd_refresh":
+        if not projector.is_initialized:
+            projector.fit(grad)
+        elif group["subspace_update_method"] == "svd_refresh":
             projector.fit_svd(grad)
         else:
             projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
@@ -197,7 +202,11 @@ class SubspaceMuon(Optimizer):
 
     @staticmethod
     def _projector_from_state(p: Tensor, group: dict, state: dict) -> SubspaceProjector:
-        projector = SubspaceProjector(rank=group["rank"], side=ProjectionSide(group["side"]))
+        projector = SubspaceProjector(
+            rank=group["rank"],
+            side=ProjectionSide(group["side"]),
+            init_method=ProjectorInitMethod(group["subspace_init"]),
+        )
         basis = state.get("basis")
         if basis is not None:
             projector.basis = basis

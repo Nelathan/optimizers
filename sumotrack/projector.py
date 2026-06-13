@@ -16,6 +16,13 @@ class ProjectionSide(StrEnum):
     RIGHT = "right"
 
 
+class ProjectorInitMethod(StrEnum):
+    """How an unfitted projector initializes its basis."""
+
+    SVD = "svd"
+    RANDOM = "random"
+
+
 @dataclass
 class SubspaceProjector:
     """Project 2D gradients into a low-dimensional orthonormal subspace.
@@ -31,6 +38,7 @@ class SubspaceProjector:
 
     rank: int = 32
     side: ProjectionSide | str = ProjectionSide.AUTO
+    init_method: ProjectorInitMethod | str = ProjectorInitMethod.SVD
     basis: Tensor | None = None
     resolved_side: ProjectionSide | None = field(default=None, init=False)
 
@@ -38,6 +46,7 @@ class SubspaceProjector:
         if self.rank <= 0:
             raise ValueError(f"rank must be positive, got {self.rank}")
         self.side = ProjectionSide(self.side)
+        self.init_method = ProjectorInitMethod(self.init_method)
 
     @property
     def is_initialized(self) -> bool:
@@ -74,6 +83,37 @@ class SubspaceProjector:
         self.basis = basis.to(device=matrix.device, dtype=matrix.dtype).contiguous()
         self.resolved_side = side
         return self.basis
+
+    @torch.no_grad()
+    def fit_random(self, matrix: Tensor) -> Tensor:
+        """Initialize the basis with QR-orthonormalized random vectors."""
+
+        self._check_matrix(matrix)
+        side = self.effective_side(matrix)
+        rank = self.effective_rank(matrix)
+        work_dtype = torch.float32 if matrix.dtype in (torch.float16, torch.bfloat16) else matrix.dtype
+
+        if side is ProjectionSide.RIGHT:
+            random_matrix = torch.randn(matrix.shape[1], rank, device=matrix.device, dtype=work_dtype)
+            q, _r = torch.linalg.qr(random_matrix, mode="reduced")
+            basis = q.mT
+        elif side is ProjectionSide.LEFT:
+            random_matrix = torch.randn(matrix.shape[0], rank, device=matrix.device, dtype=work_dtype)
+            basis, _r = torch.linalg.qr(random_matrix, mode="reduced")
+        else:  # pragma: no cover - effective_side never returns AUTO
+            raise AssertionError(f"unexpected effective side: {side}")
+
+        self.basis = basis.to(device=matrix.device, dtype=matrix.dtype).contiguous()
+        self.resolved_side = side
+        return self.basis
+
+    @torch.no_grad()
+    def fit(self, matrix: Tensor) -> Tensor:
+        if self.init_method is ProjectorInitMethod.SVD:
+            return self.fit_svd(matrix)
+        if self.init_method is ProjectorInitMethod.RANDOM:
+            return self.fit_random(matrix)
+        raise AssertionError(f"unexpected init method: {self.init_method}")
 
     @torch.no_grad()
     def project(self, matrix: Tensor) -> Tensor:
@@ -158,7 +198,7 @@ class SubspaceProjector:
 
     def _basis_for(self, matrix: Tensor) -> Tensor:
         if self.basis is None:
-            return self.fit_svd(matrix)
+            return self.fit(matrix)
         self._check_basis_matches(matrix)
         return self.basis
 

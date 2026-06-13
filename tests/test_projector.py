@@ -40,6 +40,40 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), (3, 3))
         self.assertEqual(tuple(low.shape), (3, 9))
 
+    def test_random_init_right_projection_shape_and_orthonormality(self):
+        grad = torch.randn(11, 7)
+        projector = SubspaceProjector(rank=3, init_method="random")
+
+        basis = projector.fit(grad)
+
+        self.assertEqual(tuple(basis.shape), (3, 7))
+        self.assertIs(projector.resolved_side, ProjectionSide.RIGHT)
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
+    def test_random_init_left_projection_shape_and_orthonormality(self):
+        grad = torch.randn(5, 13)
+        projector = SubspaceProjector(rank=4, init_method="random")
+
+        basis = projector.fit(grad)
+
+        self.assertEqual(tuple(basis.shape), (5, 4))
+        self.assertIs(projector.resolved_side, ProjectionSide.LEFT)
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
+    def test_random_init_preserves_dtype_device_and_clamps_rank(self):
+        grad = torch.randn(3, 9, dtype=torch.bfloat16)
+        projector = SubspaceProjector(rank=32, init_method="random")
+
+        low = projector.project(grad)
+
+        self.assertEqual(projector.effective_rank(grad), 3)
+        self.assertEqual(tuple(projector.basis.shape), (3, 3))
+        self.assertEqual(projector.basis.dtype, grad.dtype)
+        self.assertEqual(projector.basis.device, grad.device)
+        self.assertEqual(low.dtype, grad.dtype)
+        self.assertEqual(low.device, grad.device)
+        self.assertLess(float(projector.orthonormality_error()), 2e-2)
+
     def test_explicit_right_side(self):
         grad = torch.randn(4, 10)
         projector = SubspaceProjector(rank=2, side=ProjectionSide.RIGHT)

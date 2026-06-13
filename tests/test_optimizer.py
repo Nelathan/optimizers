@@ -80,6 +80,20 @@ class SubspaceMuonTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             SubspaceMuon([weight], param_ecc="bf16+8")
 
+    def test_random_subspace_init_wires_into_matrix_state(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SubspaceMuon([weight], lr=0.01, rank=2, subspace_init="random", subspace_update_method="grassmann")
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        basis = state["basis"]
+        gram = basis @ basis.mT
+        self.assertEqual(tuple(basis.shape), (2, 5))
+        self.assertTrue(torch.allclose(gram, torch.eye(2), atol=1e-5))
+        self.assertEqual(opt.param_groups[0]["subspace_init"], "random")
+
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SubspaceMuon(
