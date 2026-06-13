@@ -7,7 +7,7 @@ This is the next-iteration queue for SUMOTrack / `SubspaceMuon`. Prefer small fa
 Progression is gated by evidence, not by vibes or a locally attractive diff. Each gate should be satisfied by committed code, tests, and when relevant a small script that emits the observable signal.
 
 - [x] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
-- [ ] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
+- [x] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
 - [ ] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [ ] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
 - [ ] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
@@ -39,12 +39,12 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Phase 2: round-robin refresh scheduler
 
-- [ ] Implement stable eligible-parameter ordering.
-- [ ] Implement `subspace_refresh_budget` scheduling.
-- [ ] Implement derived `target_refresh_interval` scheduling.
-- [ ] Make wrapping behavior explicit and tested.
-- [ ] Record which parameter IDs refresh on each step for diagnostics.
-- [ ] Verify only rotations refresh round-robin; ordinary updates still run for all parameters.
+- [x] Implement stable eligible-parameter ordering.
+- [x] Implement `subspace_refresh_budget` scheduling.
+- [x] Implement derived `target_refresh_interval` scheduling.
+- [x] Make wrapping behavior explicit and tested.
+- [x] Record which parameter IDs refresh on each step for diagnostics.
+- [x] Verify only rotations refresh round-robin; ordinary updates still run for all parameters.
 
 ## Phase 3: minimal optimizer
 
