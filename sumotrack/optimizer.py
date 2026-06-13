@@ -31,7 +31,14 @@ class SubspaceMuon(Optimizer):
         recovery_scale: float = 0.0,
         orthogonalization: str = "svd",
         subspace_refresh_budget: int = 1,
+        ecc: str | None = None,
+        param_ecc: str | None = None,
     ) -> None:
+        if ecc is not None or param_ecc is not None:
+            raise NotImplementedError(
+                "SubspaceMuon does not yet support HeavyBall ECC/param-ECC. "
+                "Use the eager baseline without ECC, or wait for the HeavyBall-native integration gate."
+            )
         if lr <= 0:
             raise ValueError(f"lr must be positive, got {lr}")
         if not 0 <= beta < 1:

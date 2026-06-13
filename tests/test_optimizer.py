@@ -72,6 +72,14 @@ class SubspaceMuonTest(unittest.TestCase):
         new_opt.step()
         self.assertEqual(tuple(new_opt.state[new_weight]["projected_exp_avg"].shape), (7, 2))
 
+    def test_ecc_options_fail_loudly_until_heavyball_integration(self):
+        weight = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+
+        with self.assertRaises(NotImplementedError):
+            SubspaceMuon([weight], ecc="bf16+8")
+        with self.assertRaises(NotImplementedError):
+            SubspaceMuon([weight], param_ecc="bf16+8")
+
 
 if __name__ == "__main__":
     unittest.main()

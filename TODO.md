@@ -10,7 +10,7 @@ Progression is gated by evidence, not by vibes or a locally attractive diff. Eac
 - [x] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
 - [x] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [x] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
-- [ ] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
+- [x] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
 - [ ] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
 - [ ] **Performance gate:** optimization work is justified by measured step time, refresh spike size, state bytes, and a profiler/kernel-launch signal.
 
@@ -63,9 +63,9 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [ ] Convert the matrix path into a HeavyBall-compatible chainable transform where practical.
 - [ ] Preserve compatibility with HeavyBall `ecc="bf16+8"`.
 - [ ] Preserve compatibility with HeavyBall `param_ecc="bf16+8"`.
-- [ ] Verify warmup/clipping/caution/MARS behavior or explicitly disable unsupported combinations.
+- [x] Verify warmup/clipping/caution/MARS behavior or explicitly disable unsupported combinations.
 - [ ] Decide whether to use `SplitOpt` or local grouped delegation for fallback params.
-- [ ] Add tests for bf16 parameters with ECC enabled.
+- [x] Add tests for bf16 parameters with ECC enabled.
 
 ## Phase 5: Grassmann tracking
 
