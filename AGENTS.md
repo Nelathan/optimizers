@@ -72,6 +72,15 @@ Do not make this the baseline. If implemented, isolate it behind explicit opt-in
 
 Do not report optimizer work as done because the code imports. Optimizers fail silently and convincingly.
 
+Use the repo's `uv` environment for Python commands. System Python may not have torch installed. Preferred forms:
+
+```bash
+uv run python -m unittest discover -s tests
+uv run python experiments/<script>.py
+```
+
+If adding dependencies, update `pyproject.toml` and let `uv` update `uv.lock`; do not work around the environment by using global Python packages.
+
 Useful evidence includes:
 
 - projector shape and orthonormality tests,
