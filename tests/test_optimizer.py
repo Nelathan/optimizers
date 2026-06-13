@@ -80,6 +80,32 @@ class SubspaceMuonTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             SubspaceMuon([weight], param_ecc="bf16+8")
 
+    def test_grassmann_refresh_transports_projected_moment(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SubspaceMuon(
+            [weight],
+            lr=0.01,
+            rank=2,
+            subspace_update_method="grassmann",
+            grassmann_step_size=0.01,
+            subspace_refresh_budget=1,
+        )
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        state = opt.state[weight]
+        old_basis = state["basis"].clone()
+        old_moment = state["projected_exp_avg"].clone()
+
+        weight.grad = torch.randn_like(weight)
+        old_lifted_moment = old_moment @ old_basis
+        opt.step()
+
+        new_basis = state["basis"]
+        transported = old_lifted_moment @ new_basis.mT
+        self.assertTrue(torch.allclose(state["projected_exp_avg"], 0.9 * transported + 0.1 * (weight.grad @ new_basis.mT), atol=1e-5))
+        self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

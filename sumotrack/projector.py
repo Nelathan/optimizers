@@ -109,6 +109,40 @@ class SubspaceProjector:
         return self.project_back(self.project(matrix))
 
     @torch.no_grad()
+    def update_grassmann(self, matrix: Tensor, step_size: float) -> Tensor:
+        """Refresh the basis with a small Grassmann/Stiefel tangent step.
+
+        The update minimizes the residual of projecting ``matrix`` into the
+        current basis, then retracts with QR. This is intentionally device-safe
+        and dtype-safe rather than a literal port of SubTrack's CUDA-bound
+        rank-1 geodesic update.
+        """
+
+        if step_size <= 0:
+            raise ValueError(f"step_size must be positive, got {step_size}")
+        basis = self._basis_for(matrix)
+        side = self._basis_side()
+        work_matrix = self._svd_input(matrix)
+        work_basis = basis.float() if basis.dtype in (torch.float16, torch.bfloat16) else basis
+
+        if side is ProjectionSide.RIGHT:
+            projected = work_matrix @ work_basis.mT
+            residual = work_matrix - projected @ work_basis
+            partial = -2.0 * (projected.mT @ residual)
+            tangent = partial - (partial @ work_basis.mT) @ work_basis
+            new_basis = self._orthonormalize_rows(work_basis - step_size * tangent)
+        else:
+            projected = work_basis.mT @ work_matrix
+            residual = work_matrix - work_basis @ projected
+            partial = -2.0 * (residual @ projected.mT)
+            tangent = partial - work_basis @ (work_basis.mT @ partial)
+            new_basis = self._orthonormalize_columns(work_basis - step_size * tangent)
+
+        self.basis = new_basis.to(device=matrix.device, dtype=matrix.dtype).contiguous()
+        self.resolved_side = side
+        return self.basis
+
+    @torch.no_grad()
     def orthonormality_error(self) -> Tensor:
         """Return max absolute deviation from basis orthonormality."""
 
@@ -160,3 +194,13 @@ class SubspaceProjector:
         if matrix.dtype in (torch.float16, torch.bfloat16):
             return matrix.float()
         return matrix
+
+    @staticmethod
+    def _orthonormalize_rows(matrix: Tensor) -> Tensor:
+        q, _r = torch.linalg.qr(matrix.mT, mode="reduced")
+        return q.mT
+
+    @staticmethod
+    def _orthonormalize_columns(matrix: Tensor) -> Tensor:
+        q, _r = torch.linalg.qr(matrix, mode="reduced")
+        return q

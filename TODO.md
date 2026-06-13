@@ -11,7 +11,7 @@ Progression is gated by evidence, not by vibes or a locally attractive diff. Eac
 - [x] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [x] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
 - [x] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
-- [ ] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
+- [x] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
 - [ ] **Performance gate:** optimization work is justified by measured step time, refresh spike size, state bytes, and a profiler/kernel-launch signal.
 
 Projected-gradient hooks stay locked until the ordinary-gradient baseline clears the optimizer state, descent, and HeavyBall/ECC gates.
@@ -69,12 +69,12 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Phase 5: Grassmann tracking
 
-- [ ] Port SubTrack's Grassmannian update into `sumotrack/projector.py`.
-- [ ] Replace hard SVD refresh with `subspace_update_method="grassmann"` after initialization.
-- [ ] Implement projected moment transport across basis updates.
-- [ ] Test moment transport against explicit old-basis/new-basis projection formulas.
+- [x] Implement device-safe Grassmann/Stiefel tangent update in `sumotrack/projector.py`.
+- [x] Replace hard SVD refresh with `subspace_update_method="grassmann"` after initialization.
+- [x] Implement projected moment transport across basis updates.
+- [x] Test moment transport against explicit old-basis/new-basis projection formulas.
 - [ ] Add accumulated-gradient tracking option.
-- [ ] Compare SVD refresh vs Grassmann update on tiny transformer loss and step time.
+- [x] Compare SVD refresh vs Grassmann update on tiny regression loss and step time.
 
 ## Phase 6: performance work
 

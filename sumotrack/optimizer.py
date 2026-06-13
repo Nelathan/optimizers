@@ -30,6 +30,8 @@ class SubspaceMuon(Optimizer):
         side: ProjectionSide | str = ProjectionSide.AUTO,
         recovery_scale: float = 0.0,
         orthogonalization: str = "svd",
+        subspace_update_method: str = "svd_refresh",
+        grassmann_step_size: float = 0.01,
         subspace_refresh_budget: int = 1,
         ecc: str | None = None,
         param_ecc: str | None = None,
@@ -55,6 +57,10 @@ class SubspaceMuon(Optimizer):
             raise ValueError(f"recovery_scale must be non-negative, got {recovery_scale}")
         if orthogonalization != "svd":
             raise ValueError("only orthogonalization='svd' is implemented in the eager baseline")
+        if subspace_update_method not in {"svd_refresh", "grassmann"}:
+            raise ValueError("subspace_update_method must be 'svd_refresh' or 'grassmann'")
+        if grassmann_step_size <= 0:
+            raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
         if subspace_refresh_budget <= 0:
             raise ValueError(f"subspace_refresh_budget must be positive, got {subspace_refresh_budget}")
 
@@ -68,6 +74,8 @@ class SubspaceMuon(Optimizer):
             side=ProjectionSide(side).value,
             recovery_scale=recovery_scale,
             orthogonalization=orthogonalization,
+            subspace_update_method=subspace_update_method,
+            grassmann_step_size=grassmann_step_size,
             subspace_refresh_budget=subspace_refresh_budget,
             subspace_refresh_cursor=0,
         )
@@ -113,14 +121,7 @@ class SubspaceMuon(Optimizer):
 
         projector = self._projector_from_state(p, group, state)
         if not projector.is_initialized or refresh_basis:
-            old_shape = tuple(state["projected_exp_avg"].shape) if "projected_exp_avg" in state else None
-            projector.fit_svd(grad)
-            state["basis"] = projector.basis
-            resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
-            state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
-            projected_shape = tuple(projector.project(grad).shape)
-            if old_shape is not None and old_shape != projected_shape:
-                state.pop("projected_exp_avg", None)
+            self._refresh_projector(projector, grad, group, state)
 
         projected_grad = projector.project(grad)
         projected_exp_avg = state.get("projected_exp_avg")
@@ -162,6 +163,31 @@ class SubspaceMuon(Optimizer):
         bias_correction2 = 1.0 - beta2 ** state["step"]
         denom = exp_avg_sq.sqrt().div_(bias_correction2**0.5).add_(group["eps"])
         p.addcdiv_(exp_avg / bias_correction1, denom, value=-group["lr"])
+
+    def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict) -> None:
+        old_projected_exp_avg = state.get("projected_exp_avg")
+        old_projector = None
+        if projector.is_initialized and old_projected_exp_avg is not None:
+            old_projector = SubspaceProjector(rank=projector.rank, side=projector.side)
+            old_projector.basis = projector.basis
+            old_projector.resolved_side = projector.resolved_side
+
+        if not projector.is_initialized or group["subspace_update_method"] == "svd_refresh":
+            projector.fit_svd(grad)
+        else:
+            projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+
+        state["basis"] = projector.basis
+        resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
+        state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
+
+        if old_projector is not None:
+            lifted_moment = old_projector.project_back(old_projected_exp_avg)
+            state["projected_exp_avg"] = projector.project(lifted_moment)
+        elif old_projected_exp_avg is not None:
+            projected_shape = tuple(projector.project(grad).shape)
+            if tuple(old_projected_exp_avg.shape) != projected_shape:
+                state.pop("projected_exp_avg", None)
 
     @staticmethod
     def _orthogonalize_svd(update: Tensor) -> Tensor:

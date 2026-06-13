@@ -71,6 +71,18 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(lifted.dtype, grad.dtype)
         self.assertEqual(lifted.device, grad.device)
 
+    def test_grassmann_update_preserves_orthonormality_and_device(self):
+        grad = torch.randn(9, 5)
+        projector = SubspaceProjector(rank=3)
+        old_basis = projector.fit_svd(grad).clone()
+
+        projector.update_grassmann(torch.randn_like(grad), step_size=0.01)
+
+        self.assertEqual(projector.basis.device, grad.device)
+        self.assertEqual(projector.basis.dtype, grad.dtype)
+        self.assertEqual(tuple(projector.basis.shape), tuple(old_basis.shape))
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
