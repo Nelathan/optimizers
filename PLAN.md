@@ -148,3 +148,19 @@ SUMOTrack v1 is worth continuing if it can show:
 - refresh spikes that are visible but tolerable.
 
 Do not declare victory from a green unit test. The observable downstream signals are loss curves, peak memory, step time, state size, and restart correctness.
+
+## Progression gates
+
+Each phase must leave behind a checked signal before the next phase becomes the main thread. If a gate fails, stop and repair the concept or implementation before piling on features. A narrow green test is useful only when it protects the real invariant named by the gate.
+
+The gates are:
+
+1. **Projector gate:** projection shape, lift shape, orthonormality, rank clamping, dtype/device behavior, and side selection are tested for both tall and wide matrices.
+2. **Scheduler gate:** round-robin refresh order is deterministic, wraps explicitly, supports budget and target interval controls, and demonstrably schedules only basis refreshes rather than ordinary optimizer updates.
+3. **Optimizer state gate:** one optimizer step changes parameters, matrix parameters store only projected moments and projector state, fallback parameters update, and save/load resumes without state shape drift.
+4. **Descent gate:** a tiny no-download training script shows reproducible loss descent and prints enough state accounting to catch accidental AdamW-sized matrix state.
+5. **HeavyBall/ECC gate:** bf16 matrix params run with HeavyBall ECC/param-ECC compatibility or unsupported combinations are explicitly rejected rather than silently ignored.
+6. **Grassmann gate:** basis updates preserve orthonormality, projected moments are transported across basis changes, and Grassmann tracking matches or beats periodic SVD refresh on a tiny wall-clock-aware smoke test.
+7. **Performance gate:** any optimization phase must report step time, refresh spike size, state bytes, and enough profiling signal to show the bottleneck being attacked is real.
+
+Projected-gradient hooks remain behind all baseline gates. They are not allowed to become the explanation for why the ordinary-gradient optimizer has not yet been proven.

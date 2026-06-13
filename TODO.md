@@ -2,24 +2,38 @@
 
 This is the next-iteration queue for SUMOTrack / `SubspaceMuon`. Prefer small falsifiable cuts over heroic optimizer theatre.
 
+## Gates before advancing
+
+Progression is gated by evidence, not by vibes or a locally attractive diff. Each gate should be satisfied by committed code, tests, and when relevant a small script that emits the observable signal.
+
+- [ ] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
+- [ ] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
+- [ ] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
+- [ ] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
+- [ ] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
+- [ ] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
+- [ ] **Performance gate:** optimization work is justified by measured step time, refresh spike size, state bytes, and a profiler/kernel-launch signal.
+
+Projected-gradient hooks stay locked until the ordinary-gradient baseline clears the optimizer state, descent, and HeavyBall/ECC gates.
+
 ## Phase 0: repo/package setup
 
-- [ ] Add an editable HeavyBall path dependency in `pyproject.toml`.
-- [ ] Create the `sumotrack/` package.
+- [x] Add an editable HeavyBall path dependency in `pyproject.toml`.
+- [x] Create the `sumotrack/` package.
 - [ ] Export `SubspaceMuon` from `sumotrack/__init__.py`.
 - [ ] Add a minimal smoke script under `experiments/`.
-- [ ] Add a tiny test harness that can run without downloading a large model.
+- [x] Add a tiny test harness that can run without downloading a large model.
 
 ## Phase 1: projector correctness
 
-- [ ] Implement `SubspaceProjector` for 2D tensors.
-- [ ] Support right-basis projection for `m >= n`.
-- [ ] Support left-basis projection for `m < n`.
-- [ ] Clamp rank to valid matrix dimensions.
-- [ ] Initialize basis with exact SVD.
+- [x] Implement `SubspaceProjector` for 2D tensors.
+- [x] Support right-basis projection for `m >= n`.
+- [x] Support left-basis projection for `m < n`.
+- [x] Clamp rank to valid matrix dimensions.
+- [x] Initialize basis with exact SVD.
 - [ ] Add random orthogonal initialization as an option for ablation.
-- [ ] Implement `project()` and `project_back()` shape tests.
-- [ ] Test basis orthonormality after initialization.
+- [x] Implement `project()` and `project_back()` shape tests.
+- [x] Test basis orthonormality after initialization.
 - [ ] Test dtype/device preservation.
 - [ ] Remove all hard-coded CUDA device assumptions from borrowed SubTrack logic.
 
