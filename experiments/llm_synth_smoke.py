@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 import pyarrow.parquet as pq
 import torch
@@ -20,6 +22,15 @@ PREFERRED_MODELS = (
     "Qwen/Qwen3.5-2B-Base",
     "Qwen/Qwen3-4B",
 )
+
+ParamScope = Literal["full", "matrices-no-embeddings"]
+
+
+def cached_model_snapshots(model_name: str) -> list[Path]:
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{model_name.replace('/', '--')}" / "snapshots"
+    if not cache_dir.exists():
+        return []
+    return sorted([path for path in cache_dir.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
@@ -57,10 +68,11 @@ def choose_model(explicit: str | None) -> str:
     for name in candidates:
         try:
             AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=True)
-            cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{name.replace('/', '--')}"
-            has_weights = any((cache_dir / "snapshots").glob("*/*.safetensors")) or any((cache_dir / "snapshots").glob("*/*.bin"))
+            has_weights = any(snapshot.glob("*.safetensors") for snapshot in cached_model_snapshots(name)) or any(
+                snapshot.glob("*.bin") for snapshot in cached_model_snapshots(name)
+            )
             if not has_weights:
-                raise FileNotFoundError(f"tokenizer/config cached but no local weight files under {cache_dir}")
+                raise FileNotFoundError(f"tokenizer/config cached but no local weight files for {name}")
             return name
         except Exception as error:  # noqa: BLE001 - printed as terrain
             errors.append(f"{name}: {type(error).__name__}: {error}")
@@ -83,27 +95,57 @@ def load_model_and_tokenizer(model_name: str, device: torch.device):
     return model, tokenizer
 
 
-def select_trainable_attention_params(model: torch.nn.Module, last_layers: int) -> list[torch.nn.Parameter]:
-    attention_layer_ids = set()
-    for name, _param in model.named_parameters():
-        marker = ".layers."
-        if marker in name and ".self_attn." in name:
-            suffix = name.split(marker, 1)[1]
-            attention_layer_ids.add(int(suffix.split(".", 1)[0]))
-    if not attention_layer_ids:
-        raise RuntimeError("Could not infer transformer layer IDs from model parameter names")
-    selected_ids = sorted(attention_layer_ids)[-last_layers:]
-    layer_prefixes = [f".layers.{layer_id}.self_attn." for layer_id in selected_ids]
+def is_embedding_like_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(part in lowered for part in ("embed", "embedding", "wte", "wpe", "lm_head"))
 
+
+def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> tuple[list[torch.nn.Parameter], dict[str, int]]:
     trainable = []
+    stats = {
+        "selected_tensors": 0,
+        "selected_params": 0,
+        "selected_matrix_tensors": 0,
+        "selected_matrix_params": 0,
+        "selected_fallback_tensors": 0,
+        "selected_fallback_params": 0,
+        "excluded_embedding_tensors": 0,
+        "excluded_embedding_params": 0,
+        "excluded_3d_tensors": 0,
+        "excluded_3d_params": 0,
+    }
+
     for name, param in model.named_parameters():
-        wants_param = any(prefix in name for prefix in layer_prefixes) and param.ndim == 2
+        if param_scope == "full":
+            wants_param = True
+        elif param_scope == "matrices-no-embeddings":
+            is_embedding = is_embedding_like_name(name)
+            wants_param = param.ndim == 2 and not is_embedding
+            if is_embedding:
+                stats["excluded_embedding_tensors"] += 1
+                stats["excluded_embedding_params"] += param.numel()
+            if param.ndim == 3:
+                stats["excluded_3d_tensors"] += 1
+                stats["excluded_3d_params"] += param.numel()
+        else:  # pragma: no cover - argparse constrains this
+            raise ValueError(f"unknown param scope: {param_scope}")
+
         param.requires_grad_(wants_param)
-        if wants_param:
-            trainable.append(param)
+        if not wants_param:
+            continue
+        trainable.append(param)
+        stats["selected_tensors"] += 1
+        stats["selected_params"] += param.numel()
+        if param.ndim == 2:
+            stats["selected_matrix_tensors"] += 1
+            stats["selected_matrix_params"] += param.numel()
+        else:
+            stats["selected_fallback_tensors"] += 1
+            stats["selected_fallback_params"] += param.numel()
+
     if not trainable:
-        raise RuntimeError("No trainable attention matrix parameters selected")
-    return trainable
+        raise RuntimeError(f"No trainable parameters selected for param_scope={param_scope}")
+    return trainable, stats
 
 
 def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int):
@@ -132,13 +174,21 @@ def evaluate_loss(model, batches) -> float:
     return sum(losses) / len(losses)
 
 
+def train_step(model, optimizer: torch.optim.Optimizer, batch) -> float:
+    optimizer.zero_grad(set_to_none=True)
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    return float(loss.detach().float().cpu())
+
+
 def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[str], val_texts: list[str], device: torch.device) -> dict[str, float | int | str]:
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     gc.collect()
     model, tokenizer = load_model_and_tokenizer(model_name, device)
-    trainable = select_trainable_attention_params(model, args.last_layers)
+    trainable, param_stats = select_trainable_params(model, args.param_scope)
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len)
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
 
@@ -148,6 +198,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
             lr=args.subspace_lr,
             rank=args.rank,
             beta=args.beta,
+            subspace_init=args.subspace_init,
             subspace_update_method="grassmann",
             grassmann_step_size=args.grassmann_step_size,
             subspace_refresh_budget=args.subspace_refresh_budget,
@@ -158,29 +209,46 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         raise ValueError(optimizer_name)
 
     initial_val = evaluate_loss(model, val_batches)
-    losses = []
-    start_time = time.perf_counter()
-    for step in range(args.steps):
+    warmup_losses = []
+    measured_losses = []
+
+    for step in range(args.warmup_steps):
         batch = train_batches[step % len(train_batches)]
-        optimizer.zero_grad(set_to_none=True)
-        loss = model(**batch).loss
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss.detach().float().cpu()))
+        warmup_losses.append(train_step(model, optimizer, batch))
+
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - start_time
+        torch.cuda.reset_peak_memory_stats(device)
+    start_time = time.perf_counter()
+    for step in range(args.measure_steps):
+        batch = train_batches[(args.warmup_steps + step) % len(train_batches)]
+        measured_losses.append(train_step(model, optimizer, batch))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    measured_elapsed = time.perf_counter() - start_time
     final_val = evaluate_loss(model, val_batches)
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     result = {
         "optimizer": optimizer_name,
-        "trainable_params": sum(p.numel() for p in trainable),
+        "param_scope": args.param_scope,
+        "subspace_init": args.subspace_init if optimizer_name == "subspace" else "n/a",
+        "trainable_params": param_stats["selected_params"],
+        "trainable_tensors": param_stats["selected_tensors"],
+        "trainable_matrix_params": param_stats["selected_matrix_params"],
+        "trainable_matrix_tensors": param_stats["selected_matrix_tensors"],
+        "trainable_fallback_params": param_stats["selected_fallback_params"],
+        "trainable_fallback_tensors": param_stats["selected_fallback_tensors"],
+        "excluded_embedding_params": param_stats["excluded_embedding_params"],
+        "excluded_3d_params": param_stats["excluded_3d_params"],
         "state_bytes": optimizer_state_bytes(optimizer),
         "initial_val_loss": initial_val,
         "final_val_loss": final_val,
-        "first_train_loss": losses[0],
-        "last_train_loss": losses[-1],
-        "elapsed_seconds": elapsed,
+        "first_warmup_loss": warmup_losses[0] if warmup_losses else float("nan"),
+        "last_warmup_loss": warmup_losses[-1] if warmup_losses else float("nan"),
+        "first_measured_train_loss": measured_losses[0],
+        "last_measured_train_loss": measured_losses[-1],
+        "measured_elapsed_seconds": measured_elapsed,
+        "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
     }
     del optimizer, model, tokenizer, train_batches, val_batches
@@ -190,32 +258,111 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     return result
 
 
+def local_safetensor_shapes(model_name: str) -> dict[str, tuple[int, ...]]:
+    for snapshot in cached_model_snapshots(model_name):
+        index_path = snapshot / "model.safetensors.index.json"
+        if index_path.exists():
+            with index_path.open("r", encoding="utf-8") as handle:
+                index = json.load(handle)
+            # Index files usually omit shape metadata; fall through to shard headers.
+            safetensors_paths = sorted({snapshot / file_name for file_name in index.get("weight_map", {}).values()})
+        else:
+            safetensors_paths = sorted(snapshot.glob("*.safetensors"))
+        if not safetensors_paths:
+            continue
+
+        shapes: dict[str, tuple[int, ...]] = {}
+        for path in safetensors_paths:
+            with path.open("rb") as handle:
+                header_size = int.from_bytes(handle.read(8), byteorder="little")
+                header = json.loads(handle.read(header_size))
+            for tensor_name, tensor_info in header.items():
+                if tensor_name == "__metadata__":
+                    continue
+                shapes[tensor_name] = tuple(tensor_info["shape"])
+        return shapes
+    return {}
+
+
+def print_shapes(model_name: str, shapes: dict[str, tuple[int, ...]]) -> None:
+    shapes_by_dim: dict[int, tuple[int, int]] = {}
+    total_params = 0
+    for shape in shapes.values():
+        dim = len(shape)
+        count, params = shapes_by_dim.get(dim, (0, 0))
+        param_count = 1
+        for size in shape:
+            param_count *= size
+        total_params += param_count
+        shapes_by_dim[dim] = (count + 1, params + param_count)
+
+    print(f"shape_summary_model={model_name}")
+    print(f"shape_summary_total_params={total_params}")
+    for dim, (count, params) in sorted(shapes_by_dim.items()):
+        print(f"shape_summary_dim_{dim}_tensors={count}")
+        print(f"shape_summary_dim_{dim}_params={params}")
+    for tensor_name, shape in sorted(shapes.items()):
+        if len(shape) == 3:
+            print(f"shape_summary_3d={tensor_name}:{shape}")
+
+
+def print_shape_summary(model_name: str) -> None:
+    local_shapes = local_safetensor_shapes(model_name)
+    if local_shapes:
+        print_shapes(model_name, local_shapes)
+        return
+
+    from huggingface_hub import get_safetensors_metadata
+
+    metadata = get_safetensors_metadata(model_name)
+    remote_shapes = {}
+    for tensor_name, tensor_info in metadata.tensors.items():
+        remote_shapes[tensor_name] = tuple(tensor_info.shape)
+    print_shapes(model_name, remote_shapes)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SUMOTrack")
-    parser.add_argument("--model", default="", help="HF model name; empty = prefer cached LiquidAI, Qwen3.5, Qwen3")
+    parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--optimizers", default="subspace", help="comma-separated: subspace,adamw")
-    parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--param-scope", choices=("full", "matrices-no-embeddings"), default="matrices-no-embeddings")
+    parser.add_argument("--warmup-steps", type=int, default=1)
+    parser.add_argument("--measure-steps", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=192)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--last-layers", type=int, default=1)
     parser.add_argument("--rank", type=int, default=128)
+    parser.add_argument("--subspace-init", choices=("svd", "random"), default="random")
     parser.add_argument("--subspace-lr", type=float, default=2e-5)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--subspace-refresh-budget", type=int, default=1)
+    parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
     args = parser.parse_args()
+
+    if args.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if args.measure_steps <= 0:
+        raise ValueError("measure_steps must be positive")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = choose_model(args.model or None)
-    train_texts = synth_texts(Path(args.data_dir), "train", limit=max(args.steps, 4) * args.batch_size)
+    if args.print_shape_summary:
+        print_shape_summary(model_name)
+        return
+
+    total_train_steps = args.warmup_steps + args.measure_steps
+    train_texts = synth_texts(Path(args.data_dir), "train", limit=max(total_train_steps, 4) * args.batch_size)
     val_texts = synth_texts(Path(args.data_dir), "val", limit=2 * args.batch_size)
     print(f"device={device}")
     print(f"model={model_name}")
     print(f"data_dir={args.data_dir}")
     print(f"train_texts={len(train_texts)} val_texts={len(val_texts)}")
-    print(f"seq_len={args.seq_len} batch_size={args.batch_size} steps={args.steps} last_layers={args.last_layers} rank={args.rank}")
+    print(
+        f"seq_len={args.seq_len} batch_size={args.batch_size} warmup_steps={args.warmup_steps} "
+        f"measure_steps={args.measure_steps} param_scope={args.param_scope} rank={args.rank} subspace_init={args.subspace_init}"
+    )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
         result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, device)
