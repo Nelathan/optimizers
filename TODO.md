@@ -8,7 +8,7 @@ Progression is gated by evidence, not by vibes or a locally attractive diff. Eac
 
 - [x] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
 - [x] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
-- [ ] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
+- [x] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [ ] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
 - [ ] **HeavyBall/ECC gate:** bf16 params plus HeavyBall ECC/param-ECC either work in a smoke test or unsupported combinations fail loudly.
 - [ ] **Grassmann gate:** Grassmann basis updates preserve orthonormality, transport projected moments correctly, and are compared against SVD refresh on tiny loss and step-time signals.
@@ -20,7 +20,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 - [x] Add an editable HeavyBall path dependency in `pyproject.toml`.
 - [x] Create the `sumotrack/` package.
-- [ ] Export `SubspaceMuon` from `sumotrack/__init__.py`.
+- [x] Export `SubspaceMuon` from `sumotrack/__init__.py`.
 - [ ] Add a minimal smoke script under `experiments/`.
 - [x] Add a tiny test harness that can run without downloading a large model.
 
@@ -48,15 +48,15 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 
 ## Phase 3: minimal optimizer
 
-- [ ] Implement first eager `SubspaceMuon` optimizer using normal PyTorch gradients.
-- [ ] Matrix path: projected first moment only, no full-size first moment.
-- [ ] Fallback path: delegate non-2D params to HeavyBall AdamW or LaProp.
-- [ ] Add config for `rank=32`, `beta`, `recovery_scale`, `orthogonalization`, and refresh scheduling.
-- [ ] Implement exact-SVD orthogonalization inside projected space for correctness mode.
+- [x] Implement first eager `SubspaceMuon` optimizer using normal PyTorch gradients.
+- [x] Matrix path: projected first moment only, no full-size first moment.
+- [x] Fallback path: update non-2D params with local AdamW baseline.
+- [x] Add config for `rank=32`, `beta`, `recovery_scale`, `orthogonalization`, and refresh scheduling.
+- [x] Implement exact-SVD orthogonalization inside projected space for correctness mode.
 - [ ] Implement HeavyBall Newton-Schulz/polar orthogonalization for speed mode.
 - [ ] Add optional Nesterov projected momentum.
-- [ ] Add optional perpendicular gradient recovery.
-- [ ] Verify state dict save/load round trip.
+- [x] Add optional perpendicular gradient recovery.
+- [x] Verify state dict save/load round trip.
 
 ## Phase 4: HeavyBall-native integration
 

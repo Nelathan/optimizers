@@ -6,6 +6,7 @@ nailed down.
 """
 
 from .projector import ProjectionSide, SubspaceProjector
+from .optimizer import SubspaceMuon
 from .rotation import RoundRobinRefreshScheduler
 
-__all__ = ["ProjectionSide", "RoundRobinRefreshScheduler", "SubspaceProjector"]
+__all__ = ["ProjectionSide", "RoundRobinRefreshScheduler", "SubspaceMuon", "SubspaceProjector"]
