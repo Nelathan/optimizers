@@ -6,7 +6,7 @@ This is the next-iteration queue for SUMOTrack / `SubspaceMuon`. Prefer small fa
 
 Progression is gated by evidence, not by vibes or a locally attractive diff. Each gate should be satisfied by committed code, tests, and when relevant a small script that emits the observable signal.
 
-- [ ] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
+- [x] **Projector gate:** tall and wide projections have correct shapes, lift back to the original shape, clamp rank correctly, preserve dtype/device expectations, and maintain orthonormal bases.
 - [ ] **Scheduler gate:** refresh order is deterministic, budgeted, wraps explicitly, supports derived target intervals, and is proven not to skip ordinary per-step updates.
 - [ ] **Optimizer state gate:** `SubspaceMuon.step()` updates matrix and fallback params, matrix params store projected moments only, and optimizer state dict save/load round-trips without shape drift.
 - [ ] **Descent gate:** a no-download smoke script shows loss descent and reports optimizer state bytes, including a comparison that would catch accidental full-size matrix moments.
@@ -34,8 +34,8 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [ ] Add random orthogonal initialization as an option for ablation.
 - [x] Implement `project()` and `project_back()` shape tests.
 - [x] Test basis orthonormality after initialization.
-- [ ] Test dtype/device preservation.
-- [ ] Remove all hard-coded CUDA device assumptions from borrowed SubTrack logic.
+- [x] Test dtype/device preservation.
+- [x] Remove all hard-coded CUDA device assumptions from borrowed SubTrack logic.
 
 ## Phase 2: round-robin refresh scheduler
 

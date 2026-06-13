@@ -57,6 +57,20 @@ class SubspaceProjectorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             projector.project(torch.randn(2, 3, 4))
 
+    def test_preserves_dtype_and_device_for_low_precision_input(self):
+        grad = torch.randn(8, 5, dtype=torch.bfloat16)
+        projector = SubspaceProjector(rank=3)
+
+        low = projector.project(grad)
+        lifted = projector.project_back(low)
+
+        self.assertEqual(projector.basis.dtype, grad.dtype)
+        self.assertEqual(projector.basis.device, grad.device)
+        self.assertEqual(low.dtype, grad.dtype)
+        self.assertEqual(low.device, grad.device)
+        self.assertEqual(lifted.dtype, grad.dtype)
+        self.assertEqual(lifted.device, grad.device)
+
 
 if __name__ == "__main__":
     unittest.main()
