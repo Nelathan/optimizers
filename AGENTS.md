@@ -2,114 +2,156 @@
 
 ## Repo purpose
 
-This repo is a lab for home-scale machine-learning optimizers. The current main thread and public optimizer name are **SumoTrack**.
+This repo is the SumoTrack lab: a place to design and test a memory-efficient optimizer for high-capacity continued pretraining on consumer GPUs.
 
-SumoTrack targets high effectiveness on mid-range consumer NVIDIA GPUs, especially memory-constrained cards such as the RTX 4070 Super. The aim is to make full fine-tuning or continued pretraining practical where users would otherwise retreat to LoRA for memory reasons.
+SumoTrack should help a user move a pretrained model across a real distribution shift — clean reasoning data, books, stories, domain corpora — without needing full AdamW state, slow gradient accumulation, or adapter-only capacity limits.
 
-## Current design direction
+The near-term target is Gemma 4 12B-class training on a single RTX 5090-class machine with high tokens per step, good throughput, precision, and minimal gradient accumulation. The optimizer must serve that product reality, not win tiny harness games.
 
-Build SumoTrack directly on top of `../HeavyBall`. HeavyBall is a sibling repo and should be treated as the primary optimizer substrate. Prefer an editable path dependency over vendoring, forking, or submodules.
+## Current design thesis
 
-The intended synthesis:
+Public optimizer name: **SumoTrack**.
 
-- HeavyBall for chainable optimizer machinery, compiled update paths, ECC, param ECC, Muon/NS orthogonalization, clipping, MARS, caution, and API compatibility.
-- FlashOptim mainly as conceptual background; HeavyBall already implements the important 24-bit ECC path through `ecc="bf16+8"` and `param_ecc="bf16+8"`.
-- SubTrack for Grassmannian gradient subspace tracking and memory-efficient projected optimization.
-- SUMO for moment orthogonalization inside a low-dimensional subspace.
-- Aurora as a later possible improvement for rectangular/non-square orthogonalization, not a v1 dependency.
+Mainline algorithm:
 
-## Collaboration and reporting
+- one-sided SubTrack/GaLore-style gradient subspace tracking,
+- projected first moments for 2D matrices,
+- SUMO/Muon-style orthogonalization of the projected moment,
+- HeavyBall Newton-Schulz as the practical orthogonalization path,
+- full-matrix Muon scale semantics via `orthogonalization_scale_mode="muon"`,
+- Grassmann/Stiefel basis tracking as adaptation smoothing.
 
-Prefer signal over ceremony. A useful progress report should say what changed in the system's meaning: which invariant now holds, which bottleneck became visible, which assumption broke, and what the next high-leverage cut is. Avoid process-shaped summaries that merely list files, commits, and validations unless those details carry decision value.
+Interpret the current one-sided rectangular update as intentional:
 
-Do not silently work around the user's stated framing. If the user says to ignore warmup/cold-start cost, do not optimize the report or experiment around excluding it as though that were the primary concern. If that framing seems wrong, stop and discuss the disagreement explicitly.
+> Adapt along selected representation / hidden-state directions, while distributing the update across the larger side with Muon/SUMO geometry.
 
-For SumoTrack specifically, do not become overfocused on first-step SVD cost. Exact SVD initialization is allowed and often desirable because it may start stronger; random initialization exists to opt out when measuring the algorithmic/performance path. Torch compile latency can dominate first-step SVD cost in practice, so treat cold-start complaints proportionally.
+This is especially relevant for transformer MLP and attention matrices. Do not casually flatten this into “low-rank optimizer” or “Muon but smaller.” The hidden-state-facing axis is part of the product bet.
 
-## Ground rules
+## What matters now
 
-- Do not fork HeavyBall unless explicitly asked.
-- Do not copy large chunks of HeavyBall into this repo.
-- Do not add a git submodule casually.
-- Do not add speculative abstractions before the optimizer works.
-- Do not optimize kernel launches before there is a correct measurable baseline.
-- Preserve user work and unrelated files.
-- Prefer small, reversible changes with clear tests.
-- Keep algorithmic assumptions explicit.
+The next value is algorithm design, not smoke-test accumulation.
+
+High-leverage questions:
+
+- Is shape-based `AUTO` projection side aligned with transformer hidden-state semantics?
+- Should side/rank be architecture-aware for Gemma/LFM/Qwen module roles?
+- How should rank be allocated under a global optimizer-state budget?
+- Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
+- Are extreme rectangular projected moments under-served by standard Newton-Schulz, making Aurora-style leverage-uniform orthogonalization useful?
+- When, if ever, does two-sided square-core projection improve capacity/stability enough to justify the extra complexity?
+
+Low-leverage traps:
+
+- repeating broad topology smokes after accounting already works,
+- polishing LR brackets before the geometry is right,
+- treating AdamW as the opponent rather than an obvious anchor,
+- adding HeavyBall-native/ECC plumbing before the algorithm earns it,
+- implementing projected-gradient hooks before the ordinary-gradient design is proven,
+- expanding harness ceremony without a sharper algorithm question.
+
+## Competitors and anchors
+
+Serious reference points include LoRA/DoRA/QLoRA/Unsloth-style adapter training, GaLore, SubTrack, SUMO/Muon-family methods, and other low-state full-finetuning approaches.
+
+AdamW is a quality and sanity anchor. It is not the product target and not the memory story.
+
+Do not spend a session proving SumoTrack is smaller than AdamW. Everyone in the room knows that. Spend the session finding whether SumoTrack's geometry buys adaptation capacity per byte/second.
+
+## Evaluation stance
+
+SYNTH is valuable because it is clean and low-noise. Use it to test adaptation signal before moving to harder short-story data that breaks models.
+
+A useful evaluation reports:
+
+- target validation movement,
+- source/retention movement when available,
+- tokens per step and whether grad accumulation was needed,
+- measured step time / tokens/sec,
+- peak CUDA memory,
+- matrix/fallback/total optimizer state bytes,
+- update/param diagnostics,
+- basis motion or residual diagnostics when testing subspace tracking.
+
+Do not overvalue a 20-step run. A short run is allowed only when it falsifies a sharp assumption or validates a sensor needed for the next design cut.
 
 ## Implementation priorities
 
-The first useful implementation is not the fanciest one. Build in this order:
+Keep the eager implementation as the algorithm rail for now. HeavyBall-native integration and ECC are important later, not the next place to hide uncertainty.
 
-1. Correct projector math with exact SVD initialization.
-2. Minimal eager optimizer using normal full gradients.
-3. Round-robin subspace refresh for rotations only.
-4. Projected first moment and projected-space orthogonalization.
-5. HeavyBall ECC/param-ECC compatibility.
-6. Grassmannian SubTrack update.
-7. Newton-Schulz/polar fast path.
-8. Bucketing/batching for performance.
-9. Projected-gradient autograd hooks, only after the baseline is proven.
+Current invariants:
 
-## Algorithm invariants
+- Matrix params do not store full-size first moments.
+- Matrix params do not store full-size second moments in the main path.
+- Non-2D params use boring fallback semantics or are frozen by task policy.
+- Fallback state is accounted separately.
+- Orthogonalization happens in projected space.
+- HeavyBall Newton-Schulz + `orthogonalization_scale_mode="muon"` is the current mainline.
+- Unsupported ECC/param-ECC fails loudly.
+- Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 
-- Default subspace rank is `32`.
-- Matrix parameters should not store full-size first moments.
-- Matrix parameters should not store full-size second moments in the main path.
-- Non-2D params should use a boring fallback optimizer path.
-- Fallback optimizer behavior should be classic AdamW/FlashOptim-style, implemented through HeavyBall where possible, with no moment quantization unless explicitly chosen. ECC/state ECC and param ECC are important compatibility targets.
-- Round-robin scheduling applies to subspace refresh/rotation, not to ordinary per-step optimization.
-- Orthogonalization happens inside the projected subspace.
-- Grassmannian tracking is expected to become the main update method after v1 correctness is established.
-- Exact SVD initialization is the default because it may improve early adaptation. Random initialization is an opt-out for ablation and performance-path measurement.
-- Fast orthogonalization should move up quickly: prefer HeavyBall's Newton-Schulz/polar machinery, and check whether HeavyBall is using a PolarExpress-style algorithm before inventing a local substitute.
+Near-term implementation cuts should be one of:
 
-## Performance notes
+1. architecture-aware projection side/rank policy,
+2. global state-budget rank allocation,
+3. basis movement / residual diagnostics for tracking smoothness,
+4. Aurora/rectangular orthogonalization ablation,
+5. minimal structured eval output when needed for a real medium adaptation run.
 
-Past optimizer experiments hit a kernel-launch wall. Too many tiny decompositions or per-module kernels can dominate runtime. Batching by module shape and using batched `eigh`/SVD helped in previous implementations.
+Do not add speculative abstractions. Every new knob should correspond to a named geometry question.
 
-For SumoTrack, round-robin refresh may reduce decomposition pressure because only rotations are staggered. However, projection and orthogonalization still happen every step, so watch kernel-launch count and module-count scaling.
+## HeavyBall and adjacent repos
 
-Prefer matmul-shaped hot paths. HeavyBall's optimized Newton-Schulz/polar implementation is likely faster than decomposition-based orthogonalization because it is mostly matmuls.
+Build on `../HeavyBall` directly. Use it as the primary optimizer substrate for compiled orthogonalization, future ECC/param-ECC, chainable machinery, clipping, MARS, caution, and API compatibility.
 
-Orthogonalization quality and optimizer learning rate are coupled. When swapping exact SVD orthogonalization for a fast approximate path, expect LR tuning to be part of the experiment rather than treating equal LR as a fair comparison.
+Do not fork HeavyBall unless explicitly asked. Do not vendor HeavyBall internals. Do not add a submodule casually.
 
-## Future projected-gradient path
+Aurora is relevant because very rectangular projected moments may not be well served by ordinary NS. Use it as a projected direction map inside SumoTrack, not as a wholesale optimizer replacement: SumoTrack owns momentum, basis tracking, scaling, LR, fallback semantics, and accounting.
 
-A later optimization may avoid materializing the full-rank gradient before projection. For linear layers, projected gradients can be computed from projected activations/backprops and stored directly. This can reduce memory pressure, but prior attempts required heavy PyTorch/autograd hacking, including returning `None` for normal gradients and storing projected gradients out-of-band.
+## Product discipline
 
-Do not make this the baseline. If implemented, isolate it behind explicit opt-in hooks and prove equivalence against projecting the full gradient on tiny models.
+The product is usable distribution adaptation under memory pressure. Keep asking:
+
+- Does this let us train more tokens per step?
+- Does this preserve enough source behavior while moving target loss?
+- Does this spend state on the tensors that matter?
+- Does this improve the optimizer geometry or merely make the harness prettier?
+- Would this help Gemma 12B on a 5090, or only make LFM smoke tables look tidy?
+
+If the work does not sharpen one of those answers, it is probably displacement activity wearing a lab coat.
 
 ## Validation expectations
 
-Do not report optimizer work as done because the code imports. Optimizers fail silently and convincingly.
-
-Use the repo's `uv` environment for Python commands. System Python may not have torch installed. Preferred forms:
+Use the repo's `uv` environment:
 
 ```bash
 uv run python -m unittest discover -s tests
 uv run python experiments/<script>.py
 ```
 
-If adding dependencies, update `pyproject.toml` and let `uv` update `uv.lock`; do not work around the environment by using global Python packages.
+Useful checks include projector shape/orthonormality, state-dict restart, bf16 behavior, optimizer state accounting, loss curves, peak VRAM, step time, tokens/sec, and retention curves.
 
-Useful evidence includes:
-
-- projector shape and orthonormality tests,
-- state dict save/load tests,
-- bf16 + ECC smoke tests,
-- loss descent on tiny regression / tiny transformer tasks,
-- peak VRAM measurement,
-- optimizer state byte accounting,
-- step-time and refresh-spike measurement,
-- comparison against HeavyBall AdamW, Muon, and PSGDLRA.
+Do not report optimizer work as done because code imports or a smoke run descends. Optimizers fail silently and convincingly.
 
 If validation cannot be run, say exactly what remains unverified.
 
+## Reporting
+
+Prefer signal over ceremony.
+
+A useful report says what changed in system meaning: which geometric assumption became stronger or weaker, which bottleneck became visible, which product constraint bit, and what should be cut next.
+
+Avoid reports that merely list files, commands, and green tests unless those details carry decision value.
+
+Do not silently work around the user's framing. If the user says the product wants no gradient accumulation, do not optimize an experiment around grad accumulation and call it equivalent. If the requested framing seems wrong, stop and argue the point explicitly.
+
 ## Naming
 
-Use **SumoTrack** for the project/optimizer family and public optimizer class. Avoid churny renaming once code exists.
+Use **SumoTrack** for the optimizer family and public optimizer class. Avoid churny renaming once code exists.
 
 ## Style
 
-Favor direct, readable PyTorch first. Once the math is right, move hot paths toward HeavyBall-style transforms and compiled utilities. Keep comments for non-obvious math, state-shape invariants, and performance traps. Do not narrate obvious tensor operations.
+Favor direct, readable PyTorch first. Once the math is right, move hot paths toward HeavyBall-style transforms and compiled utilities.
+
+Keep comments for non-obvious math, state-shape invariants, and performance traps. Do not narrate obvious tensor operations.
+
+Maintainability is a feature, but product-shaped algorithm clarity outranks tidy scaffolding.

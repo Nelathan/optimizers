@@ -220,6 +220,53 @@ class SumoTrackTest(unittest.TestCase):
         self.assertNotIn("exp_avg", state)
         self.assertNotIn("exp_avg_sq", state)
 
+    def test_aurora_orthogonalization_keeps_projected_state_shape(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack([weight], lr=0.01, rank=2, orthogonalization="aurora")
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
+        self.assertNotIn("exp_avg", state)
+        self.assertNotIn("exp_avg_sq", state)
+
+    def test_aurora_balances_rectangular_large_axis_leverage(self):
+        torch.manual_seed(2)
+        update = torch.randn(256, 16)
+
+        heavyball_update = SumoTrack._orthogonalize_heavyball(
+            update,
+            {"orthogonalization_scale_mode": "none", "heavyball_orthogonalization_mode": "newtonschulz"},
+            update.shape,
+        )
+        aurora_update = SumoTrack._orthogonalize_aurora(
+            update,
+            {"orthogonalization_scale_mode": "none", "aurora_pp_iterations": 2, "aurora_pp_beta": 0.5},
+            update.shape,
+        )
+
+        heavyball_cv, _heavyball_min, _heavyball_max = SumoTrack._large_axis_leverage_stats(heavyball_update)
+        aurora_cv, aurora_min, aurora_max = SumoTrack._large_axis_leverage_stats(aurora_update)
+        self.assertLess(aurora_cv, heavyball_cv)
+        self.assertLess(aurora_cv, 0.05)
+        self.assertGreater(aurora_min, 0.9)
+        self.assertLess(aurora_max, 1.1)
+
+    def test_log_norm_diagnostics_include_projected_leverage(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack([weight], lr=0.01, rank=2, orthogonalization="aurora")
+        opt.diagnostics_enabled = True
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        self.assertIn("mean_projected_leverage_cv", opt.last_step_diagnostics)
+        self.assertIn("mean_projected_leverage_min_ratio", opt.last_step_diagnostics)
+        self.assertIn("mean_projected_leverage_max_ratio", opt.last_step_diagnostics)
+        self.assertLess(opt.last_step_diagnostics["mean_projected_leverage_cv"], 0.1)
+
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SumoTrack(

@@ -1,202 +1,222 @@
 # SumoTrack Plan
 
-SumoTrack is an experimental optimizer line for memory-constrained full fine-tuning and continued pretraining on consumer GPUs. The public optimizer class is `SumoTrack`. The name marks the core synthesis: SUMO-style moment orthogonalization inside a SubTrack-style tracked gradient subspace, implemented on top of HeavyBall.
+SumoTrack is a memory-efficient optimizer line for high-capacity continued pretraining on consumer GPUs. The public optimizer class is `SumoTrack`.
 
-The target hardware is mid-range consumer NVIDIA cards, especially cards in the RTX 4070 Super / 12 GB class and adjacent 16-24 GB cards. The target use cases are:
+The goal is not to make AdamW cheaper. The goal is to make real distribution adaptation possible where full optimizer state, gradient accumulation, or adapter-only training would otherwise define the ceiling. The target use case is moving a pretrained model across a meaningful data distribution shift — for example web/knowledge model behavior toward clean reasoning, books, stories, or other target corpora — while preserving enough of the source model to avoid crude overwrite.
 
-- continued pretraining where full AdamW state is too expensive,
-- replacing or injecting a freshly initialized attention mechanism while freezing the rest,
-- full fine-tuning in situations where LoRA would normally be chosen only for memory reasons,
-- small-batch, high-noise training where stable spectral geometry matters.
+The near-term hardware target is a single RTX 5090-class workstation training Gemma 4 12B-class models with as many tokens per step as practical, no gradient accumulation if avoidable, high throughput, and enough update quality to actually change the model rather than flavor it.
 
-## Integration stance
+## Product thesis
 
-Do not fork HeavyBall first. Do not vendor HeavyBall internals. Do not add HeavyBall as a git submodule unless a concrete packaging need appears.
+For a fixed consumer-GPU memory budget, SumoTrack should deliver more useful model movement per byte and per second than adapter-only or low-rank-gradient methods when the user wants high-capacity distribution adaptation, not just style steering.
 
-Start this repo as the experimental companion package and depend on `../HeavyBall` as an editable path dependency. HeavyBall already provides the right runtime substrate: chainable transforms, compiled update paths, ECC, parameter ECC, Muon orthogonalization, clipping, MARS, cautioning, FSDP shape handling, and optimizer API compatibility.
+The relevant competitors are LoRA/DoRA/QLoRA/Unsloth-style adapter training, GaLore, SubTrack, SUMO/Muon-family optimizers, and adjacent low-state full-finetuning methods. AdamW is an obvious quality and sanity anchor, not the thing SumoTrack is trying to beat on memory.
 
-The first implementation should live here, probably under:
+Success looks like a Pareto point:
 
-```text
-sumotrack/
-  __init__.py
-  optimizer.py              # SumoTrack public optimizer
-  projector.py              # SubTrack/SUMO projector state
-  rotation.py               # round-robin subspace refresh scheduler
-  param_groups.py           # matrix/fallback grouping helpers
-  diagnostics.py            # optional lightweight metrics
-experiments/
-  smoke_sumotrack.py
-  compare_tiny_transformer.py
-```
+- enough trainable capacity to materially shift distribution,
+- optimizer state small enough to preserve tokens/step on consumer hardware,
+- stable updates that do not trash the source model faster than they learn the target,
+- step time that does not lose the memory gain to launch spray or decompositions,
+- a configuration story a serious user could operate without occult LR roulette.
 
-If the design stabilizes and its transform fits cleanly into HeavyBall's chainable model, upstreaming into HeavyBall can be considered later. Until then, local iteration speed matters more than library purity.
+## Main algorithm thesis
 
-## What HeavyBall already gives us
+SumoTrack combines:
 
-HeavyBall already integrates the most important FlashOptim idea for this work: 24-bit-like error correction through `ecc="bf16+8"` and `param_ecc="bf16+8"`. Use that path first. Do not mix FlashOptim kernels into v1.
+- **SubTrack/GaLore-style one-sided gradient subspace tracking** for memory-shaped state,
+- **projected first moments** rather than full-size matrix moments,
+- **SUMO/Muon-style orthogonalization of the projected moment** for update geometry,
+- **HeavyBall Newton-Schulz / polar machinery** for the practical orthogonalization path,
+- **Grassmann/Stiefel basis tracking** for smooth adaptation of the active subspace.
 
-HeavyBall also already provides Muon-style orthogonalization through `heavyball.chainable.orthogonalize_update` and polar/Newton-Schulz utilities in `heavyball.utils`. SumoTrack's novelty is not full-matrix Muon. The novelty is orthogonalization inside a tracked low-rank gradient subspace, with memory-shaped state.
+The current mainline is not “projected momentum plus optional ortho.” Early LFM/SYNTH evidence already showed projected moment orthogonalization is useful in this setting. Treat orthogonalized projected momentum as the main SumoTrack path; keep no-ortho only as a diagnostic when the geometry itself is under suspicion.
 
-HeavyBall's `PSGDLRA` is relevant but not equivalent. It is a low-rank PSGD preconditioner. SumoTrack should track per-matrix gradient subspaces and maintain projected first moments, closer to SubTrack + SUMO.
-
-## Core algorithm v1
-
-Default rank: `32`.
-
-For each eligible 2D parameter matrix `W` with gradient `G`:
-
-1. Maintain an orthonormal subspace basis `Q`.
-   - If `m >= n`, use a right basis `Q` with shape `[r, n]` and project as `G_hat = G @ Q.T`.
-   - If `m < n`, use a left basis `Q` with shape `[m, r]` and project as `G_hat = Q.T @ G`.
-
-2. Maintain the first moment in projected space:
-   - `M_hat = beta * M_hat + G_hat`, or a Nesterov variant.
-   - Do not maintain a full-size first moment for the matrix path.
-
-3. Orthogonalize inside the projected space:
-   - v1 can use exact SVD for correctness and debugging.
-   - The performance path should use HeavyBall's optimized Newton-Schulz / polar matmul implementation because it avoids expensive decomposition kernels.
-
-4. Project back:
-   - right basis: `O = O_hat @ Q`
-   - left basis: `O = Q @ O_hat`
-
-5. Optionally recover some discarded gradient component:
-   - `G_perp = G - project_back(G_hat)`
-   - update direction can include `O + recovery_scale * G_perp`.
-   - Start with `recovery_scale=0.0` or `0.25` as an ablation knob, not dogma.
-
-6. Apply HeavyBall-compatible parameter update behavior:
-   - learning rate and warmup,
-   - decoupled weight decay where appropriate,
-   - clipping/caution/MARS where compatible,
-   - `ecc="bf16+8"` and `param_ecc="bf16+8"`.
-
-Non-2D parameters should fall back to a boring HeavyBall optimizer path such as AdamW/LaProp. Use `SplitOpt` or helper-generated parameter groups rather than contorting the matrix path to handle embeddings, norms, and biases.
-
-## Subspace rotation
-
-Only subspace refresh/rotation should be round-robin. Ordinary projection, moment update, orthogonalization, and parameter update happen every step for every active matrix.
-
-Use a stable parameter order and a refresh budget:
+The core interpretation for a tall matrix gradient `G ∈ R^{m×n}` is:
 
 ```text
-eligible = all trainable matrix parameters above the minimum size
-cursor = persistent integer
-budget = subspace_refresh_budget
-refresh eligible[cursor : cursor + budget] each optimizer step, wrapping around
+Q ∈ R^{r×n}
+M_hat = G Qᵀ      # [m, r]
+O_hat = orthogonalize(M_hat)
+update = O_hat Q  # [m, n]
 ```
 
-Expose both direct and derived controls:
+For a wide matrix, the symmetric left-side form is used.
 
-- `subspace_refresh_budget=1` as the concrete scheduling primitive,
-- `target_refresh_interval=None` as sugar that derives a budget from the number of eligible matrices,
-- `rank=32`,
-- `subspace_update_method="grassmann" | "svd_refresh" | "random"`.
+This means SumoTrack currently says:
 
-If the target interval is shorter than the number of eligible modules, overlapping refreshes are allowed by increasing the budget. Avoid ambiguous modulo semantics.
+> Adapt along selected representation / hidden-state directions, while distributing the update across the larger side with Muon/SUMO geometry.
 
-## Strong belief: Grassmann update
+That is a deliberate and valuable bias, especially for transformer MLP and attention matrices. The backbone-facing hidden-state axis carries stability; the larger expanded side has room to shape a useful manifold. The shape is rectangular because the active subspace is one-sided, not because the optimizer accidentally became quadratic.
 
-The Grassmannian update is expected to be central, not decorative. Full SVD refresh is acceptable as a baseline and for initialization, but a good SumoTrack implementation should prefer SubTrack-style geometry-aware tracking once the shape/state machinery is correct.
+## Geometry questions that actually matter
 
-Short fresh-initialization tests are a poor primary signal for this optimizer family. Subspace methods can spend the first few thousand steps learning an unhelpful subspace; SubTrack's case is long-range pretraining efficiency, while SumoTrack's likely advantage is mid-training / post-training stability and reduced forgetting under constrained optimizer state. Treat early toy-regression underperformance as expected unless it reveals a state-shape, numerical, or stability bug.
+The important design work is not broad smoke tests or broad LR polishing. It is deciding which geometry gives the best adaptation capacity under memory and speed constraints.
 
-Given the measured state sizes, rank `32` is a conservative default rather than a ceiling. Real evaluations should include rank `64`, `128`, and possibly larger ranks before concluding that the subspace is too restrictive. Grassmann refresh should be the preferred baseline path because it is faster than repeated exact SVD refresh and gives a stable basis update target for later ECC integration.
+### 1. One-sided projection policy
 
-Performance smoke tests should use random orthogonal subspace initialization so timing measures the optimizer path rather than a wall of first-step SVDs. Convergence-quality comparisons should use SVD initialization explicitly, because good initialization is part of the algorithmic question. Do not time cold-start SVD as representative steady-state performance.
+Current `AUTO` chooses the smaller ambient side. This is simple and often sensible, but it is still a crude proxy for transformer semantics.
 
-Early LFM/SYNTH evidence supports the SUMO bet: projected first-moment orthogonalization appears to add value over raw projected momentum at the same rank/state budget. In rank-64, SVD-init, non-embedding-matrix LFM runs, orthogonalized `SumoTrack` at HeavyBall's Muon-scale default LR (`0.0025`) remains the best tested point after a wider no-ortho LR sweep. The caveat is useful: raw projected momentum was under-tuned at low LR and improves up to about `0.04`, so future comparisons must be LR-aware. Norm telemetry suggests SUMO's advantage is not explained by raw update norm alone; no-ortho begins degrading while its update norm is still below SUMO's. Treat this as positive directional evidence, not final optimizer proof.
+Open design questions:
 
-AdamW is a quality anchor, not a target budget. Full 2x-fp32 optimizer state is outside the intended feasibility envelope; the product goal is to make broad/full fine-tuning possible on consumer GPUs where users would otherwise retreat to memory-frugal LoRA/Unsloth-style paths. Compare against AdamW to understand quality, but do not let AdamW's state budget define success.
+- Should the chosen side always be the hidden-state / backbone-facing axis when module structure is known?
+- Should attention projections, MLP up/gate/down projections, and output projections use different side policies?
+- Should side choice be architecture-aware for Gemma/LFM/Qwen rather than purely shape-aware?
+- Are we throwing away task-vital gradient components because they did not appear in the tracked/SVD subspace early enough?
 
-Short LLM tests should use a real pretrained model and local SYNTH shards, not toy newborn models. `LiquidAI/LFM2.5-1.2B-Base` is the current practical default on this box. Train broad parameter scopes for actual post-training behavior; one-layer attention-only tests are useful only for plumbing and are not meaningful state-size evidence.
+### 2. Rank allocation
 
-For now, ignore 3D convolution/linear-attention kernels in the matrix path. They are small compared with projection and MLP matrices: LFM's conv kernels are `[2048, 1, 3]`, while Qwen3.5's linear-attention conv kernels are `[6144, 1, 4]`. The 2D matrices carry the memory and geometry story.
+Uniform rank is a baseline, not a product design.
 
-The SubTrack update must be adapted carefully:
+Rank should become budget-driven:
 
-- no hard-coded CUDA device strings,
-- correct dtype promotion and restoration,
-- stable behavior for tiny or skinny matrices,
-- optional accumulated-gradient tracking,
-- projected moment transport when the basis changes.
+```text
+optimizer_state_budget_mb = ...
+rank_policy = "uniform" | "size" | "spectrum" | "module_role"
+```
 
-## Performance risks
+Promising policies:
 
-The main performance enemy is not just FLOPs; it is kernel-launch spray. Past experiments showed that bucketing similarly shaped modules and calling batched eigendecompositions improved speed. SumoTrack should keep this in mind, but not prematurely optimize v1.
+- larger rank for high-leverage MLP and attention matrices,
+- role-specific rank caps,
+- gradient-spectrum-aware rank after a short calibration window,
+- global byte budget allocation rather than rank-per-tensor habit,
+- minimum rank for small-but-semantically-important matrices.
 
-Round-robin refresh reduces decomposition pressure because only rotations are sparse in time. Projection and orthogonalization still run every step, so they should be matmul-shaped and batchable where practical.
+Default rank remains `32` for library sanity, but real Gemma-scale evaluation should not pretend fixed rank `64` is a design conclusion.
 
-Likely performance ladder:
+### 3. Subspace tracking as adaptation smoothing
 
-1. Correct eager implementation.
-2. Use HeavyBall chainable transforms enough to inherit ECC/update behavior.
-3. Replace exact SVD orthogonalization with HeavyBall Newton-Schulz for the hot path. HeavyBall's PolarExpress mode is square-matrix-only in practice because rectangular tensors route through Newton-Schulz, and SUMO projected updates are usually rectangular.
-4. Bucket same-shape projected moments for batched NS or batched eig/SVD where useful.
-5. Only then consider invasive autograd tricks.
+SVD initialization and SVD refresh are not merely “better basis” operations. They can also be sharper interventions that rapidly redirect the optimizer toward the current batch distribution. Grassmann tracking is slower and smoother: it limits adaptation to a rotating subspace rather than a list of unrelated spaces over time.
 
-Orthogonalization, scaling, and LR are coupled. HeavyBall Muon scales full-matrix orthogonalized updates by `sqrt(max(1, rows / cols))`. In SUMO, applying that rule directly to the projected tensor can accidentally introduce a `sqrt(full_dim / rank)` multiplier; prefer the explicit `orthogonalization_scale_mode="muon"` semantic, which orthogonalizes in projected space but scales from the original full matrix shape. Muon-style orthogonalized updates can want LR scales far above classic LLM AdamW defaults; use HeavyBall defaults as the first prior and tune around them. Equal LR comparisons between no-ortho projected momentum and orthogonalized projected momentum are diagnostic but not final fairness.
+That smoothing may be central for distribution shift without total forgetting.
 
-## Future memory frontier: projected activations
+Open design questions:
 
-A later optimization is to avoid materializing the full-rank gradient only to project it. Mathematically, for linear modules, projected gradients can be computed from projected activations / backprops directly. This could reduce peak memory pressure substantially.
+- exact SVD init vs random init vs short calibration SVD,
+- continuous Grassmann tracking vs periodic SVD refresh,
+- moment transport strength across basis changes,
+- basis update rate by layer depth or module role,
+- whether basis motion should be slower in backbone-stability-critical modules.
 
-This is not v1. Prior attempts required heavy PyTorch hacking: returning `None` as the normal gradient and storing a projected gradient side channel. That path is powerful but sharp. It should be isolated behind explicit hooks and tested against vanilla gradients for equivalence.
+### 4. Orthogonalization quality for rectangular projected moments
 
-The safe sequence is:
+Projected moments are often rectangular. HeavyBall therefore uses its standard Newton-Schulz path rather than square-only PolarExpress-style machinery. That is fine and expected.
 
-1. Prove optimizer behavior using normal gradients.
-2. Add optional projected-gradient capture for selected `nn.Linear` modules.
-3. Verify exact/near-exact equivalence against full-gradient projection on tiny models.
-4. Measure actual peak-memory reduction, not just theoretical allocation savings.
+But very tall rectangular NS may not spread information as well as desired. Aurora-style rectangular orthogonalization is directly relevant because SumoTrack's rank-64 projected moments commonly have extreme aspect ratios: `2048×64`, `8192×64`, `9728×64`, and their transposes. Ordinary polar/NS makes the small side orthonormal but can leave large-side row leverage uneven; Aurora adds diagonal preconditioning so the large-side update energy approaches the Stiefel target.
 
-## First success criteria
+SumoTrack should treat Aurora as a **projected direction map**, not as a replacement optimizer. Momentum, basis tracking, full-matrix Muon scaling, LR, fallback semantics, and state accounting remain SumoTrack's responsibility.
 
-SumoTrack v1 is worth continuing if it can show:
+Current status: `orthogonalization="aurora"` exists as an eager projected orthogonalization mode. It applies Aurora-style leverage-uniform polar to the projected moment, then uses the same `orthogonalization_scale_mode` semantics as the HeavyBall path. `--log-norms` also reports projected leverage diagnostics so an Aurora run can answer whether the large-side energy actually became more uniform.
 
-- stable loss behavior on short cached pretrained-LLM SYNTH/post-training tests,
-- lower optimizer-state memory than AdamW for matrix-heavy models,
-- credible convergence versus HeavyBall AdamW, Muon, and PSGDLRA,
-- no accidental full-size matrix moments on the matrix path,
-- sane behavior with bf16 params plus HeavyBall ECC,
-- refresh spikes that are visible but tolerable.
+Open design questions:
 
-Do not declare victory from a green unit test. The observable downstream signals are loss curves, peak memory, step time, state size, and restart correctness.
+- HeavyBall Newton-Schulz vs Aurora-style rectangular balancing on real gradients,
+- scale and norm grafting semantics after rectangular orthogonalization,
+- whether projected tensor aspect ratio should influence rank allocation,
+- whether some modules should use two-sided square cores for cleaner orthogonalization.
 
-## Next strategic arc: full/broad fine-tuning path
+### 5. Two-sided projection as an optional branch
 
-The current matrix-only LFM/SYNTH evidence has done its first job: SUMO-style projected moment orthogonalization has signal, HeavyBall Newton-Schulz can replace exact projected-space SVD as the hot path, and full-matrix Muon scaling is now separated from projected-rank scaling. The next goal is not a slightly longer matrix-only run. The next goal is to make SumoTrack a credible full/broad fine-tuning optimizer rather than a clean matrix-path ablation.
+Two-sided projection is not the mainline yet, but it is not off the table:
 
-The key question is whether SumoTrack survives real model parameter topology while preserving the memory invariant:
+```text
+G_hat = Q_Lᵀ G Q_R      # [r_l, r_r]
+O_hat = orthogonalize(G_hat)
+update = Q_L O_hat Q_Rᵀ
+```
 
-- 2D matrix params use projected first moments and projector state, with no full-size first or second moments.
-- Non-2D params, embeddings, heads, norms, biases, and tiny kernels are either explicitly frozen or handled by a boring fallback optimizer path.
-- Fallback state is accounted separately so embeddings/lm-head cannot hide inside an attractive total-state number.
+It costs roughly `r(m+n) + r²` state instead of one-sided `r(m+n)`, so the byte penalty is modest for large matrices. It may trade raw adaptation capacity for smoother, more stable, square-core SUMO geometry.
 
-The next implementation arc should deliver:
+Evaluate this only when it answers a real design question: capacity vs stability, forgetting vs target movement, or rectangular orthogonalization limits. Do not add it as abstraction ornament.
 
-1. **HeavyBall-backed fallback semantics.** Replace the local toy AdamW fallback where practical with HeavyBall-backed AdamW/LaProp-style behavior, including clear ECC/param-ECC behavior. Unsupported combinations should fail loudly, not silently ignore configuration. Current status: non-2D fallback uses HeavyBall `fused_adam_` with fp32 moments for bf16 params; ECC/param-ECC still fail loudly because honest support needs HeavyBall `ChainOpt` state hooks.
-2. **Explicit broad parameter scopes.** Extend the LLM harness beyond `matrices-no-embeddings` with modes that make embeddings, lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors visible in the accounting. Current status: `broad-no-embeddings` trains matrices plus fallback topology while freezing embeddings/lm-head.
-3. **State accounting by category.** Report matrix projected state bytes, fallback state bytes, and total optimizer state bytes. The product claim depends on where memory goes, not only on a single total. Current status: harness reports matrix/fallback/total optimizer state bytes.
-4. **Mixed-path restart proof.** Add a save/load/resume smoke after at least one mixed matrix+fallback step. The check should prove projected moment and basis shapes survive, fallback state survives, and the next step changes parameters. Current status: unit coverage exists for mixed matrix+fallback reload and subsequent parameter movement.
-5. **Full/broad LFM/SYNTH smoke.** Run HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` on a representative broad parameter scope and report loss movement, state bytes by category, peak CUDA, post-compile step time, and matrix update norms. Current status: one warmup + one measured broad no-embedding LFM/SYNTH plumbing smoke runs on CUDA and reports category state bytes, peak CUDA, step time, and update norms.
+## Engineering direction
 
-Only after that path exists should longer LR-aware quality evaluations become the main work again. Longer matrix-only evals can refine the geometry story, but they do not prove the optimizer is usable for the product goal: broad/full fine-tuning on consumer GPUs where full AdamW state is the thing users cannot afford.
+Keep the eager implementation as the algorithm rail until the geometry is clearer. HeavyBall-native/ECC integration matters later, but premature integration will hide algorithmic questions behind framework work.
 
-## Progression gates
+Current implementation invariants:
 
-Each phase must leave behind a checked signal before the next phase becomes the main thread. If a gate fails, stop and repair the concept or implementation before piling on features. A narrow green test is useful only when it protects the real invariant named by the gate.
+- Public class is `SumoTrack`.
+- Matrix parameters must not store full-size first moments.
+- Matrix parameters must not store full-size second moments in the main path.
+- Non-2D params use a boring fallback path or are frozen by task policy.
+- Fallback state must be accounted separately from matrix state.
+- Orthogonalization happens in projected space.
+- HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` is the practical mainline orthogonalization path.
+- Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
-The gates are:
+Do not optimize kernel launches before the algorithmic shape is worth optimizing. Once the design is stable enough, the performance ladder is:
 
-1. **Projector gate:** projection shape, lift shape, orthonormality, rank clamping, dtype/device behavior, and side selection are tested for both tall and wide matrices.
-2. **Scheduler gate:** round-robin refresh order is deterministic, wraps explicitly, supports budget and target interval controls, and demonstrably schedules only basis refreshes rather than ordinary optimizer updates.
-3. **Optimizer state gate:** one optimizer step changes parameters, matrix parameters store only projected moments and projector state, fallback parameters update, and save/load resumes without state shape drift.
-4. **Descent gate:** a tiny no-download training script shows reproducible loss descent and prints enough state accounting to catch accidental AdamW-sized matrix state.
-5. **HeavyBall/ECC gate:** bf16 matrix params run with HeavyBall ECC/param-ECC compatibility or unsupported combinations are explicitly rejected rather than silently ignored.
-6. **Grassmann gate:** basis updates preserve orthonormality, projected moments are transported across basis changes, and Grassmann tracking matches or beats periodic SVD refresh on a tiny wall-clock-aware smoke test.
-7. **Performance gate:** any optimization phase must report step time, refresh spike size, state bytes, and enough profiling signal to show the bottleneck being attacked is real.
+1. bucket same-shape projected moments for batched orthogonalization,
+2. evaluate Aurora-style rectangular orthogonalization,
+3. move compatible pieces toward HeavyBall-native transforms,
+4. add ECC/param-ECC,
+5. consider projected-gradient hooks only after the ordinary-gradient optimizer has proven worth.
 
-Projected-gradient hooks remain behind all baseline gates. They are not allowed to become the explanation for why the ordinary-gradient optimizer has not yet been proven.
+Projected-gradient hooks remain dangerous and later. Avoiding full-gradient materialization could be a real Gemma-scale memory frontier, but it must be isolated and proven equivalent against ordinary full-gradient projection on tiny models.
+
+## Evaluation philosophy
+
+SYNTH is not a toy here. Clean, low-noise target data is useful for measuring adaptation because optimizer noise is less hidden by dataset noise. Ace the easy data before claiming robustness on a short-story dataset that breaks models.
+
+The evaluation target is distribution adaptation with retention, not merely short-run loss descent.
+
+Useful evaluation signals:
+
+- target validation loss curve,
+- source/retention validation loss curve,
+- tokens per optimizer step without gradient accumulation,
+- wall-clock tokens/sec,
+- peak CUDA memory,
+- optimizer state bytes by matrix/fallback/total,
+- update/param and grad/param diagnostics,
+- basis motion / orthonormality diagnostics when testing tracking,
+- qualitative generation only after quantitative movement is real.
+
+The next serious evaluation harness should support periodic validation and structured output. But harness work is only justified when it lets us answer an algorithm question faster.
+
+## Near-term design cuts
+
+The next work should improve the algorithm under our feet:
+
+1. **Aurora projected-orthogonalization ablation.** Compare `orthogonalization="heavyball"` vs `"aurora"` on the same SumoTrack configuration. Report target movement, any retention signal available, step time, peak CUDA, update/param, and projected leverage CV/min/max. The question is not “does Aurora balance rows?” — unit diagnostics already show that. The question is whether leverage-uniform projected updates improve distribution adaptation or reduce thrash on SYNTH.
+2. **Architecture-aware side/rank inspection.** Inspect Gemma/LFM/Qwen module shapes and map which axis is hidden-state-facing for MLP up/gate/down and attention projections. Decide whether `AUTO` is aligned with the intended stability axis or merely lucky.
+3. **Budget-driven rank policy.** Add a minimal rank-policy layer that can allocate rank by module role or tensor size under a target state budget. Uniform rank remains available but should stop being the only serious mode.
+4. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann vs SVD can be reasoned about as smoothing/adaptation-area control, not just speed.
+5. **Medium SYNTH adaptation run.** After one geometry cut above, run enough SYNTH to see curve shape and retention, not another 20-step smoke.
+
+## Next session contract
+
+Start with Aurora, because the evidence now points to a concrete pressure point in the current mainline: extreme-aspect projected moments likely have uneven large-side leverage under ordinary NS.
+
+Minimum useful next session:
+
+1. Run a short but nontrivial LFM/SYNTH comparison:
+   - `--param-scope broad-no-embeddings`,
+   - rank `64`,
+   - `--subspace-init random` for performance-path timing unless explicitly testing initialization quality,
+   - HeavyBall NS + Muon scale at the current center LR,
+   - Aurora + Muon scale at the same LR, then only one LR adjustment if update/param or loss says the scale changed materially,
+   - `--log-norms` so projected leverage diagnostics are present.
+2. Interpret Aurora by three signals together:
+   - target loss movement,
+   - projected leverage CV/min/max,
+   - measured step time / tokens/sec.
+3. If Aurora improves leverage but hurts loss, inspect whether uniform large-side updates are over-smoothing useful specialization.
+4. If Aurora improves or matches loss with acceptable step cost, promote it to a serious mainline candidate and then ask whether rank allocation should account for projected aspect ratio.
+5. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
+
+Falsifier: if Aurora's better leverage uniformity does not improve target movement, retention, or stability after a fair scale check, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms.
+
+## Stop conditions
+
+Stop and rethink if:
+
+- SumoTrack cannot exploit higher tokens/step or larger model scope than serious alternatives on the target GPU,
+- orthogonalized one-sided updates improve target loss but cause unacceptable retention collapse,
+- rank allocation shows most state is being spent on low-leverage tensors,
+- Grassmann tracking is too sluggish to adapt or too fast to smooth,
+- rectangular orthogonalization quality becomes the bottleneck,
+- the code starts serving old gates instead of the product thesis.
+
+The product is not a checklist of optimizer features. The product is a usable path to high-capacity distribution adaptation under consumer-GPU constraints.

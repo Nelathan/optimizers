@@ -35,6 +35,8 @@ class SumoTrack(Optimizer):
         orthogonalization: str = "svd",
         orthogonalization_scale_mode: str = "muon",
         heavyball_orthogonalization_mode: str | None = None,
+        aurora_pp_iterations: int = 2,
+        aurora_pp_beta: float = 0.5,
         subspace_init: str = "svd",
         subspace_update_method: str = "svd_refresh",
         grassmann_step_size: float = 0.01,
@@ -61,10 +63,14 @@ class SumoTrack(Optimizer):
             raise ValueError(f"rank must be positive, got {rank}")
         if recovery_scale < 0:
             raise ValueError(f"recovery_scale must be non-negative, got {recovery_scale}")
-        if orthogonalization not in {"none", "svd", "heavyball"}:
-            raise ValueError("orthogonalization must be 'none', 'svd', or 'heavyball'")
+        if orthogonalization not in {"none", "svd", "heavyball", "aurora"}:
+            raise ValueError("orthogonalization must be 'none', 'svd', 'heavyball', or 'aurora'")
         if orthogonalization_scale_mode not in {"none", "scale", "graft", "muon"}:
             raise ValueError("orthogonalization_scale_mode must be 'none', 'scale', 'graft', or 'muon'")
+        if aurora_pp_iterations < 1:
+            raise ValueError(f"aurora_pp_iterations must be >= 1, got {aurora_pp_iterations}")
+        if aurora_pp_beta <= 0:
+            raise ValueError(f"aurora_pp_beta must be positive, got {aurora_pp_beta}")
         if subspace_update_method not in {"svd_refresh", "grassmann"}:
             raise ValueError("subspace_update_method must be 'svd_refresh' or 'grassmann'")
         subspace_init = ProjectorInitMethod(subspace_init).value
@@ -85,6 +91,8 @@ class SumoTrack(Optimizer):
             orthogonalization=orthogonalization,
             orthogonalization_scale_mode=orthogonalization_scale_mode,
             heavyball_orthogonalization_mode=heavyball_orthogonalization_mode,
+            aurora_pp_iterations=aurora_pp_iterations,
+            aurora_pp_beta=aurora_pp_beta,
             subspace_init=subspace_init,
             subspace_update_method=subspace_update_method,
             grassmann_step_size=grassmann_step_size,
@@ -108,6 +116,10 @@ class SumoTrack(Optimizer):
                 "fallback_update_norm_sq": 0.0,
                 "matrix_params": 0,
                 "fallback_params": 0,
+                "projected_leverage_cv_sum": 0.0,
+                "projected_leverage_min_ratio_sum": 0.0,
+                "projected_leverage_max_ratio_sum": 0.0,
+                "projected_leverage_tensors": 0,
             }
             if self.diagnostics_enabled
             else None
@@ -134,6 +146,15 @@ class SumoTrack(Optimizer):
             diagnostics["matrix_update_norm"] = matrix_update_norm
             diagnostics["fallback_update_norm"] = fallback_update_norm
             diagnostics["update_norm"] = (diagnostics["matrix_update_norm_sq"] + diagnostics["fallback_update_norm_sq"]) ** 0.5
+            count = diagnostics["projected_leverage_tensors"]
+            if count:
+                diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count
+                diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count
+                diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count
+            else:
+                diagnostics["mean_projected_leverage_cv"] = float("nan")
+                diagnostics["mean_projected_leverage_min_ratio"] = float("nan")
+                diagnostics["mean_projected_leverage_max_ratio"] = float("nan")
             self.last_step_diagnostics = diagnostics
         else:
             self.last_step_diagnostics = {}
@@ -166,6 +187,12 @@ class SumoTrack(Optimizer):
         state["projected_exp_avg"] = projected_exp_avg
 
         update_hat = self._orthogonalize_update(projected_exp_avg, group, tuple(p.shape))
+        if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
+            leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
+            diagnostics["projected_leverage_cv_sum"] += leverage_cv
+            diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
+            diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
+            diagnostics["projected_leverage_tensors"] += 1
         update = projector.project_back(update_hat).to(dtype=p.dtype)
 
         recovery_scale = group["recovery_scale"]
@@ -252,6 +279,8 @@ class SumoTrack(Optimizer):
             )
         if group["orthogonalization"] == "heavyball":
             return SumoTrack._orthogonalize_heavyball(update, group, original_shape)
+        if group["orthogonalization"] == "aurora":
+            return SumoTrack._orthogonalize_aurora(update, group, original_shape)
         raise AssertionError(f"unexpected orthogonalization mode: {group['orthogonalization']}")
 
     @staticmethod
@@ -275,6 +304,62 @@ class SumoTrack(Optimizer):
         return work
 
     @staticmethod
+    def _orthogonalize_aurora(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
+        aurora_update = SumoTrack._aurora_leverage_uniform_polar(
+            update,
+            pp_iterations=group["aurora_pp_iterations"],
+            pp_beta=group["aurora_pp_beta"],
+        )
+        return SumoTrack._scale_orthogonalized_update(
+            update,
+            aurora_update,
+            group["orthogonalization_scale_mode"],
+            original_shape,
+        )
+
+    @staticmethod
+    def _aurora_leverage_uniform_polar(update: Tensor, pp_iterations: int = 2, pp_beta: float = 0.5, eps: float = 1e-7) -> Tensor:
+        """Aurora-style leverage-uniform polar direction for rectangular projected moments.
+
+        SumoTrack owns momentum, LR, weight decay, and full-matrix Muon scaling. This
+        helper extracts only Aurora's rectangular direction map: diagonally
+        precondition a non-square matrix before polar/NS so the large-side row
+        leverage approaches the Stiefel target. For wide matrices, transpose to
+        tall form, balance, then transpose back, matching Aurora's convention.
+        """
+
+        if update.ndim != 2:
+            raise ValueError(f"Aurora orthogonalization expects a 2D tensor, got shape {tuple(update.shape)}")
+        if pp_iterations < 1:
+            raise ValueError(f"pp_iterations must be >= 1, got {pp_iterations}")
+        if pp_beta <= 0:
+            raise ValueError(f"pp_beta must be positive, got {pp_beta}")
+        if update.shape[-2] == update.shape[-1]:
+            return SumoTrack._heavyball_polar(update)
+
+        transposed = update.shape[-2] < update.shape[-1]
+        work = update.mT if transposed else update
+        work32 = work.float()
+        rows, cols = work32.shape
+        target_row_sq = cols / rows
+        diagonal = work32.norm(dim=-1, keepdim=True).clamp_min(eps).reciprocal()
+        balanced = None
+        for iteration in range(pp_iterations):
+            balanced = SumoTrack._heavyball_polar(diagonal * work32).float()
+            if iteration < pp_iterations - 1:
+                row_sq = balanced.square().sum(dim=-1, keepdim=True).clamp_min(eps * eps)
+                diagonal = diagonal * (target_row_sq / row_sq).pow(pp_beta)
+        assert balanced is not None
+        result = balanced.mT if transposed else balanced
+        return result.to(device=update.device, dtype=update.dtype)
+
+    @staticmethod
+    def _heavyball_polar(update: Tensor) -> Tensor:
+        work = update.clone()
+        heavyball_utils.inplace_orthogonal_(work, mode="newtonschulz", out=work, scale_mode="none")
+        return work
+
+    @staticmethod
     def _scale_orthogonalized_update(
         original_update: Tensor,
         orthogonalized_update: Tensor,
@@ -294,6 +379,20 @@ class SumoTrack(Optimizer):
             cols = math.prod(original_shape[1:])
             return orthogonalized_update * math.sqrt(max(1.0, rows / cols))
         raise AssertionError(f"unexpected orthogonalization scale mode: {scale_mode}")
+
+    @staticmethod
+    def _large_axis_leverage_stats(update: Tensor, eps: float = 1e-12) -> tuple[float, float, float]:
+        if update.ndim != 2 or min(update.shape) == 0:
+            return float("nan"), float("nan"), float("nan")
+        tall = update if update.shape[-2] >= update.shape[-1] else update.mT
+        row_sq = tall.float().square().sum(dim=-1)
+        mean = row_sq.mean().clamp_min(eps)
+        cv = row_sq.std(unbiased=False) / mean
+        return (
+            float(cv.detach().cpu()),
+            float((row_sq.min() / mean).detach().cpu()),
+            float((row_sq.max() / mean).detach().cpu()),
+        )
 
     @staticmethod
     def _projector_from_state(p: Tensor, group: dict, state: dict) -> SubspaceProjector:

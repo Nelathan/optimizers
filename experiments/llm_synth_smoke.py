@@ -62,6 +62,17 @@ def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float:
     return float(diagnostics.get("update_norm", float("nan")))
 
 
+def optimizer_projected_leverage_stats(optimizer: torch.optim.Optimizer) -> tuple[float, float, float]:
+    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
+    if not diagnostics:
+        return float("nan"), float("nan"), float("nan")
+    return (
+        float(diagnostics.get("mean_projected_leverage_cv", float("nan"))),
+        float(diagnostics.get("mean_projected_leverage_min_ratio", float("nan"))),
+        float(diagnostics.get("mean_projected_leverage_max_ratio", float("nan"))),
+    )
+
+
 def synth_texts(data_dir: Path, split: str, limit: int) -> list[str]:
     shards = sorted(data_dir.glob("synth_*.parquet"))
     if not shards:
@@ -214,12 +225,16 @@ def train_step(
     param_norm = parameter_norm(trainable) if log_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if log_norms else float("nan")
+    leverage_cv, leverage_min_ratio, leverage_max_ratio = optimizer_projected_leverage_stats(optimizer) if log_norms else (float("nan"), float("nan"), float("nan"))
     return {
         "loss": sum(losses) / len(losses),
         "grad_norm": grad_norm,
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_norm / param_norm if param_norm > 0 else float("nan"),
+        "projected_leverage_cv": leverage_cv,
+        "projected_leverage_min_ratio": leverage_min_ratio,
+        "projected_leverage_max_ratio": leverage_max_ratio,
     }
 
 
@@ -254,6 +269,8 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
             orthogonalization=args.orthogonalization,
             orthogonalization_scale_mode=args.orthogonalization_scale_mode,
             heavyball_orthogonalization_mode=args.heavyball_orthogonalization_mode,
+            aurora_pp_iterations=args.aurora_pp_iterations,
+            aurora_pp_beta=args.aurora_pp_beta,
             subspace_init=args.subspace_init,
             subspace_update_method="grassmann",
             grassmann_step_size=args.grassmann_step_size,
@@ -293,6 +310,9 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     measured_param_norms = [step["param_norm"] for step in measured_steps]
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
+    measured_leverage_cvs = [step["projected_leverage_cv"] for step in measured_steps]
+    measured_leverage_min_ratios = [step["projected_leverage_min_ratio"] for step in measured_steps]
+    measured_leverage_max_ratios = [step["projected_leverage_max_ratio"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
@@ -328,10 +348,16 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "mean_measured_param_norm": mean_or_nan(measured_param_norms),
         "mean_measured_update_norm": mean_or_nan(measured_update_norms),
         "mean_measured_update_to_param_ratio": mean_or_nan(measured_update_to_param_ratios),
+        "mean_measured_projected_leverage_cv": mean_or_nan(measured_leverage_cvs),
+        "mean_measured_projected_leverage_min_ratio": mean_or_nan(measured_leverage_min_ratios),
+        "mean_measured_projected_leverage_max_ratio": mean_or_nan(measured_leverage_max_ratios),
         "last_measured_grad_norm": measured_grad_norms[-1],
         "last_measured_param_norm": measured_param_norms[-1],
         "last_measured_update_norm": measured_update_norms[-1],
         "last_measured_update_to_param_ratio": measured_update_to_param_ratios[-1],
+        "last_measured_projected_leverage_cv": measured_leverage_cvs[-1],
+        "last_measured_projected_leverage_min_ratio": measured_leverage_min_ratios[-1],
+        "last_measured_projected_leverage_max_ratio": measured_leverage_max_ratios[-1],
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
@@ -420,9 +446,11 @@ def main() -> None:
     parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
-    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball"), default="svd")
+    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="svd")
     parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
     parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
+    parser.add_argument("--aurora-pp-iterations", type=int, default=2)
+    parser.add_argument("--aurora-pp-beta", type=float, default=0.5)
     parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
     parser.add_argument("--subspace-lr", dest="sumotrack_lr", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
