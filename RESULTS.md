@@ -162,3 +162,36 @@ Notes:
 - HeavyBall Newton-Schulz closely matches exact SVD quality and update scale in this short run, with lower measured step time.
 - Exact SVD remains valuable as a correctness/debug baseline, but it should no longer be the main performance path.
 - The previous best unscaled SVD run (`1.593341`) is not directly comparable to the Muon-scaled runs; scale and LR are coupled. Muon-scale mode likely needs its own LR sweep.
+
+## 2026-06-14: Broad no-embedding LFM/SYNTH quality smoke
+
+Question: does rank-64 broad-scope `SumoTrack` preserve the state-memory story and keep useful movement when real model topology adds fallback tensors, or was the positive matrix-only signal too narrow?
+
+Setup:
+
+- Model/data: `LiquidAI/LFM2.5-1.2B-Base` from local cache, local SYNTH shards, `HF_HUB_OFFLINE=1`.
+- Scope: `--param-scope broad-no-embeddings`; embeddings/lm-head frozen.
+- Trainable: 1,036,120,832 params across 146 tensors: 92 matrix tensors / 1,035,993,088 params and 54 fallback tensors / 127,744 params.
+- Rank/init: rank 64, `--subspace-init random`.
+- Steps: 1 warmup + 20 measured optimizer steps.
+- Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
+- Validation texts: 8.
+- Norm logging: enabled for `SumoTrack` runs.
+
+Results:
+
+| optimizer | ortho | lr | state bytes | matrix/fallback state bytes | peak CUDA bytes | final val | mean train | mean update/param | step seconds |
+| --- | --- | ---: | ----------: | ---: | --------------: | --------: | ---------: | ----------------: | -----------: |
+| SumoTrack | HeavyBall NS + Muon scale | 0.0025 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.734250 | 2.072461 | 0.001181 | 0.323579 |
+| SumoTrack | HeavyBall NS + Muon scale | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.793099 | 2.168231 | 0.002193 | 0.326059 |
+| SumoTrack | none | 0.04 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 7.085179 | 7.481242 | 0.010982 | 0.285293 |
+| SumoTrack | none | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.811141 | 2.219735 | 0.001681 | 0.284458 |
+| torch AdamW | n/a | 0.00002 | 4,144,483,912 | n/a / 4,144,483,912 | 9,129,377,280 | 1.512150 | 1.927465 | n/a | 0.203278 |
+
+Notes:
+
+- Broad topology preserved the SumoTrack state-memory story: fallback state was ~1.0 MB and did not dominate the ~89.9 MB total.
+- Orthogonalized SumoTrack stayed numerically stable at LR `0.0025` and `0.005`, but `0.005` looked too hot on this short run.
+- The no-ortho matrix-only LR prior did not transfer. LR `0.04` was an obvious broad-topology failure, not a noisy loss comparison. LR `0.005` was stable but still worse than orthogonalized LR `0.0025`.
+- AdamW remains materially better in this short quality anchor, but it used about 46x SumoTrack optimizer state and much higher peak CUDA. That is the intended product tension, not a contradiction.
+- Next useful gate is a longer broad run centered on orthogonalized LR `0.0025`, with a lower no-ortho bracket and possibly SVD init as a quality-initialization comparison. Continuing should be falsified if the AdamW quality gap fails to narrow with more steps/tokens or if no-ortho catches up after a fair broad LR tune.
