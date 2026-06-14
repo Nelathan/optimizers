@@ -118,7 +118,7 @@ Open design questions:
 
 ### 5. Two-sided projection as an optional branch
 
-Two-sided projection is not the mainline yet, but it is not off the table:
+Two-sided projection exists as an experimental branch, but it is not the mainline:
 
 ```text
 G_hat = Q_Lᵀ G Q_R      # [r_l, r_r]
@@ -127,6 +127,8 @@ update = Q_L O_hat Q_Rᵀ
 ```
 
 It costs roughly `r(m+n) + r²` state instead of one-sided `r(m+n)`, so the byte penalty is modest for large matrices. It may trade raw adaptation capacity for smoother, more stable, square-core SUMO geometry.
+
+Current status: `projection_mode="two_sided"` stores left/right bases plus a square projected moment. It supports random/SVD initialization and either fixed bases (`subspace_update_method="none"`) or explicit SVD refresh. It rejects Grassmann tracking because the coupled left/right smoothing update has not been designed. A short fixed-basis LFM/SYNTH check found two-sided stable and state-cheap but weaker than one-sided rectangular updates on immediate target movement. Keep it as a stability/retention/rank-budget branch, not as the default.
 
 Evaluate this only when it answers a real design question: capacity vs stability, forgetting vs target movement, or rectangular orthogonalization limits. Do not add it as abstraction ornament.
 
@@ -179,7 +181,7 @@ The next serious evaluation harness should support periodic validation and struc
 
 The next work should improve the algorithm under our feet:
 
-1. **Aurora projected-orthogonalization ablation.** Compare `orthogonalization="heavyball"` vs `"aurora"` on the same SumoTrack configuration. Report target movement, any retention signal available, step time, peak CUDA, update/param, and projected leverage CV/min/max. The question is not “does Aurora balance rows?” — unit diagnostics already show that. The question is whether leverage-uniform projected updates improve distribution adaptation or reduce thrash on SYNTH.
+1. **Retention-aware Aurora ablation.** Compare `orthogonalization="heavyball"` vs `"aurora"` on the same one-sided SumoTrack configuration. Report target movement, source/retention movement, step time, peak CUDA, update/param, and projected leverage CV/min/max. The question is no longer “does Aurora balance rows?” — it does. The question is whether leverage-uniform projected updates reduce thrash/forgetting enough to justify a small target-loss and step-time cost.
 2. **Architecture-aware side/rank inspection.** Inspect Gemma/LFM/Qwen module shapes and map which axis is hidden-state-facing for MLP up/gate/down and attention projections. Decide whether `AUTO` is aligned with the intended stability axis or merely lucky.
 3. **Budget-driven rank policy.** Add a minimal rank-policy layer that can allocate rank by module role or tensor size under a target state budget. Uniform rank remains available but should stop being the only serious mode.
 4. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann vs SVD can be reasoned about as smoothing/adaptation-area control, not just speed.
@@ -187,7 +189,7 @@ The next work should improve the algorithm under our feet:
 
 ## Next session contract
 
-Start with Aurora, because the evidence now points to a concrete pressure point in the current mainline: extreme-aspect projected moments likely have uneven large-side leverage under ordinary NS.
+Start with Aurora/retention, because the evidence now points to a concrete pressure point in the current mainline: extreme-aspect projected moments have uneven large-side leverage under ordinary NS, and Aurora fixes that mechanically. The unknown is whether that smoothing helps product behavior or only slows target descent.
 
 Minimum useful next session:
 
@@ -202,9 +204,10 @@ Minimum useful next session:
    - target loss movement,
    - projected leverage CV/min/max,
    - measured step time / tokens/sec.
-3. If Aurora improves leverage but hurts loss, inspect whether uniform large-side updates are over-smoothing useful specialization.
-4. If Aurora improves or matches loss with acceptable step cost, promote it to a serious mainline candidate and then ask whether rank allocation should account for projected aspect ratio.
-5. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
+3. Include a source/retention validation split if available. Aurora's plausible value is less thrashy distribution movement, not prettier row norms.
+4. If Aurora improves leverage but hurts both target and retention, demote it. If it hurts short target movement but preserves source behavior, schedule a longer run rather than discarding it.
+5. Keep two-sided square-core out of the mainline unless it shows a retention or rank-budget advantage. Its short fixed-basis target movement was weaker than one-sided.
+6. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
 
 Falsifier: if Aurora's better leverage uniformity does not improve target movement, retention, or stability after a fair scale check, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms.
 

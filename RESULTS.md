@@ -195,3 +195,33 @@ Notes:
 - The no-ortho matrix-only LR prior did not transfer. LR `0.04` was an obvious broad-topology failure, not a noisy loss comparison. LR `0.005` was stable but still worse than orthogonalized LR `0.0025`.
 - AdamW remains materially better in this short quality anchor, but it used about 46x SumoTrack optimizer state and much higher peak CUDA. That is the intended product tension, not a contradiction.
 - Next useful gate is a longer broad run centered on orthogonalized LR `0.0025`, with a lower no-ortho bracket and possibly SVD init as a quality-initialization comparison. Continuing should be falsified if the AdamW quality gap fails to narrow with more steps/tokens or if no-ortho catches up after a fair broad LR tune.
+
+## 2026-06-14: Aurora and two-sided projected geometry check
+
+Question: should SumoTrack's projected orthogonalization remain one-sided rectangular HeavyBall NS, use Aurora-style leverage-uniform rectangular polar, or move to a two-sided square-core projection?
+
+Setup:
+
+- Model/data: `LiquidAI/LFM2.5-1.2B-Base`, local SYNTH, `HF_HUB_OFFLINE=1`.
+- Scope: `--param-scope broad-no-embeddings`.
+- Rank/init: rank 64, fixed bases via `--subspace-update-method none` unless noted.
+- Steps: 1 warmup + 10 measured optimizer steps.
+- Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
+- Validation texts: 8.
+- Norm/leverage logging: enabled.
+
+Results:
+
+| projection | init | ortho | state bytes | final val | mean train | update/param | leverage CV | leverage min/max vs mean | step seconds |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one-sided | random | HeavyBall NS | 89,888,768 | 1.735645 | 2.123392 | 0.001307 | 1.277685 | 0.109 / 36.609 | 0.347413 |
+| one-sided | random | Aurora | 89,888,768 | 1.751235 | 2.145004 | 0.001313 | 0.025380 | 0.829 / 1.066 | 0.418227 |
+| two-sided | random | HeavyBall NS | 90,642,432 | 1.801806 | 2.180583 | 0.001318 | 0.023224 | 0.917 / 1.043 | 0.341462 |
+| two-sided | SVD | HeavyBall NS | 90,642,432 | 1.813795 | 2.162647 | 0.001303 | 0.019022 | 0.946 / 1.042 | 0.335513 |
+
+Notes:
+
+- One-sided HeavyBall NS has extreme large-axis leverage concentration in this diagnostic: average projected row-energy max was ~36x mean.
+- Aurora fixes that mechanically, reducing leverage CV to ~0.025 and max/mean to ~1.07, with similar update/param. It slightly lost immediate target movement and cost ~20% step time over this short run.
+- Two-sided square-core projection is stable and nearly state-neutral, but underperformed one-sided rectangular HeavyBall on immediate target movement. SVD init did not rescue it in this short fixed-basis comparison.
+- Interpretation: one-sided rectangular updates remain the mainline for target adaptation. Aurora is still worth a retention-aware run because its value may be smoother/less forgetting-prone movement, not faster 10-step target loss. Two-sided should stay experimental until it shows retention or rank-budget advantage.

@@ -56,9 +56,12 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Wire HeavyBall Newton-Schulz/polar orthogonalization for eager experiments.
 - [x] Integrate HeavyBall Newton-Schulz orthogonalization without disabling compile.
 - [x] Add full-matrix Muon scale mode for projected SUMO updates.
+- [x] Add Aurora-style leverage-uniform projected orthogonalization as a SumoTrack-owned direction map.
+- [x] Add experimental two-sided square-core projection mode with left/right bases and square projected moments.
 - [ ] Add optional Nesterov projected momentum.
 - [x] Add optional perpendicular gradient recovery.
 - [x] Verify state dict save/load round trip.
+- [x] Verify two-sided state dict save/load round trip.
 
 ## Phase 4: HeavyBall-native integration
 
@@ -78,6 +81,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Replace hard SVD refresh with `subspace_update_method="grassmann"` after initialization.
 - [x] Implement projected moment transport across basis updates.
 - [x] Test moment transport against explicit old-basis/new-basis projection formulas.
+- [ ] Design coupled left/right Grassmann tracking for two-sided projection, or document why two-sided should stay fixed/SVD-refresh only.
 - [ ] Add accumulated-gradient tracking option.
 - [x] Compare SVD refresh vs Grassmann update on tiny regression loss and step time.
 
@@ -89,6 +93,7 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [ ] Investigate bucketing refreshed modules by shape for batched `eigh`/SVD if refresh spikes matter.
 - [ ] Measure whether round-robin refresh makes batched decompositions unnecessary.
 - [x] Add diagnostics for step time, refresh spike ratio, state bytes, peak CUDA memory, and profiler CUDA events.
+- [x] Add projected leverage diagnostics for rectangular/square orthogonalized updates.
 - [ ] Avoid optimizing decomposition refresh before the hot per-step projection/ortho path is understood.
 
 ## Phase 7: experiments
@@ -96,8 +101,8 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [x] Tiny linear regression sanity check.
 - [x] Cached pretrained-LLM SYNTH smoke test.
 - [x] Update LLM SYNTH smoke to train all non-embedding 2D matrices by default.
-- [ ] Add full/broad post-training mode that trains matrix params plus explicit fallback params.
-- [ ] Add LLM harness accounting for embeddings/lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors.
+- [x] Add full/broad post-training mode that trains matrix params plus explicit fallback params.
+- [ ] Add fuller LLM harness accounting for embeddings/lm-head, non-2D fallback tensors, tiny 3D kernels, and frozen tensors.
 - [x] Exclude or separately account for tiny 3D conv/linear-attention kernels.
 - [x] Add warmup/measurement split for no-compile smoke runs.
 - [x] Add opt-in grad/param/update norm logging to LLM SYNTH smoke.
@@ -112,8 +117,12 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [ ] Test recovery scale `0`, `0.1`, `0.25`, `0.5`, `1.0`.
 - [x] Test orthogonalization `svd` vs `none` for SUMO-vs-SubTrack ablation.
 - [x] Test compiled HeavyBall `newtonschulz` orthogonalization.
-- [ ] Test whether any square projected spaces make `thinky_polar_express` relevant; rectangular projected updates route through Newton-Schulz.
-- [ ] Run full/broad LFM/SYNTH smoke with HeavyBall NS, `orthogonalization_scale_mode="muon"`, state bytes by category, peak CUDA, post-compile step time, and matrix update norms.
+- [x] Test Aurora-style rectangular projected orthogonalization and leverage diagnostics.
+- [x] Test experimental two-sided square-core projection on cached LFM/SYNTH.
+- [ ] Test whether square projected cores make `thinky_polar_express` relevant for two-sided mode.
+- [x] Run full/broad LFM/SYNTH smoke with HeavyBall NS, `orthogonalization_scale_mode="muon"`, state bytes by category, peak CUDA, post-compile step time, and matrix update norms.
+- [ ] Run a retention-aware Aurora vs HeavyBall comparison; do not judge Aurora only by target loss over 10 steps.
+- [ ] Run a retention-aware two-sided vs one-sided comparison before discarding square-core projection.
 - [ ] Test freshly initialized attention module with rest frozen.
 
 ## Phase 8: projected-gradient hooks, later and dangerous
@@ -132,7 +141,8 @@ Projected-gradient hooks stay locked until the ordinary-gradient baseline clears
 - [ ] Is perpendicular recovery beneficial in the target fine-tuning regime, or does it reintroduce too much noise?
 - [ ] Does rank 32 need faster rotation than higher-rank SubTrack defaults?
 - [ ] Does Grassmann tracking beat periodic SVD refresh at the same wall-clock budget?
-- [ ] Is Aurora-style rectangular balancing useful inside projected spaces, or only for full-matrix Muon?
+- [ ] Is Aurora-style rectangular balancing useful inside projected spaces for retention/stability, or only prettier leverage?
+- [ ] Does two-sided square-core projection offer a retention/rank-budget advantage despite weaker short-run target movement?
 - [ ] Which fallback optimizer is best for embeddings/norms/biases: AdamW, LaProp, or HeavyBall's existing split MuonAdamW pattern?
 
 ## Red flags

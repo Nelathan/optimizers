@@ -45,6 +45,23 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
         self.assertNotEqual(tuple(state["projected_exp_avg"].shape), tuple(weight.shape))
 
+    def test_two_sided_matrix_state_keeps_square_projected_moment(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack([weight], lr=0.01, rank=2, projection_mode="two_sided", subspace_update_method="none")
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        self.assertIn("basis_left", state)
+        self.assertIn("basis_right", state)
+        self.assertIn("projected_exp_avg", state)
+        self.assertNotIn("exp_avg", state)
+        self.assertNotIn("exp_avg_sq", state)
+        self.assertEqual(tuple(state["basis_left"].shape), (8, 2))
+        self.assertEqual(tuple(state["basis_right"].shape), (2, 5))
+        self.assertEqual(tuple(state["projected_exp_avg"].shape), (2, 2))
+
     def test_fallback_state_uses_adamw_moments(self):
         bias = torch.nn.Parameter(torch.randn(5))
         opt = SumoTrack([bias], lr=0.01)
@@ -117,6 +134,30 @@ class SumoTrackTest(unittest.TestCase):
         new_opt.step()
         self.assertEqual(tuple(new_opt.state[new_weight]["projected_exp_avg"].shape), (7, 2))
 
+    def test_two_sided_state_dict_round_trip_preserves_state_shapes(self):
+        weight = torch.nn.Parameter(torch.randn(7, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, projection_mode="two_sided", subspace_update_method="none")
+
+        weight.square().mean().backward()
+        opt.step()
+        saved = opt.state_dict()
+
+        new_weight = torch.nn.Parameter(weight.detach().clone())
+        new_opt = SumoTrack([new_weight], lr=0.01, rank=2, projection_mode="two_sided", subspace_update_method="none")
+        new_opt.load_state_dict(saved)
+
+        new_state = new_opt.state[new_weight]
+        self.assertEqual(tuple(new_state["basis_left"].shape), (7, 2))
+        self.assertEqual(tuple(new_state["basis_right"].shape), (2, 4))
+        self.assertEqual(tuple(new_state["projected_exp_avg"].shape), (2, 2))
+
+        new_opt.zero_grad()
+        new_weight.square().mean().backward()
+        before = new_weight.detach().clone()
+        new_opt.step()
+        self.assertFalse(torch.equal(new_weight, before))
+        self.assertEqual(tuple(new_opt.state[new_weight]["projected_exp_avg"].shape), (2, 2))
+
     def test_mixed_path_state_dict_resume_changes_params_after_reload(self):
         torch.manual_seed(0)
         weight = torch.nn.Parameter(torch.randn(7, 4))
@@ -153,6 +194,12 @@ class SumoTrackTest(unittest.TestCase):
             SumoTrack([weight], ecc="bf16+8")
         with self.assertRaises(NotImplementedError):
             SumoTrack([weight], param_ecc="bf16+8")
+
+    def test_two_sided_rejects_unsupported_grassmann_tracking(self):
+        weight = torch.nn.Parameter(torch.randn(4, 4))
+
+        with self.assertRaises(ValueError):
+            SumoTrack([weight], projection_mode="two_sided", subspace_update_method="grassmann")
 
     def test_random_subspace_init_wires_into_matrix_state(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
@@ -266,6 +313,27 @@ class SumoTrackTest(unittest.TestCase):
         self.assertIn("mean_projected_leverage_min_ratio", opt.last_step_diagnostics)
         self.assertIn("mean_projected_leverage_max_ratio", opt.last_step_diagnostics)
         self.assertLess(opt.last_step_diagnostics["mean_projected_leverage_cv"], 0.1)
+
+    def test_two_sided_orthogonalization_updates_params_and_logs_square_core(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack(
+            [weight],
+            lr=0.01,
+            rank=2,
+            projection_mode="two_sided",
+            subspace_update_method="none",
+            orthogonalization="heavyball",
+        )
+        opt.diagnostics_enabled = True
+        before = weight.detach().clone()
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        self.assertFalse(torch.equal(weight, before))
+        self.assertEqual(tuple(opt.state[weight]["projected_exp_avg"].shape), (2, 2))
+        self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
+        self.assertEqual(opt.last_step_diagnostics["projected_leverage_tensors"], 1)
 
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))

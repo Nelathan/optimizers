@@ -38,7 +38,7 @@ High-leverage questions:
 - How should rank be allocated under a global optimizer-state budget?
 - Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
 - Are extreme rectangular projected moments under-served by standard Newton-Schulz, making Aurora-style leverage-uniform orthogonalization useful?
-- When, if ever, does two-sided square-core projection improve capacity/stability enough to justify the extra complexity?
+- When, if ever, does two-sided square-core projection improve retention/stability or rank-budget efficiency enough to justify the extra bottleneck?
 
 Low-leverage traps:
 
@@ -86,6 +86,7 @@ Current invariants:
 - Fallback state is accounted separately.
 - Orthogonalization happens in projected space.
 - HeavyBall Newton-Schulz + `orthogonalization_scale_mode="muon"` is the current mainline.
+- `orthogonalization="aurora"` and `projection_mode="two_sided"` are experimental geometry branches, not defaults.
 - Unsupported ECC/param-ECC fails loudly.
 - Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 
@@ -94,7 +95,7 @@ Near-term implementation cuts should be one of:
 1. architecture-aware projection side/rank policy,
 2. global state-budget rank allocation,
 3. basis movement / residual diagnostics for tracking smoothness,
-4. Aurora/rectangular orthogonalization ablation,
+4. Aurora/rectangular orthogonalization retention ablation,
 5. minimal structured eval output when needed for a real medium adaptation run.
 
 Do not add speculative abstractions. Every new knob should correspond to a named geometry question.

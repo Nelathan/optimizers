@@ -266,13 +266,14 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
             lr=args.sumotrack_lr,
             rank=args.rank,
             beta=args.beta,
+            projection_mode=args.projection_mode,
             orthogonalization=args.orthogonalization,
             orthogonalization_scale_mode=args.orthogonalization_scale_mode,
             heavyball_orthogonalization_mode=args.heavyball_orthogonalization_mode,
             aurora_pp_iterations=args.aurora_pp_iterations,
             aurora_pp_beta=args.aurora_pp_beta,
             subspace_init=args.subspace_init,
-            subspace_update_method="grassmann",
+            subspace_update_method=args.subspace_update_method,
             grassmann_step_size=args.grassmann_step_size,
             subspace_refresh_budget=args.subspace_refresh_budget,
         )
@@ -318,6 +319,8 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "optimizer": optimizer_name,
         "param_scope": args.param_scope,
         "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
+        "projection_mode": args.projection_mode if optimizer_name == "sumotrack" else "n/a",
+        "subspace_update_method": args.subspace_update_method if optimizer_name == "sumotrack" else "n/a",
         "orthogonalization": args.orthogonalization if optimizer_name == "sumotrack" else "n/a",
         "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "sumotrack" else "n/a",
         "heavyball_orthogonalization_mode": args.heavyball_orthogonalization_mode if optimizer_name == "sumotrack" else "n/a",
@@ -445,7 +448,9 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
+    parser.add_argument("--projection-mode", choices=("one_sided", "two_sided"), default="one_sided")
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
+    parser.add_argument("--subspace-update-method", choices=("none", "svd_refresh", "grassmann"), default="grassmann")
     parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="svd")
     parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
     parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
