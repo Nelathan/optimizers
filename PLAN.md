@@ -87,7 +87,7 @@ Promising policies:
 
 Default rank remains `32` for library sanity, but real Gemma-scale evaluation should not pretend fixed rank `64` is a design conclusion.
 
-Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, module-role side, ~89 MB state budget showed size-rank under budget using the least state (`79.7 MB`) and reaching the strongest target validation (`1.591`). Module-role rank matched uniform rank quality (`1.613`) but exceeded the budget clamp. Uniform rank was worst at same state (`1.600`). The harness supports `--rank-policy uniform|size|module-role`, `--min-rank`, `--max-rank`, and optional `--optimizer-state-budget-mb` matrix-state clamping. Size-rank is the best current default: it allocates more rank to larger tensors and spends less state than uniform at equivalent or better quality. Spectrum-calibrated allocation is the next step.
+Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, module-role side, ~89 MB state budget compared rank policies. Size-rank saved ~10 MB vs uniform (`79.7 MB` vs `89.9 MB`) with a marginal quality delta (`1.591` vs `1.600`, likely noise at 200 steps). Module-role rank overshot the budget clamp. The simplest winning config is module-role side + uniform rank 64. Size-rank is a cheap optimization if state tightens, not a necessary policy knob. Spectrum-calibrated allocation was attempted but blocked by HeavyBall compile issues; initial-gradient R99 was measured as ~35 mean, drifting down to ~9 after 200 steps as gradient structure concentrates during training.
 
 ### 3. Subspace tracking as adaptation smoothing
 
@@ -192,20 +192,20 @@ The next serious evaluation harness should support periodic validation and struc
 The next work should improve the algorithm under our feet:
 
 1. **Aurora productization path.** Aurora is now the default projected direction. Same-shape bucketing works. Aurora overhead shrinks from ~21% at 768 tokens/step to ~10% at 4096 tokens/step; at product-scale tokens it should become noise. Retention/source behavior remains unmeasured.
-2. **Architecture-aware side/rank policy.** Module-role side beats AUTO at identical state. Size-rank under budget performs best. The harness policy exists and is tested. Next: make module-role side + size rank the harness default, then move to spectrum-aware allocation.
+2. **Architecture-aware side/rank policy.** Module-role side beats AUTO at identical state. The simplest winning config is module-role side + uniform rank 64. Size-rank is a cheap optimization if state tightens, not a necessary knob. Spectrum-aware allocation was explored but the single-step gradient R99 measurement drifted dramatically during training, and evaluation was blocked by HeavyBall compile issues.
 3. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
 4. **Medium SYNTH adaptation run with retention/source validation.** After defaulting the winning side/rank policy, run enough SYNTH with a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
 
 ## Next session contract
 
-Start from the 1k Aurora result and the side/rank evaluation. Module-role projection side beats AUTO, size-rank under budget performs best, Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
+Start from the 1k Aurora result and the side/rank evaluation. Module-role side beats AUTO decisively, rank policy differences are marginal, Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
 
 Minimum useful next session:
 
-1. Default the harness to module-role side + size rank. Record the defaults in code and docs.
+1. Default the harness to module-role side + uniform rank 64. Record the defaults in code and docs.
 2. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
 3. Use the retention/source validation output with a real source corpus (not SYNTH-as-retention) when available.
-4. Do not spend the session on AdamW, broad topology proof, ECC, projected-gradient hooks, no-ortho, HeavyBall-vs-Aurora reruns, two-sided revival, or schedule/budget archaeology.
+4. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or further rank-policy horse races.
 
 Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if side-rank wins are noise at longer horizons, revisit the direction map and allocation.
 

@@ -35,8 +35,8 @@ The next value is algorithm design, not smoke-test accumulation.
 High-leverage questions:
 
 - Module-role projection side beats shape `AUTO` at identical state; make it the harness default.
-- Size-rank under budget beats both uniform and module-role rank; make it the harness default.
-- How should the current size-rank policy evolve toward spectrum/calibration-aware allocation?
+- Size-rank under budget saved ~10 MB with a marginal quality delta vs uniform; uniform is simpler and close enough.
+- How should the current rank policy evolve toward spectrum/calibration-aware allocation?
 - Does burst Grassmann smoothing provide useful retention behavior; should refresh interval vary by layer role?
 - How much does Aurora's per-step overhead actually cost at product-scale token counts (32k+)?
 
@@ -89,13 +89,13 @@ Current invariants:
 - Grassmann tracking is the only forward basis-update path after initialization; tune smoothing with refresh cadence and step size.
 - Two-sided square-core projection was removed from the active code path after weaker target movement and no clear product pull.
 - Burst refresh (all bases on interval steps) is the Grassmann schedule; round-robin was measured and removed as complexity rent.
-- Module-role projection side and size-rank allocation are the current best policy defaults; architecture-aware side/rank lives in the harness.
+- Module-role projection side and uniform rank allocation are the current best policy defaults; architecture-aware side/rank lives in the harness.
 - Unsupported ECC/param-ECC fails loudly.
 - Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 
 Near-term implementation cuts should be one of:
 
-1. default module-role side + size rank in the harness,
+1. default module-role side + uniform rank in the harness,
 2. basis movement / residual diagnostics for tuning Grassmann smoothing,
 3. measure realistic-token-step amortization of bucketed Aurora (32k+ tokens/step),
 4. use retention/source validation output for a real medium adaptation run.
