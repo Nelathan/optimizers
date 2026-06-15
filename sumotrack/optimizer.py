@@ -33,7 +33,7 @@ class SumoTrack(Optimizer):
         projection_mode: str = "one_sided",
         side: ProjectionSide | str = ProjectionSide.AUTO,
         recovery_scale: float = 0.0,
-        orthogonalization: str = "svd",
+        orthogonalization: str = "aurora",
         orthogonalization_scale_mode: str = "muon",
         heavyball_orthogonalization_mode: str | None = None,
         aurora_pp_iterations: int = 2,

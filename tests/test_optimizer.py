@@ -11,6 +11,13 @@ class SumoTrackTest(unittest.TestCase):
         self.assertIs(sumotrack.SumoTrack, SumoTrack)
         self.assertFalse(hasattr(sumotrack, "SubspaceMuon"))
 
+    def test_default_orthogonalization_is_aurora_muon(self):
+        weight = torch.nn.Parameter(torch.randn(4, 4))
+        opt = SumoTrack([weight])
+
+        self.assertEqual(opt.param_groups[0]["orthogonalization"], "aurora")
+        self.assertEqual(opt.param_groups[0]["orthogonalization_scale_mode"], "muon")
+
     def test_step_updates_matrix_and_fallback_params(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
         bias = torch.nn.Parameter(torch.randn(4))

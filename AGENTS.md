@@ -17,7 +17,8 @@ Mainline algorithm:
 - one-sided SubTrack/GaLore-style gradient subspace tracking,
 - projected first moments for 2D matrices,
 - SUMO/Muon-style orthogonalization of the projected moment,
-- HeavyBall Newton-Schulz as the practical orthogonalization path,
+- Aurora-style leverage-uniform rectangular orthogonalization as the default projected direction map,
+- HeavyBall Newton-Schulz as the fast baseline and fallback orthogonalization path,
 - full-matrix Muon scale semantics via `orthogonalization_scale_mode="muon"`,
 - Grassmann/Stiefel basis tracking as adaptation smoothing.
 
@@ -37,7 +38,7 @@ High-leverage questions:
 - Should side/rank be architecture-aware for Gemma/LFM/Qwen module roles?
 - How should rank be allocated under a global optimizer-state budget?
 - Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
-- Are extreme rectangular projected moments under-served by standard Newton-Schulz, making Aurora-style leverage-uniform orthogonalization useful?
+- How should Aurora's per-step overhead be amortized and bucketed for realistic high-token steps?
 - When, if ever, does two-sided square-core projection improve retention/stability or rank-budget efficiency enough to justify the extra bottleneck?
 
 Low-leverage traps:
@@ -85,18 +86,18 @@ Current invariants:
 - Non-2D params use boring fallback semantics or are frozen by task policy.
 - Fallback state is accounted separately.
 - Orthogonalization happens in projected space.
-- HeavyBall Newton-Schulz + `orthogonalization_scale_mode="muon"` is the current mainline.
-- `orthogonalization="aurora"` and `projection_mode="two_sided"` are experimental geometry branches, not defaults.
+- `orthogonalization="aurora"` + `orthogonalization_scale_mode="muon"` is the current default direction after the 1k target result.
+- HeavyBall Newton-Schulz remains the fast baseline/fallback; `projection_mode="two_sided"` remains an experimental geometry branch, not a default.
 - Unsupported ECC/param-ECC fails loudly.
 - Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 
 Near-term implementation cuts should be one of:
 
-1. architecture-aware projection side/rank policy,
-2. global state-budget rank allocation,
-3. basis movement / residual diagnostics for tracking smoothness,
-4. Aurora/rectangular orthogonalization retention ablation,
-5. minimal structured eval output when needed for a real medium adaptation run.
+1. Aurora overhead productization: bucket same-shape projected orthogonalization and measure realistic-token-step amortization,
+2. architecture-aware projection side/rank policy,
+3. global state-budget rank allocation,
+4. basis movement / residual diagnostics for tracking smoothness,
+5. minimal retention/source validation output when needed for a real medium adaptation run.
 
 Do not add speculative abstractions. Every new knob should correspond to a named geometry question.
 

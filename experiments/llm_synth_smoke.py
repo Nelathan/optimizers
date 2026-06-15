@@ -451,7 +451,7 @@ def main() -> None:
     parser.add_argument("--projection-mode", choices=("one_sided", "two_sided"), default="one_sided")
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
     parser.add_argument("--subspace-update-method", choices=("none", "svd_refresh", "grassmann"), default="grassmann")
-    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="svd")
+    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="aurora")
     parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
     parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)

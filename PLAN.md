@@ -27,7 +27,7 @@ SumoTrack combines:
 - **SubTrack/GaLore-style one-sided gradient subspace tracking** for memory-shaped state,
 - **projected first moments** rather than full-size matrix moments,
 - **SUMO/Muon-style orthogonalization of the projected moment** for update geometry,
-- **HeavyBall Newton-Schulz / polar machinery** for the practical orthogonalization path,
+- **HeavyBall Newton-Schulz and Aurora-style rectangular polar machinery** for practical projected orthogonalization,
 - **Grassmann/Stiefel basis tracking** for smooth adaptation of the active subspace.
 
 The current mainline is not “projected momentum plus optional ortho.” Early LFM/SYNTH evidence already showed projected moment orthogonalization is useful in this setting. Treat orthogonalized projected momentum as the main SumoTrack path; keep no-ortho only as a diagnostic when the geometry itself is under suspicion.
@@ -109,9 +109,13 @@ SumoTrack should treat Aurora as a **projected direction map**, not as a replace
 
 Current status: `orthogonalization="aurora"` exists as an eager projected orthogonalization mode. It applies Aurora-style leverage-uniform polar to the projected moment, then uses the same `orthogonalization_scale_mode` semantics as the HeavyBall path. `--log-norms` also reports projected leverage diagnostics so an Aurora run can answer whether the large-side energy actually became more uniform.
 
+The Aurora question has moved. A 1k-step broad-no-embeddings LFM/SYNTH target run at rank 64, random init, Grassmann tracking, 768 tokens/step, LR `0.0025`, and Muon scale showed Aurora beating HeavyBall NS on target validation (`1.590971` vs `1.663156`) at matched update/param and identical peak memory, while reducing mean projected leverage CV from `1.2257` to `0.0197`. The measured `~21%` step-time cost happened at an unrealistically small token count, where per-step orthogonalization overhead is least amortized. Treat this as evidence that leverage-uniform rectangular orthogonalization is behaviorally useful, not merely prettier telemetry.
+
+Aurora is now the default projected direction map. The remaining question is not “does Aurora matter?” but how to productize it: retention/source behavior, overhead amortization at realistic tokens per step, and implementation efficiency.
+
 Open design questions:
 
-- HeavyBall Newton-Schulz vs Aurora-style rectangular balancing on real gradients,
+- Aurora retention/source behavior after its target-movement win,
 - scale and norm grafting semantics after rectangular orthogonalization,
 - whether projected tensor aspect ratio should influence rank allocation,
 - whether some modules should use two-sided square cores for cleaner orthogonalization.
@@ -144,13 +148,13 @@ Current implementation invariants:
 - Non-2D params use a boring fallback path or are frozen by task policy.
 - Fallback state must be accounted separately from matrix state.
 - Orthogonalization happens in projected space.
-- HeavyBall Newton-Schulz with `orthogonalization_scale_mode="muon"` is the practical mainline orthogonalization path.
+- `orthogonalization="aurora"` with `orthogonalization_scale_mode="muon"` is the default projected direction. HeavyBall Newton-Schulz with the same scale semantics remains the fast baseline/fallback.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
 Do not optimize kernel launches before the algorithmic shape is worth optimizing. Once the design is stable enough, the performance ladder is:
 
-1. bucket same-shape projected moments for batched orthogonalization,
-2. evaluate Aurora-style rectangular orthogonalization,
+1. bucket same-shape projected moments for batched Aurora/HeavyBall orthogonalization,
+2. measure realistic-token-step amortization of projected orthogonalization overhead,
 3. move compatible pieces toward HeavyBall-native transforms,
 4. add ECC/param-ECC,
 5. consider projected-gradient hooks only after the ordinary-gradient optimizer has proven worth.
@@ -181,35 +185,26 @@ The next serious evaluation harness should support periodic validation and struc
 
 The next work should improve the algorithm under our feet:
 
-1. **Retention-aware Aurora ablation.** Compare `orthogonalization="heavyball"` vs `"aurora"` on the same one-sided SumoTrack configuration. Report target movement, source/retention movement, step time, peak CUDA, update/param, and projected leverage CV/min/max. The question is no longer “does Aurora balance rows?” — it does. The question is whether leverage-uniform projected updates reduce thrash/forgetting enough to justify a small target-loss and step-time cost.
+1. **Aurora productization path.** Treat Aurora as the default rectangular orthogonalization path unless a retention/source run contradicts it. The next work is not another target-only ablation; it is making Aurora usable at product scale: overhead amortization, bucketed same-shape projected moments, and retention/source measurement.
 2. **Architecture-aware side/rank inspection.** Inspect Gemma/LFM/Qwen module shapes and map which axis is hidden-state-facing for MLP up/gate/down and attention projections. Decide whether `AUTO` is aligned with the intended stability axis or merely lucky.
 3. **Budget-driven rank policy.** Add a minimal rank-policy layer that can allocate rank by module role or tensor size under a target state budget. Uniform rank remains available but should stop being the only serious mode.
 4. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann vs SVD can be reasoned about as smoothing/adaptation-area control, not just speed.
-5. **Medium SYNTH adaptation run.** After one geometry cut above, run enough SYNTH to see curve shape and retention, not another 20-step smoke.
+5. **Medium SYNTH adaptation run with retention/source validation.** After one implementation/productization cut above, run enough SYNTH to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
 
 ## Next session contract
 
-Start with Aurora/retention, because the evidence now points to a concrete pressure point in the current mainline: extreme-aspect projected moments have uneven large-side leverage under ordinary NS, and Aurora fixes that mechanically. The unknown is whether that smoothing helps product behavior or only slows target descent.
+Start from the 1k Aurora result, not the old 10-step ambiguity. Extreme-aspect projected moments have uneven large-side leverage under ordinary NS, Aurora fixes that mechanically, and the 1k target-only LFM/SYNTH run says the fix improves target movement at matched update scale. The unknown has narrowed to productization: retention/source behavior, realistic-token-step overhead, and implementation efficiency.
 
 Minimum useful next session:
 
-1. Run a short but nontrivial LFM/SYNTH comparison:
-   - `--param-scope broad-no-embeddings`,
-   - rank `64`,
-   - `--subspace-init random` for performance-path timing unless explicitly testing initialization quality,
-   - HeavyBall NS + Muon scale at the current center LR,
-   - Aurora + Muon scale at the same LR, then only one LR adjustment if update/param or loss says the scale changed materially,
-   - `--log-norms` so projected leverage diagnostics are present.
-2. Interpret Aurora by three signals together:
-   - target loss movement,
-   - projected leverage CV/min/max,
-   - measured step time / tokens/sec.
-3. Include a source/retention validation split if available. Aurora's plausible value is less thrashy distribution movement, not prettier row norms.
-4. If Aurora improves leverage but hurts both target and retention, demote it. If it hurts short target movement but preserves source behavior, schedule a longer run rather than discarding it.
+1. Update the experiment/harness only where needed to report a distinct source/retention validation loss beside target validation. Do not build a general evaluation palace.
+2. Add a small timing-only amortization check for larger token counts if feasible locally (`4k`/`8k`/`16k`, not convergence runs) to estimate how much Aurora's per-step overhead disappears as tokens/step approaches product reality.
+3. If Aurora remains the active direction, make the first performance cut bucketed same-shape projected orthogonalization rather than HeavyBall-native/ECC integration.
+4. Move next to architecture-aware side/rank policy; Aurora improves the direction map, but state still needs to be spent on the tensors and axes that matter.
 5. Keep two-sided square-core out of the mainline unless it shows a retention or rank-budget advantage. Its short fixed-basis target movement was weaker than one-sided.
 6. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
 
-Falsifier: if Aurora's better leverage uniformity does not improve target movement, retention, or stability after a fair scale check, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms.
+Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if its per-step cost remains material at realistic tokens/step after straightforward bucketing, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms; also do not over-penalize a per-step cost measured at toy token counts.
 
 ## Stop conditions
 
