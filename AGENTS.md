@@ -18,7 +18,7 @@ Mainline algorithm:
 - projected first moments for 2D matrices,
 - SUMO/Muon-style orthogonalization of the projected moment,
 - Aurora-style leverage-uniform rectangular orthogonalization as the default projected direction map,
-- HeavyBall Newton-Schulz as the fast baseline and fallback orthogonalization path,
+- HeavyBall Newton-Schulz as the internal polar primitive inside Aurora,
 - full-matrix Muon scale semantics via `orthogonalization_scale_mode="muon"`,
 - Grassmann/Stiefel basis tracking as adaptation smoothing.
 
@@ -39,7 +39,6 @@ High-leverage questions:
 - How should the current minimal rank policy evolve toward spectrum/calibration-aware allocation?
 - Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
 - How should Aurora's per-step overhead be amortized and bucketed for realistic high-token steps?
-- When, if ever, does two-sided square-core projection improve retention/stability or rank-budget efficiency enough to justify the extra bottleneck?
 
 Low-leverage traps:
 
@@ -86,8 +85,9 @@ Current invariants:
 - Non-2D params use boring fallback semantics or are frozen by task policy.
 - Fallback state is accounted separately.
 - Orthogonalization happens in projected space.
-- `orthogonalization="aurora"` + `orthogonalization_scale_mode="muon"` is the current default direction after the 1k target result.
-- HeavyBall Newton-Schulz remains the fast baseline/fallback; `projection_mode="two_sided"` remains an experimental geometry branch, not a default.
+- Aurora with Muon scale semantics is the only forward projected direction after the 1k target result.
+- Grassmann tracking is the only forward basis-update path after initialization; tune smoothing with refresh cadence and step size.
+- Two-sided square-core projection was removed from the active code path after weaker target movement and no clear product pull.
 - Unsupported ECC/param-ECC fails loudly.
 - Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 

@@ -10,7 +10,6 @@ from typing import Literal
 
 import pyarrow.parquet as pq
 import torch
-import heavyball
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -394,22 +393,13 @@ def run_optimizer(
             sumotrack_param_groups,
             lr=args.sumotrack_lr,
             beta=args.beta,
-            projection_mode=args.projection_mode,
-            orthogonalization=args.orthogonalization,
-            orthogonalization_scale_mode=args.orthogonalization_scale_mode,
-            heavyball_orthogonalization_mode=args.heavyball_orthogonalization_mode,
-            aurora_pp_iterations=args.aurora_pp_iterations,
-            aurora_pp_beta=args.aurora_pp_beta,
             subspace_init=args.subspace_init,
-            subspace_update_method=args.subspace_update_method,
             grassmann_step_size=args.grassmann_step_size,
             subspace_refresh_budget=args.subspace_refresh_budget,
         )
         optimizer.diagnostics_enabled = args.log_norms
     elif optimizer_name in {"adamw", "torch_adamw"}:
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
-    elif optimizer_name in {"heavyball_adamw", "hb_adamw"}:
-        optimizer = heavyball.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.99), weight_decay=0.0, compile_step=False)
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
 
@@ -456,11 +446,7 @@ def run_optimizer(
         "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "sumotrack" else 0,
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
         "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
-        "projection_mode": args.projection_mode if optimizer_name == "sumotrack" else "n/a",
-        "subspace_update_method": args.subspace_update_method if optimizer_name == "sumotrack" else "n/a",
-        "orthogonalization": args.orthogonalization if optimizer_name == "sumotrack" else "n/a",
-        "orthogonalization_scale_mode": args.orthogonalization_scale_mode if optimizer_name == "sumotrack" else "n/a",
-        "heavyball_orthogonalization_mode": args.heavyball_orthogonalization_mode if optimizer_name == "sumotrack" else "n/a",
+        "orthogonalization": "aurora" if optimizer_name == "sumotrack" else "n/a",
         "grad_accum_steps": args.grad_accum_steps,
         "norm_logging": int(args.log_norms),
         "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
@@ -580,7 +566,7 @@ def main() -> None:
     parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
-    parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw,heavyball_adamw")
+    parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="matrices-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=3)
@@ -594,15 +580,8 @@ def main() -> None:
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=0, help="0 means cap only by tensor dimension")
     parser.add_argument("--optimizer-state-budget-mb", type=float, default=0.0, help="optional matrix-state budget for rank clamping")
-    parser.add_argument("--projection-mode", choices=("one_sided", "two_sided"), default="one_sided")
     parser.add_argument("--projection-side-policy", choices=("auto", "module-role"), default="auto")
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
-    parser.add_argument("--subspace-update-method", choices=("none", "svd_refresh", "grassmann"), default="grassmann")
-    parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="aurora")
-    parser.add_argument("--orthogonalization-scale-mode", choices=("none", "scale", "graft", "muon"), default="muon")
-    parser.add_argument("--heavyball-orthogonalization-mode", default="", help="empty = HeavyBall default; e.g. newtonschulz or thinky_polar_express")
-    parser.add_argument("--aurora-pp-iterations", type=int, default=2)
-    parser.add_argument("--aurora-pp-beta", type=float, default=0.5)
     parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
     parser.add_argument("--subspace-lr", dest="sumotrack_lr", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
@@ -622,7 +601,6 @@ def main() -> None:
     if args.min_rank <= 0:
         raise ValueError("min_rank must be positive")
     args.max_rank = args.max_rank or None
-    args.heavyball_orthogonalization_mode = args.heavyball_orthogonalization_mode or None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = choose_model(args.model or None)
@@ -645,7 +623,7 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
         f"rank={args.rank} rank_policy={args.rank_policy} projection_side_policy={args.projection_side_policy} "
-        f"subspace_init={args.subspace_init} orthogonalization={args.orthogonalization}"
+        f"subspace_init={args.subspace_init} orthogonalization=aurora"
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:

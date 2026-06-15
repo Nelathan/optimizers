@@ -27,10 +27,10 @@ SumoTrack combines:
 - **SubTrack/GaLore-style one-sided gradient subspace tracking** for memory-shaped state,
 - **projected first moments** rather than full-size matrix moments,
 - **SUMO/Muon-style orthogonalization of the projected moment** for update geometry,
-- **HeavyBall Newton-Schulz and Aurora-style rectangular polar machinery** for practical projected orthogonalization,
+- **Aurora-style rectangular polar machinery** for practical projected orthogonalization,
 - **Grassmann/Stiefel basis tracking** for smooth adaptation of the active subspace.
 
-The current mainline is not “projected momentum plus optional ortho.” Early LFM/SYNTH evidence already showed projected moment orthogonalization is useful in this setting. Treat orthogonalized projected momentum as the main SumoTrack path; keep no-ortho only as a diagnostic when the geometry itself is under suspicion.
+The current mainline is not “projected momentum plus optional ortho.” Early LFM/SYNTH evidence already showed projected moment orthogonalization is useful in this setting, and the 1k Aurora result made the direction concrete. Treat Aurora-orthogonalized projected momentum as SumoTrack's forward path.
 
 The core interpretation for a tall matrix gradient `G ∈ R^{m×n}` is:
 
@@ -91,14 +91,14 @@ Current status: the LLM SYNTH harness supports `--rank-policy uniform|size|modul
 
 ### 3. Subspace tracking as adaptation smoothing
 
-SVD initialization and SVD refresh are not merely “better basis” operations. They can also be sharper interventions that rapidly redirect the optimizer toward the current batch distribution. Grassmann tracking is slower and smoother: it limits adaptation to a rotating subspace rather than a list of unrelated spaces over time.
+SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: it limits adaptation to a rotating subspace rather than a list of unrelated spaces over time.
 
 That smoothing may be central for distribution shift without total forgetting.
 
 Open design questions:
 
 - exact SVD init vs random init vs short calibration SVD,
-- continuous Grassmann tracking vs periodic SVD refresh,
+- Grassmann refresh cadence and step size,
 - moment transport strength across basis changes,
 - basis update rate by layer depth or module role,
 - whether basis motion should be slower in backbone-stability-critical modules.
@@ -111,7 +111,7 @@ But very tall rectangular NS may not spread information as well as desired. Auro
 
 SumoTrack should treat Aurora as a **projected direction map**, not as a replacement optimizer. Momentum, basis tracking, full-matrix Muon scaling, LR, fallback semantics, and state accounting remain SumoTrack's responsibility.
 
-Current status: `orthogonalization="aurora"` exists as an eager projected orthogonalization mode. It applies Aurora-style leverage-uniform polar to the projected moment, then uses the same `orthogonalization_scale_mode` semantics as the HeavyBall path. `--log-norms` also reports projected leverage diagnostics so an Aurora run can answer whether the large-side energy actually became more uniform.
+Current status: Aurora-style leverage-uniform polar is the projected direction map. Muon scale semantics are fixed, not a user-facing scale-mode knob. `--log-norms` reports projected leverage diagnostics so a run can answer whether the large-side energy actually became more uniform.
 
 The Aurora question has moved. A 1k-step broad-no-embeddings LFM/SYNTH target run at rank 64, random init, Grassmann tracking, 768 tokens/step, LR `0.0025`, and Muon scale showed Aurora beating HeavyBall NS on target validation (`1.590971` vs `1.663156`) at matched update/param and identical peak memory, while reducing mean projected leverage CV from `1.2257` to `0.0197`. The measured `~21%` step-time cost happened at an unrealistically small token count, where per-step orthogonalization overhead is least amortized. Treat this as evidence that leverage-uniform rectangular orthogonalization is behaviorally useful, not merely prettier telemetry.
 
@@ -120,13 +120,13 @@ Aurora is now the default projected direction map. Same-shape one-sided projecte
 Open design questions:
 
 - Aurora retention/source behavior after its target-movement win,
-- scale and norm grafting semantics after rectangular orthogonalization,
+- whether Muon scale semantics continue to hold under larger target/source runs,
 - whether projected tensor aspect ratio should influence rank allocation,
-- whether some modules should use two-sided square cores for cleaner orthogonalization.
+- whether module role should influence Grassmann refresh cadence.
 
-### 5. Two-sided projection as an optional branch
+### 5. Two-sided projection: removed from active path
 
-Two-sided projection exists as an experimental branch, but it is not the mainline:
+Two-sided projection was implemented as an experimental branch:
 
 ```text
 G_hat = Q_Lᵀ G Q_R      # [r_l, r_r]
@@ -136,9 +136,9 @@ update = Q_L O_hat Q_Rᵀ
 
 It costs roughly `r(m+n) + r²` state instead of one-sided `r(m+n)`, so the byte penalty is modest for large matrices. It may trade raw adaptation capacity for smoother, more stable, square-core SUMO geometry.
 
-Current status: `projection_mode="two_sided"` stores left/right bases plus a square projected moment. It supports random/SVD initialization and either fixed bases (`subspace_update_method="none"`) or explicit SVD refresh. It rejects Grassmann tracking because the coupled left/right smoothing update has not been designed. A short fixed-basis LFM/SYNTH check found two-sided stable and state-cheap but weaker than one-sided rectangular updates on immediate target movement. Keep it as a stability/retention/rank-budget branch, not as the default.
+Current status: removed from the active optimizer and harness. A short fixed-basis LFM/SYNTH check found two-sided stable and state-cheap but weaker than one-sided rectangular updates on immediate target movement. Without Grassmann tracking or a retention-specific win, it was complexity rent. Keep the result as historical evidence; recover from git only if a future retention/rank-budget question demands it.
 
-Evaluate this only when it answers a real design question: capacity vs stability, forgetting vs target movement, or rectangular orthogonalization limits. Do not add it as abstraction ornament.
+Do not revive it unless a real retention/rank-budget result demands the complexity.
 
 ## Engineering direction
 
@@ -152,8 +152,9 @@ Current implementation invariants:
 - Non-2D params use a boring fallback path or are frozen by task policy.
 - Fallback state must be accounted separately from matrix state.
 - Orthogonalization happens in projected space.
-- `orthogonalization="aurora"` with `orthogonalization_scale_mode="muon"` is the default projected direction. HeavyBall Newton-Schulz with the same scale semantics remains the fast baseline/fallback.
-- One-sided same-shape projected orthogonalization is bucketed. Two-sided projection remains on the simpler per-tensor path until it earns more product relevance.
+- Aurora with fixed Muon scale semantics is the projected direction. HeavyBall Newton-Schulz remains an internal polar primitive, not a user-facing optimizer option.
+- One-sided same-shape projected orthogonalization is bucketed. Two-sided projection has been removed from the active path.
+- Grassmann tracking is the basis-update path after initialization; tune smoothing with refresh cadence and `grassmann_step_size`, not method switches.
 - Architecture-aware side/rank policy lives in the LLM harness via named-parameter groups. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
@@ -207,10 +208,9 @@ Minimum useful next session:
 2. Add a small timing-only amortization check for larger token counts if feasible locally (`4k`/`8k`/`16k`, not convergence runs) to estimate how much Aurora's bucketed per-step overhead disappears as tokens/step approaches product reality.
 3. Evaluate architecture-aware side/rank policy under equal matrix-state budget. Aurora improves the direction map, but state still needs to be spent on the tensors and axes that matter.
 4. Clean up the optimizer step path before adding more optimizer features; the bucketed one-sided path is working but now visibly too tangled.
-5. Keep two-sided square-core out of the mainline unless it shows a retention or rank-budget advantage. Its short fixed-basis target movement was weaker than one-sided.
-6. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
+5. Do not spend the session on AdamW, broad topology proof, ECC, projected-gradient hooks, no-ortho, HeavyBall-vs-Aurora reruns, or two-sided revival.
 
-Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if its per-step cost remains material at realistic tokens/step after straightforward bucketing, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms; also do not over-penalize a per-step cost measured at toy token counts.
+Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if its per-step cost remains material at realistic tokens/step after straightforward bucketing, revisit the direction map. Do not worship prettier row norms; also do not over-penalize a per-step cost measured at toy token counts.
 
 ## Stop conditions
 

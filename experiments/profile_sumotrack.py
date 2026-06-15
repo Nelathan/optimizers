@@ -56,7 +56,6 @@ def benchmark(refresh_budget: int, device: torch.device, steps: int = 20) -> dic
         rank=8,
         beta=0.9,
         subspace_refresh_budget=refresh_budget,
-        subspace_update_method="grassmann",
         grassmann_step_size=0.01,
     )
 
@@ -96,7 +95,6 @@ def profile_cuda_events(device: torch.device) -> int:
         lr=0.001,
         rank=8,
         subspace_refresh_budget=1,
-        subspace_update_method="grassmann",
     )
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":

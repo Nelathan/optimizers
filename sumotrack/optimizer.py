@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Iterable
 
 import torch
@@ -10,6 +11,16 @@ from torch.optim import Optimizer
 from heavyball import utils as heavyball_utils
 
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
+
+
+@dataclass
+class MatrixUpdate:
+    param: Tensor
+    grad: Tensor
+    projector: SubspaceProjector
+    projected_grad: Tensor
+    projected_exp_avg: Tensor
+    original_shape: tuple[int, ...]
 
 
 class SumoTrack(Optimizer):
@@ -30,16 +41,8 @@ class SumoTrack(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         rank: int = 32,
-        projection_mode: str = "one_sided",
         side: ProjectionSide | str = ProjectionSide.AUTO,
-        recovery_scale: float = 0.0,
-        orthogonalization: str = "aurora",
-        orthogonalization_scale_mode: str = "muon",
-        heavyball_orthogonalization_mode: str | None = None,
-        aurora_pp_iterations: int = 2,
-        aurora_pp_beta: float = 0.5,
         subspace_init: str = "svd",
-        subspace_update_method: str = "svd_refresh",
         grassmann_step_size: float = 0.01,
         subspace_refresh_budget: int = 1,
         ecc: str | None = None,
@@ -62,22 +65,6 @@ class SumoTrack(Optimizer):
             raise ValueError(f"weight_decay must be non-negative, got {weight_decay}")
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
-        if projection_mode not in {"one_sided", "two_sided"}:
-            raise ValueError("projection_mode must be 'one_sided' or 'two_sided'")
-        if recovery_scale < 0:
-            raise ValueError(f"recovery_scale must be non-negative, got {recovery_scale}")
-        if orthogonalization not in {"none", "svd", "heavyball", "aurora"}:
-            raise ValueError("orthogonalization must be 'none', 'svd', 'heavyball', or 'aurora'")
-        if orthogonalization_scale_mode not in {"none", "scale", "graft", "muon"}:
-            raise ValueError("orthogonalization_scale_mode must be 'none', 'scale', 'graft', or 'muon'")
-        if aurora_pp_iterations < 1:
-            raise ValueError(f"aurora_pp_iterations must be >= 1, got {aurora_pp_iterations}")
-        if aurora_pp_beta <= 0:
-            raise ValueError(f"aurora_pp_beta must be positive, got {aurora_pp_beta}")
-        if subspace_update_method not in {"none", "svd_refresh", "grassmann"}:
-            raise ValueError("subspace_update_method must be 'none', 'svd_refresh', or 'grassmann'")
-        if projection_mode == "two_sided" and subspace_update_method == "grassmann":
-            raise ValueError("two-sided projection does not yet support Grassmann tracking; use subspace_update_method='none' or 'svd_refresh'")
         subspace_init = ProjectorInitMethod(subspace_init).value
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
@@ -91,16 +78,11 @@ class SumoTrack(Optimizer):
             eps=eps,
             weight_decay=weight_decay,
             rank=rank,
-            projection_mode=projection_mode,
             side=ProjectionSide(side).value,
-            recovery_scale=recovery_scale,
-            orthogonalization=orthogonalization,
-            orthogonalization_scale_mode=orthogonalization_scale_mode,
-            heavyball_orthogonalization_mode=heavyball_orthogonalization_mode,
-            aurora_pp_iterations=aurora_pp_iterations,
-            aurora_pp_beta=aurora_pp_beta,
+            orthogonalization_scale_mode="muon",
+            aurora_pp_iterations=2,
+            aurora_pp_beta=0.5,
             subspace_init=subspace_init,
-            subspace_update_method=subspace_update_method,
             grassmann_step_size=grassmann_step_size,
             subspace_refresh_budget=subspace_refresh_budget,
             subspace_refresh_cursor=0,
@@ -143,10 +125,7 @@ class SumoTrack(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
-                    if group["projection_mode"] == "one_sided":
-                        matrix_updates.append(self._prepare_one_sided_matrix_update(p, grad, group, id(p) in refresh_ids))
-                    else:
-                        self._step_matrix_param(p, grad, group, id(p) in refresh_ids, diagnostics)
+                    matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids))
                 else:
                     self._step_fallback_param(p, grad, group, diagnostics)
             self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
@@ -182,47 +161,7 @@ class SumoTrack(Optimizer):
         group["subspace_refresh_cursor"] = (cursor + budget) % len(matrix_params)
         return {id(matrix_params[index]) for index in refresh}
 
-    def _step_matrix_param(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool, diagnostics: dict | None) -> None:
-        state = self.state[p]
-        state["step"] = state.get("step", 0) + 1
-
-        if group["projection_mode"] == "two_sided":
-            self._step_two_sided_matrix_param(p, grad, group, refresh_basis, diagnostics)
-            return
-
-        projector = self._projector_from_state(p, group, state)
-        if not projector.is_initialized or refresh_basis:
-            self._refresh_projector(projector, grad, group, state)
-
-        projected_grad = projector.project(grad)
-        projected_exp_avg = state.get("projected_exp_avg")
-        if projected_exp_avg is None:
-            projected_exp_avg = torch.zeros_like(projected_grad)
-        projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
-        state["projected_exp_avg"] = projected_exp_avg
-
-        update_hat = self._orthogonalize_update(projected_exp_avg, group, tuple(p.shape))
-        if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
-            leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
-            diagnostics["projected_leverage_cv_sum"] += leverage_cv
-            diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
-            diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
-            diagnostics["projected_leverage_tensors"] += 1
-        update = projector.project_back(update_hat).to(dtype=p.dtype)
-
-        recovery_scale = group["recovery_scale"]
-        if recovery_scale:
-            projected_back_grad = projector.project_back(projected_grad).to(dtype=grad.dtype)
-            update = update + recovery_scale * (grad - projected_back_grad)
-
-        if group["weight_decay"]:
-            p.mul_(1.0 - group["lr"] * group["weight_decay"])
-        if diagnostics is not None:
-            diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
-            diagnostics["matrix_params"] += p.numel()
-        p.add_(update, alpha=-group["lr"])
-
-    def _prepare_one_sided_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> dict:
+    def _prepare_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> MatrixUpdate:
         state = self.state[p]
         state["step"] = state.get("step", 0) + 1
 
@@ -237,32 +176,27 @@ class SumoTrack(Optimizer):
         projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
         state["projected_exp_avg"] = projected_exp_avg
 
-        return {
-            "param": p,
-            "grad": grad,
-            "projector": projector,
-            "projected_grad": projected_grad,
-            "projected_exp_avg": projected_exp_avg,
-            "original_shape": tuple(p.shape),
-        }
+        return MatrixUpdate(
+            param=p,
+            grad=grad,
+            projector=projector,
+            projected_grad=projected_grad,
+            projected_exp_avg=projected_exp_avg,
+            original_shape=tuple(p.shape),
+        )
 
-    def _apply_matrix_update_buckets(self, entries: list[dict], group: dict, diagnostics: dict | None) -> None:
+    def _apply_matrix_update_buckets(self, entries: list[MatrixUpdate], group: dict, diagnostics: dict | None) -> None:
         if not entries:
             return
 
-        buckets: dict[tuple, list[dict]] = {}
+        buckets: dict[tuple, list[MatrixUpdate]] = {}
         for entry in entries:
-            projected_exp_avg = entry["projected_exp_avg"]
+            projected_exp_avg = entry.projected_exp_avg
             key = (
-                group["orthogonalization"],
-                group["orthogonalization_scale_mode"],
                 tuple(projected_exp_avg.shape),
-                entry["original_shape"],
+                entry.original_shape,
                 projected_exp_avg.dtype,
                 projected_exp_avg.device,
-                group["heavyball_orthogonalization_mode"],
-                group["aurora_pp_iterations"],
-                group["aurora_pp_beta"],
             )
             buckets.setdefault(key, []).append(entry)
 
@@ -270,76 +204,33 @@ class SumoTrack(Optimizer):
             if len(bucket_entries) == 1:
                 update_hats = [
                     self._orthogonalize_update(
-                        bucket_entries[0]["projected_exp_avg"],
+                        bucket_entries[0].projected_exp_avg,
                         group,
-                        bucket_entries[0]["original_shape"],
+                        bucket_entries[0].original_shape,
                     )
                 ]
             else:
-                stacked = torch.stack([entry["projected_exp_avg"] for entry in bucket_entries])
-                stacked_update_hats = self._orthogonalize_update(stacked, group, bucket_entries[0]["original_shape"])
+                stacked = torch.stack([entry.projected_exp_avg for entry in bucket_entries])
+                stacked_update_hats = self._orthogonalize_update(stacked, group, bucket_entries[0].original_shape)
                 update_hats = list(stacked_update_hats.unbind(0))
             for entry, update_hat in zip(bucket_entries, update_hats, strict=True):
-                self._apply_one_sided_matrix_update(entry, update_hat, group, diagnostics)
+                self._apply_matrix_update(entry, update_hat, group, diagnostics)
 
-    def _apply_one_sided_matrix_update(self, entry: dict, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
-        p = entry["param"]
-        grad = entry["grad"]
-        projector = entry["projector"]
-        projected_grad = entry["projected_grad"]
-
-        if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
+    def _apply_matrix_update(self, entry: MatrixUpdate, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
+        if diagnostics is not None:
             leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
             diagnostics["projected_leverage_cv_sum"] += leverage_cv
             diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
             diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
             diagnostics["projected_leverage_tensors"] += 1
-        update = projector.project_back(update_hat).to(dtype=p.dtype)
-
-        recovery_scale = group["recovery_scale"]
-        if recovery_scale:
-            projected_back_grad = projector.project_back(projected_grad).to(dtype=grad.dtype)
-            update = update + recovery_scale * (grad - projected_back_grad)
+        update = entry.projector.project_back(update_hat).to(dtype=entry.param.dtype)
 
         if group["weight_decay"]:
-            p.mul_(1.0 - group["lr"] * group["weight_decay"])
+            entry.param.mul_(1.0 - group["lr"] * group["weight_decay"])
         if diagnostics is not None:
             diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
-            diagnostics["matrix_params"] += p.numel()
-        p.add_(update, alpha=-group["lr"])
-
-    def _step_two_sided_matrix_param(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool, diagnostics: dict | None) -> None:
-        state = self.state[p]
-        if self._two_sided_needs_fit(state) or refresh_basis:
-            self._refresh_two_sided_projector(grad, group, state)
-
-        projected_grad = self._two_sided_project(grad, state)
-        projected_exp_avg = state.get("projected_exp_avg")
-        if projected_exp_avg is None:
-            projected_exp_avg = torch.zeros_like(projected_grad)
-        projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
-        state["projected_exp_avg"] = projected_exp_avg
-
-        update_hat = self._orthogonalize_update(projected_exp_avg, group, tuple(p.shape))
-        if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
-            leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
-            diagnostics["projected_leverage_cv_sum"] += leverage_cv
-            diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
-            diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
-            diagnostics["projected_leverage_tensors"] += 1
-        update = self._two_sided_project_back(update_hat, state).to(dtype=p.dtype)
-
-        recovery_scale = group["recovery_scale"]
-        if recovery_scale:
-            projected_back_grad = self._two_sided_project_back(projected_grad, state).to(dtype=grad.dtype)
-            update = update + recovery_scale * (grad - projected_back_grad)
-
-        if group["weight_decay"]:
-            p.mul_(1.0 - group["lr"] * group["weight_decay"])
-        if diagnostics is not None:
-            diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
-            diagnostics["matrix_params"] += p.numel()
-        p.add_(update, alpha=-group["lr"])
+            diagnostics["matrix_params"] += entry.param.numel()
+        entry.param.add_(update, alpha=-group["lr"])
 
     def _step_fallback_param(self, p: Tensor, grad: Tensor, group: dict, diagnostics: dict | None) -> None:
         state = self.state[p]
@@ -383,10 +274,6 @@ class SumoTrack(Optimizer):
 
         if not projector.is_initialized:
             projector.fit(grad)
-        elif group["subspace_update_method"] == "none":
-            return
-        elif group["subspace_update_method"] == "svd_refresh":
-            projector.fit_svd(grad)
         else:
             projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
 
@@ -403,119 +290,8 @@ class SumoTrack(Optimizer):
                 state.pop("projected_exp_avg", None)
 
     @staticmethod
-    def _two_sided_rank(matrix: Tensor, rank: int) -> int:
-        if matrix.ndim != 2:
-            raise ValueError(f"two-sided projection only supports 2D tensors, got shape {tuple(matrix.shape)}")
-        return min(rank, matrix.shape[0], matrix.shape[1])
-
-    @staticmethod
-    def _two_sided_needs_fit(state: dict) -> bool:
-        return state.get("basis_left") is None or state.get("basis_right") is None
-
-    @staticmethod
-    def _fit_two_sided_projector(matrix: Tensor, group: dict, init_method: str | None = None) -> tuple[Tensor, Tensor]:
-        rank = SumoTrack._two_sided_rank(matrix, group["rank"])
-        work_dtype = torch.float32 if matrix.dtype in (torch.float16, torch.bfloat16) else matrix.dtype
-        init_method = init_method or group["subspace_init"]
-        if init_method == "svd":
-            work = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
-            u, _s, vh = torch.linalg.svd(work, full_matrices=False)
-            left = u[:, :rank]
-            right = vh[:rank, :]
-        else:
-            left_random = torch.randn(matrix.shape[0], rank, device=matrix.device, dtype=work_dtype)
-            left, _left_r = torch.linalg.qr(left_random, mode="reduced")
-            right_random = torch.randn(matrix.shape[1], rank, device=matrix.device, dtype=work_dtype)
-            right_q, _right_r = torch.linalg.qr(right_random, mode="reduced")
-            right = right_q.mT
-        return (
-            left.to(device=matrix.device, dtype=matrix.dtype).contiguous(),
-            right.to(device=matrix.device, dtype=matrix.dtype).contiguous(),
-        )
-
-    @staticmethod
-    def _refresh_two_sided_projector(grad: Tensor, group: dict, state: dict) -> None:
-        old_projected_exp_avg = state.get("projected_exp_avg")
-        old_left = state.get("basis_left")
-        old_right = state.get("basis_right")
-
-        if old_left is not None and old_right is not None and group["subspace_update_method"] == "none":
-            return
-
-        init_method = "svd" if old_left is not None and group["subspace_update_method"] == "svd_refresh" else group["subspace_init"]
-        new_left, new_right = SumoTrack._fit_two_sided_projector(grad, group, init_method=init_method)
-        state["basis_left"] = new_left
-        state["basis_right"] = new_right
-        state["projection_mode"] = "two_sided"
-
-        if old_projected_exp_avg is not None and old_left is not None and old_right is not None:
-            lifted_moment = old_left @ old_projected_exp_avg @ old_right
-            state["projected_exp_avg"] = new_left.mT @ lifted_moment @ new_right.mT
-        elif old_projected_exp_avg is not None:
-            projected_shape = tuple(SumoTrack._two_sided_project(grad, state).shape)
-            if tuple(old_projected_exp_avg.shape) != projected_shape:
-                state.pop("projected_exp_avg", None)
-
-    @staticmethod
-    def _two_sided_project(matrix: Tensor, state: dict) -> Tensor:
-        left = state.get("basis_left")
-        right = state.get("basis_right")
-        if left is None or right is None:
-            raise RuntimeError("two-sided projector has not been fitted")
-        return left.mT @ matrix @ right.mT
-
-    @staticmethod
-    def _two_sided_project_back(projected: Tensor, state: dict) -> Tensor:
-        left = state.get("basis_left")
-        right = state.get("basis_right")
-        if left is None or right is None:
-            raise RuntimeError("two-sided projector has not been fitted")
-        expected = (left.shape[1], right.shape[0])
-        if tuple(projected.shape) != expected:
-            raise ValueError(f"two-sided projected tensor must have shape {expected}, got {tuple(projected.shape)}")
-        return left @ projected @ right
-
-    @staticmethod
     def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
-        if group["orthogonalization"] == "none":
-            return update
-        if group["orthogonalization"] == "svd":
-            return SumoTrack._scale_orthogonalized_update(
-                update,
-                SumoTrack._orthogonalize_svd(update),
-                group["orthogonalization_scale_mode"],
-                original_shape,
-            )
-        if group["orthogonalization"] == "heavyball":
-            return SumoTrack._orthogonalize_heavyball(update, group, original_shape)
-        if group["orthogonalization"] == "aurora":
-            return SumoTrack._orthogonalize_aurora(update, group, original_shape)
-        raise AssertionError(f"unexpected orthogonalization mode: {group['orthogonalization']}")
-
-    @staticmethod
-    def _orthogonalize_svd(update: Tensor) -> Tensor:
-        svd_input = update.float() if update.dtype in (torch.float16, torch.bfloat16) else update
-        u, _s, vh = torch.linalg.svd(svd_input, full_matrices=False)
-        return (u @ vh).to(dtype=update.dtype, device=update.device)
-
-    @staticmethod
-    def _orthogonalize_heavyball(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
-        if update.ndim > 2:
-            work = SumoTrack._batched_newton_schulz5(update)
-            if group["orthogonalization_scale_mode"] == "muon":
-                work = SumoTrack._scale_orthogonalized_update(update, work, "muon", original_shape)
-            return work
-        work = update.clone()
-        scale_mode = group["orthogonalization_scale_mode"]
-        heavyball_utils.inplace_orthogonal_(
-            work,
-            mode=group["heavyball_orthogonalization_mode"],
-            out=work,
-            scale_mode="none" if scale_mode == "muon" else scale_mode,
-        )
-        if scale_mode == "muon":
-            work = SumoTrack._scale_orthogonalized_update(update, work, scale_mode, original_shape)
-        return work
+        return SumoTrack._orthogonalize_aurora(update, group, original_shape)
 
     @staticmethod
     def _orthogonalize_aurora(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
