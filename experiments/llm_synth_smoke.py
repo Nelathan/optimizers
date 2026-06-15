@@ -25,7 +25,39 @@ PREFERRED_MODELS = (
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "module-role"]
-RankPolicy = Literal["uniform", "size", "module-role"]
+RankPolicy = Literal["uniform", "size", "module-role", "spectrum"]
+
+
+def compute_spectrum_ranks(
+    model,
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    tokenizer,
+    train_texts: list[str],
+    device: torch.device,
+    batch_size: int,
+    seq_len: int,
+    threshold: float = 0.99,
+    min_rank: int = 1,
+    max_rank: int | None = None,
+) -> dict[int, int]:
+    model.train()
+    batches = make_batches(tokenizer, train_texts, device, batch_size, seq_len)
+    with torch.compiler.set_stance("force_eager"):
+        loss = model(**batches[0]).loss
+        loss.backward()
+
+    ranks: dict[int, int] = {}
+    for name, param in named_params:
+        if param.ndim != 2 or param.grad is None:
+            continue
+        grad_float = param.grad.float()
+        _, s, _ = torch.linalg.svd(grad_float, full_matrices=False)
+        cum_mass = (s**2).cumsum(0) / (s**2).sum()
+        needed = (cum_mass < threshold).sum().item() + 1
+        cap = min(param.shape) if max_rank is None else min(max_rank, min(param.shape))
+        ranks[id(param)] = max(min_rank, min(cap, needed))
+    model.zero_grad(set_to_none=True)
+    return ranks
 
 
 def cached_model_snapshots(model_name: str) -> list[Path]:
@@ -210,9 +242,20 @@ def side_for_policy(role: str, policy: ProjectionSidePolicy) -> str:
     return "auto"
 
 
-def rank_for_policy(param: torch.nn.Parameter, role: str, rank: int, policy: RankPolicy, min_rank: int, max_rank: int | None, median_matrix_params: float) -> int:
+def rank_for_policy(
+    param: torch.nn.Parameter,
+    role: str,
+    rank: int,
+    policy: RankPolicy,
+    min_rank: int,
+    max_rank: int | None,
+    median_matrix_params: float,
+    spectrum_ranks: dict[int, int] | None = None,
+) -> int:
     if param.ndim != 2:
         return rank
+    if policy == "spectrum" and spectrum_ranks is not None:
+        return spectrum_ranks.get(id(param), rank)
     if policy == "uniform":
         proposed = rank
     elif policy == "size":
@@ -262,6 +305,7 @@ def build_sumotrack_param_groups(
     min_rank: int,
     max_rank: int | None,
     optimizer_state_budget_mb: float,
+    spectrum_ranks: dict[int, int] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     matrix_sizes = sorted(param.numel() for _name, param in named_params if param.ndim == 2)
     median_matrix_params = float(matrix_sizes[len(matrix_sizes) // 2]) if matrix_sizes else 1.0
@@ -271,7 +315,7 @@ def build_sumotrack_param_groups(
     for name, param in named_params:
         role = module_role(name, param)
         side = side_for_policy(role, projection_side_policy)
-        param_rank = rank_for_policy(param, role, rank, rank_policy, min_rank, max_rank, median_matrix_params)
+        param_rank = rank_for_policy(param, role, rank, rank_policy, min_rank, max_rank, median_matrix_params, spectrum_ranks)
         param_options[id(param)] = {"rank": param_rank, "side": side}
 
     apply_matrix_state_budget(param_options, named_params, optimizer_state_budget_mb, min_rank)
@@ -372,6 +416,12 @@ def run_optimizer(
     model, tokenizer = load_model_and_tokenizer(model_name, device)
     trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
     trainable = [param for _name, param in trainable_named]
+    spectrum_ranks = None
+    if args.rank_policy == "spectrum":
+        spectrum_ranks = compute_spectrum_ranks(
+            model, trainable_named, tokenizer, train_texts[:1], device,
+            args.batch_size, args.seq_len, 0.99, args.min_rank, args.max_rank,
+        )
     sumotrack_param_groups, policy_stats = build_sumotrack_param_groups(
         trainable_named,
         args.rank,
@@ -380,6 +430,7 @@ def run_optimizer(
         args.min_rank,
         args.max_rank,
         args.optimizer_state_budget_mb,
+        spectrum_ranks,
     )
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len)
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
@@ -550,7 +601,7 @@ def main() -> None:
     parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--retention-val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
-    parser.add_argument("--rank-policy", choices=("uniform", "size", "module-role"), default="uniform")
+    parser.add_argument("--rank-policy", choices=("uniform", "size", "module-role", "spectrum"), default="uniform")
     parser.add_argument("--min-rank", type=int, default=1)
     parser.add_argument("--max-rank", type=int, default=0, help="0 means cap only by tensor dimension")
     parser.add_argument("--optimizer-state-budget-mb", type=float, default=0.0, help="optional matrix-state budget for rank clamping")
