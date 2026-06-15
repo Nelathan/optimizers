@@ -395,7 +395,7 @@ def run_optimizer(
             beta=args.beta,
             subspace_init=args.subspace_init,
             grassmann_step_size=args.grassmann_step_size,
-            subspace_refresh_budget=args.subspace_refresh_budget,
+            subspace_refresh_interval=args.subspace_refresh_interval,
         )
         optimizer.diagnostics_enabled = args.log_norms
     elif optimizer_name in {"adamw", "torch_adamw"}:
@@ -446,6 +446,7 @@ def run_optimizer(
         "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "sumotrack" else 0,
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
         "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
+        "subspace_refresh_interval": args.subspace_refresh_interval if optimizer_name == "sumotrack" else 0,
         "orthogonalization": "aurora" if optimizer_name == "sumotrack" else "n/a",
         "grad_accum_steps": args.grad_accum_steps,
         "norm_logging": int(args.log_norms),
@@ -587,7 +588,7 @@ def main() -> None:
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
-    parser.add_argument("--subspace-refresh-budget", type=int, default=1)
+    parser.add_argument("--subspace-refresh-interval", type=int, default=100)
     parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SumoTrack update norms; adds reduction overhead")
     parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
     args = parser.parse_args()
@@ -600,6 +601,8 @@ def main() -> None:
         raise ValueError("grad_accum_steps must be positive")
     if args.min_rank <= 0:
         raise ValueError("min_rank must be positive")
+    if args.subspace_refresh_interval <= 0:
+        raise ValueError("subspace_refresh_interval must be positive")
     args.max_rank = args.max_rank or None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -623,7 +626,7 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
         f"rank={args.rank} rank_policy={args.rank_policy} projection_side_policy={args.projection_side_policy} "
-        f"subspace_init={args.subspace_init} orthogonalization=aurora"
+        f"subspace_init={args.subspace_init} subspace_refresh_interval={args.subspace_refresh_interval} orthogonalization=aurora"
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:

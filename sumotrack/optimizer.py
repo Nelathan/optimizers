@@ -44,7 +44,7 @@ class SumoTrack(Optimizer):
         side: ProjectionSide | str = ProjectionSide.AUTO,
         subspace_init: str = "svd",
         grassmann_step_size: float = 0.01,
-        subspace_refresh_budget: int = 1,
+        subspace_refresh_interval: int = 100,
         ecc: str | None = None,
         param_ecc: str | None = None,
     ) -> None:
@@ -68,8 +68,8 @@ class SumoTrack(Optimizer):
         subspace_init = ProjectorInitMethod(subspace_init).value
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
-        if subspace_refresh_budget <= 0:
-            raise ValueError(f"subspace_refresh_budget must be positive, got {subspace_refresh_budget}")
+        if subspace_refresh_interval <= 0:
+            raise ValueError(f"subspace_refresh_interval must be positive, got {subspace_refresh_interval}")
 
         defaults = dict(
             lr=lr,
@@ -84,8 +84,8 @@ class SumoTrack(Optimizer):
             aurora_pp_beta=0.5,
             subspace_init=subspace_init,
             grassmann_step_size=grassmann_step_size,
-            subspace_refresh_budget=subspace_refresh_budget,
-            subspace_refresh_cursor=0,
+            subspace_refresh_interval=subspace_refresh_interval,
+            subspace_refresh_step=0,
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
@@ -153,13 +153,12 @@ class SumoTrack(Optimizer):
 
     def _refresh_param_ids(self, group: dict, matrix_params: list[Tensor]) -> set[int]:
         if not matrix_params:
-            group["subspace_refresh_cursor"] = 0
             return set()
-        budget = min(group["subspace_refresh_budget"], len(matrix_params))
-        cursor = group["subspace_refresh_cursor"] % len(matrix_params)
-        refresh = [(cursor + offset) % len(matrix_params) for offset in range(budget)]
-        group["subspace_refresh_cursor"] = (cursor + budget) % len(matrix_params)
-        return {id(matrix_params[index]) for index in refresh}
+        step = group["subspace_refresh_step"]
+        group["subspace_refresh_step"] = step + 1
+        if step > 0 and step % group["subspace_refresh_interval"] == 0:
+            return {id(param) for param in matrix_params}
+        return set()
 
     def _prepare_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> MatrixUpdate:
         state = self.state[p]

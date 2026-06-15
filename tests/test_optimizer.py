@@ -249,6 +249,19 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(tuple(opt.state[first]["projected_exp_avg"].shape), (8, 2))
         self.assertEqual(tuple(opt.state[second]["projected_exp_avg"].shape), (8, 2))
 
+    def test_refresh_interval_updates_all_bases_on_interval_step(self):
+        params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
+        opt = SumoTrack(params, subspace_refresh_interval=2)
+        group = opt.param_groups[0]
+
+        first = opt._refresh_param_ids(group, params)
+        second = opt._refresh_param_ids(group, params)
+        third = opt._refresh_param_ids(group, params)
+
+        self.assertEqual(first, set())
+        self.assertEqual(second, set())
+        self.assertEqual(third, {id(param) for param in params})
+
     def test_log_norm_diagnostics_include_projected_leverage(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SumoTrack([weight], lr=0.01, rank=2)
@@ -269,7 +282,7 @@ class SumoTrackTest(unittest.TestCase):
             lr=0.01,
             rank=2,
             grassmann_step_size=0.01,
-            subspace_refresh_budget=1,
+            subspace_refresh_interval=1,
         )
 
         weight.grad = torch.randn_like(weight)

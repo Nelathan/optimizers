@@ -37,7 +37,7 @@ def train(optimizer_name: str) -> tuple[float, float, int]:
     x, y = make_problem()
 
     if optimizer_name == "sumotrack":
-        optimizer = SumoTrack(model.parameters(), lr=0.01, rank=4, beta=0.9, subspace_refresh_budget=1)
+        optimizer = SumoTrack(model.parameters(), lr=0.01, rank=4, beta=0.9, subspace_refresh_interval=1)
     elif optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     else:  # pragma: no cover - local script guard
