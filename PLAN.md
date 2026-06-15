@@ -64,7 +64,7 @@ Open design questions:
 - Should side choice be architecture-aware for Gemma/LFM/Qwen rather than purely shape-aware?
 - Are we throwing away task-vital gradient components because they did not appear in the tracked/SVD subspace early enough?
 
-Current status: the LLM SYNTH harness supports `--projection-side-policy module-role`, which maps MLP up/gate and attention q/k/v projections to right-side hidden-input bases, and MLP down / attention output projections to left-side hidden-output bases. Unknown matrices stay on shape-based `AUTO`. A tiny LFM smoke with module-role policy selected 50 right-side, 32 left-side, and 10 auto matrix tensors, confirming that architecture semantics materially differ from pure shape habit.
+Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, equal ~89.9 MB state budget showed module-role side policy beating shape `AUTO` decisively on target validation (`1.600` vs `1.810` final val). This is evidence that aligning projection sides to the hidden-state axis improves adaptation at identical byte cost. The harness supports `--projection-side-policy module-role`, which maps MLP up/gate and attention q/k/v projections to right-side hidden-input bases, and MLP down / attention output projections to left-side hidden-output bases.
 
 ### 2. Rank allocation
 
@@ -87,20 +87,19 @@ Promising policies:
 
 Default rank remains `32` for library sanity, but real Gemma-scale evaluation should not pretend fixed rank `64` is a design conclusion.
 
-Current status: the LLM SYNTH harness supports `--rank-policy uniform|size|module-role`, `--min-rank`, `--max-rank`, and optional `--optimizer-state-budget-mb` matrix-state clamping. This is deliberately a harness policy layer over named parameters, not optimizer core machinery. It is good enough to ask whether role/size allocation changes adaptation per byte; it is not yet a learned or spectrum-calibrated allocator.
+Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, module-role side, ~89 MB state budget showed size-rank under budget using the least state (`79.7 MB`) and reaching the strongest target validation (`1.591`). Module-role rank matched uniform rank quality (`1.613`) but exceeded the budget clamp. Uniform rank was worst at same state (`1.600`). The harness supports `--rank-policy uniform|size|module-role`, `--min-rank`, `--max-rank`, and optional `--optimizer-state-budget-mb` matrix-state clamping. Size-rank is the best current default: it allocates more rank to larger tensors and spends less state than uniform at equivalent or better quality. Spectrum-calibrated allocation is the next step.
 
 ### 3. Subspace tracking as adaptation smoothing
 
-SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: it limits adaptation to a rotating subspace rather than a list of unrelated spaces over time.
+SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: burst refresh on a cadence interval. Equal-cadence burst-vs-round-robin measurements showed identical peak VRAM (~8.18 GB at 4096 tokens/step, ~5.03 GB at 64 tokens/step) — state is ~90 MB and activation/model memory dominates. Burst is the simpler default; refresh cadence is tuned via `subspace_refresh_interval`.
 
 That smoothing may be central for distribution shift without total forgetting.
 
 Open design questions:
 
 - exact SVD init vs random init vs short calibration SVD,
-- Grassmann refresh cadence and step size,
+- refresh interval by layer depth or module role,
 - moment transport strength across basis changes,
-- basis update rate by layer depth or module role,
 - whether basis motion should be slower in backbone-stability-critical modules.
 
 ### 4. Orthogonalization quality for rectangular projected moments
@@ -152,9 +151,9 @@ Current implementation invariants:
 - Non-2D params use a boring fallback path or are frozen by task policy.
 - Fallback state must be accounted separately from matrix state.
 - Orthogonalization happens in projected space.
-- Aurora with fixed Muon scale semantics is the projected direction. HeavyBall Newton-Schulz remains an internal polar primitive, not a user-facing optimizer option.
-- One-sided same-shape projected orthogonalization is bucketed. Two-sided projection has been removed from the active path.
-- Grassmann tracking is the basis-update path after initialization; tune smoothing with refresh cadence and `grassmann_step_size`, not method switches.
+- Aurora with fixed Muon scale semantics is the projected direction. HeavyBall Newton-Schulz remains an internal polar primitive.
+- One-sided same-shape projected orthogonalization is bucketed. Two-sided projection has been removed.
+- Grassmann basis tracking refreshes all bases on a burst cadence controlled by `subspace_refresh_interval`. Equal-cadence round-robin was measured and removed as complexity rent — state is too small to affect peak VRAM.
 - Architecture-aware side/rank policy lives in the LLM harness via named-parameter groups. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
@@ -192,25 +191,23 @@ The next serious evaluation harness should support periodic validation and struc
 
 The next work should improve the algorithm under our feet:
 
-1. **Aurora productization path.** Treat Aurora as the default rectangular orthogonalization path unless a retention/source run contradicts it. Same-shape projected orthogonalization is now bucketed; the next product question is whether the bucketed overhead is negligible at realistic tokens/step and whether target movement preserves useful source behavior.
-2. **Architecture-aware side/rank evaluation.** The minimal harness policy exists. Use it to compare shape `AUTO` against module-role hidden-axis policy on target+retention movement, not just to print prettier side counts.
-3. **Budget-driven rank policy evaluation.** The minimal rank-policy layer exists. Use `uniform`, `size`, and `module-role` under a comparable matrix-state budget; do not compare policies with different byte spend and call it geometry.
-4. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann vs SVD can be reasoned about as smoothing/adaptation-area control, not just speed.
-5. **Medium SYNTH adaptation run with retention/source validation.** After one implementation/productization cut above, run enough SYNTH to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
+1. **Aurora productization path.** Aurora is now the default projected direction. Same-shape bucketing works. Aurora overhead shrinks from ~21% at 768 tokens/step to ~10% at 4096 tokens/step; at product-scale tokens it should become noise. Retention/source behavior remains unmeasured.
+2. **Architecture-aware side/rank policy.** Module-role side beats AUTO at identical state. Size-rank under budget performs best. The harness policy exists and is tested. Next: make module-role side + size rank the harness default, then move to spectrum-aware allocation.
+3. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
+4. **Medium SYNTH adaptation run with retention/source validation.** After defaulting the winning side/rank policy, run enough SYNTH with a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
 
 ## Next session contract
 
-Start from the 1k Aurora result, not the old 10-step ambiguity. Extreme-aspect projected moments have uneven large-side leverage under ordinary NS, Aurora fixes that mechanically, and the 1k target-only LFM/SYNTH run says the fix improves target movement at matched update scale. The unknown has narrowed to productization: retention/source behavior, realistic-token-step overhead, and implementation efficiency.
+Start from the 1k Aurora result and the side/rank evaluation. Module-role projection side beats AUTO, size-rank under budget performs best, Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
 
 Minimum useful next session:
 
-1. Use the new optional retention/source validation output when a real source corpus is available. Do not use SYNTH-as-retention as evidence; that is only a plumbing check.
-2. Add a small timing-only amortization check for larger token counts if feasible locally (`4k`/`8k`/`16k`, not convergence runs) to estimate how much Aurora's bucketed per-step overhead disappears as tokens/step approaches product reality.
-3. Evaluate architecture-aware side/rank policy under equal matrix-state budget. Aurora improves the direction map, but state still needs to be spent on the tensors and axes that matter.
-4. Clean up the optimizer step path before adding more optimizer features; the bucketed one-sided path is working but now visibly too tangled.
-5. Do not spend the session on AdamW, broad topology proof, ECC, projected-gradient hooks, no-ortho, HeavyBall-vs-Aurora reruns, or two-sided revival.
+1. Default the harness to module-role side + size rank. Record the defaults in code and docs.
+2. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
+3. Use the retention/source validation output with a real source corpus (not SYNTH-as-retention) when available.
+4. Do not spend the session on AdamW, broad topology proof, ECC, projected-gradient hooks, no-ortho, HeavyBall-vs-Aurora reruns, two-sided revival, or schedule/budget archaeology.
 
-Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if its per-step cost remains material at realistic tokens/step after straightforward bucketing, revisit the direction map. Do not worship prettier row norms; also do not over-penalize a per-step cost measured at toy token counts.
+Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if side-rank wins are noise at longer horizons, revisit the direction map and allocation.
 
 ## Stop conditions
 

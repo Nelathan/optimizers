@@ -405,12 +405,11 @@ def run_optimizer(
 
     initial_val = evaluate_loss(model, val_batches)
     initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
-    warmup_steps = []
     measured_steps = []
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
-        warmup_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
+        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -425,7 +424,6 @@ def run_optimizer(
     final_val = evaluate_loss(model, val_batches)
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
-    warmup_losses = [step["loss"] for step in warmup_steps]
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
     measured_param_norms = [step["param_norm"] for step in measured_steps]
@@ -437,7 +435,6 @@ def run_optimizer(
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
-        "param_scope": args.param_scope,
         "rank_policy": args.rank_policy if optimizer_name == "sumotrack" else "n/a",
         "projection_side_policy": args.projection_side_policy if optimizer_name == "sumotrack" else "n/a",
         "rank_policy_min_rank": policy_stats["rank_policy_min_rank"] if optimizer_name == "sumotrack" else 0,
@@ -447,18 +444,7 @@ def run_optimizer(
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
         "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
         "subspace_refresh_interval": args.subspace_refresh_interval if optimizer_name == "sumotrack" else 0,
-        "orthogonalization": "aurora" if optimizer_name == "sumotrack" else "n/a",
-        "grad_accum_steps": args.grad_accum_steps,
-        "norm_logging": int(args.log_norms),
         "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
-        "trainable_params": param_stats["selected_params"],
-        "trainable_tensors": param_stats["selected_tensors"],
-        "trainable_matrix_params": param_stats["selected_matrix_params"],
-        "trainable_matrix_tensors": param_stats["selected_matrix_tensors"],
-        "trainable_fallback_params": param_stats["selected_fallback_params"],
-        "trainable_fallback_tensors": param_stats["selected_fallback_tensors"],
-        "excluded_embedding_params": param_stats["excluded_embedding_params"],
-        "excluded_3d_params": param_stats["excluded_3d_params"],
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
         "state_bytes": state_bytes["total"],
@@ -467,13 +453,7 @@ def run_optimizer(
         "initial_retention_val_loss": initial_retention_val,
         "final_retention_val_loss": final_retention_val,
         "retention_val_loss_delta": final_retention_val - initial_retention_val,
-        "first_warmup_loss": warmup_losses[0] if warmup_losses else float("nan"),
-        "last_warmup_loss": warmup_losses[-1] if warmup_losses else float("nan"),
-        "first_measured_train_loss": measured_losses[0],
         "last_measured_train_loss": measured_losses[-1],
-        "mean_measured_train_loss": sum(measured_losses) / len(measured_losses),
-        "min_measured_train_loss": min(measured_losses),
-        "max_measured_train_loss": max(measured_losses),
         "mean_measured_grad_norm": mean_or_nan(measured_grad_norms),
         "mean_measured_param_norm": mean_or_nan(measured_param_norms),
         "mean_measured_update_norm": mean_or_nan(measured_update_norms),
@@ -481,13 +461,6 @@ def run_optimizer(
         "mean_measured_projected_leverage_cv": mean_or_nan(measured_leverage_cvs),
         "mean_measured_projected_leverage_min_ratio": mean_or_nan(measured_leverage_min_ratios),
         "mean_measured_projected_leverage_max_ratio": mean_or_nan(measured_leverage_max_ratios),
-        "last_measured_grad_norm": measured_grad_norms[-1],
-        "last_measured_param_norm": measured_param_norms[-1],
-        "last_measured_update_norm": measured_update_norms[-1],
-        "last_measured_update_to_param_ratio": measured_update_to_param_ratios[-1],
-        "last_measured_projected_leverage_cv": measured_leverage_cvs[-1],
-        "last_measured_projected_leverage_min_ratio": measured_leverage_min_ratios[-1],
-        "last_measured_projected_leverage_max_ratio": measured_leverage_max_ratios[-1],
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,

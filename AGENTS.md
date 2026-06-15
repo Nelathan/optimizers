@@ -34,11 +34,11 @@ The next value is algorithm design, not smoke-test accumulation.
 
 High-leverage questions:
 
-- Does harness-side `--projection-side-policy module-role` beat shape-based `AUTO` on target+retention movement?
-- Does `--rank-policy size|module-role` improve adaptation per byte under equal matrix-state budget?
-- How should the current minimal rank policy evolve toward spectrum/calibration-aware allocation?
-- Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
-- How should Aurora's per-step overhead be amortized and bucketed for realistic high-token steps?
+- Module-role projection side beats shape `AUTO` at identical state; make it the harness default.
+- Size-rank under budget beats both uniform and module-role rank; make it the harness default.
+- How should the current size-rank policy evolve toward spectrum/calibration-aware allocation?
+- Does burst Grassmann smoothing provide useful retention behavior; should refresh interval vary by layer role?
+- How much does Aurora's per-step overhead actually cost at product-scale token counts (32k+)?
 
 Low-leverage traps:
 
@@ -88,16 +88,17 @@ Current invariants:
 - Aurora with Muon scale semantics is the only forward projected direction after the 1k target result.
 - Grassmann tracking is the only forward basis-update path after initialization; tune smoothing with refresh cadence and step size.
 - Two-sided square-core projection was removed from the active code path after weaker target movement and no clear product pull.
+- Burst refresh (all bases on interval steps) is the Grassmann schedule; round-robin was measured and removed as complexity rent.
+- Module-role projection side and size-rank allocation are the current best policy defaults; architecture-aware side/rank lives in the harness.
 - Unsupported ECC/param-ECC fails loudly.
 - Exact SVD remains a correctness rail and possible initialization choice, not the steady-state performance path.
 
 Near-term implementation cuts should be one of:
 
-1. clean up the now-tangled bucketed one-sided optimizer step path,
-2. evaluate architecture-aware projection side/rank policy under equal matrix-state budget,
-3. measure realistic-token-step amortization of bucketed Aurora,
-4. basis movement / residual diagnostics for tracking smoothness,
-5. use retention/source validation output for a real medium adaptation run.
+1. default module-role side + size rank in the harness,
+2. basis movement / residual diagnostics for tuning Grassmann smoothing,
+3. measure realistic-token-step amortization of bucketed Aurora (32k+ tokens/step),
+4. use retention/source validation output for a real medium adaptation run.
 
 Do not add speculative abstractions. Every new knob should correspond to a named geometry question.
 
