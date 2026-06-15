@@ -134,6 +134,7 @@ class SumoTrack(Optimizer):
         for group in self.param_groups:
             matrix_params = [p for p in group["params"] if p.grad is not None and p.ndim == 2]
             refresh_ids = self._refresh_param_ids(group, matrix_params)
+            matrix_updates = []
 
             for p in group["params"]:
                 if p.grad is None:
@@ -142,9 +143,13 @@ class SumoTrack(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
-                    self._step_matrix_param(p, grad, group, id(p) in refresh_ids, diagnostics)
+                    if group["projection_mode"] == "one_sided":
+                        matrix_updates.append(self._prepare_one_sided_matrix_update(p, grad, group, id(p) in refresh_ids))
+                    else:
+                        self._step_matrix_param(p, grad, group, id(p) in refresh_ids, diagnostics)
                 else:
                     self._step_fallback_param(p, grad, group, diagnostics)
+            self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
 
         if diagnostics is not None:
             matrix_update_norm = diagnostics["matrix_update_norm_sq"] ** 0.5
@@ -197,6 +202,92 @@ class SumoTrack(Optimizer):
         state["projected_exp_avg"] = projected_exp_avg
 
         update_hat = self._orthogonalize_update(projected_exp_avg, group, tuple(p.shape))
+        if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
+            leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
+            diagnostics["projected_leverage_cv_sum"] += leverage_cv
+            diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
+            diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
+            diagnostics["projected_leverage_tensors"] += 1
+        update = projector.project_back(update_hat).to(dtype=p.dtype)
+
+        recovery_scale = group["recovery_scale"]
+        if recovery_scale:
+            projected_back_grad = projector.project_back(projected_grad).to(dtype=grad.dtype)
+            update = update + recovery_scale * (grad - projected_back_grad)
+
+        if group["weight_decay"]:
+            p.mul_(1.0 - group["lr"] * group["weight_decay"])
+        if diagnostics is not None:
+            diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
+            diagnostics["matrix_params"] += p.numel()
+        p.add_(update, alpha=-group["lr"])
+
+    def _prepare_one_sided_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> dict:
+        state = self.state[p]
+        state["step"] = state.get("step", 0) + 1
+
+        projector = self._projector_from_state(p, group, state)
+        if not projector.is_initialized or refresh_basis:
+            self._refresh_projector(projector, grad, group, state)
+
+        projected_grad = projector.project(grad)
+        projected_exp_avg = state.get("projected_exp_avg")
+        if projected_exp_avg is None:
+            projected_exp_avg = torch.zeros_like(projected_grad)
+        projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
+        state["projected_exp_avg"] = projected_exp_avg
+
+        return {
+            "param": p,
+            "grad": grad,
+            "projector": projector,
+            "projected_grad": projected_grad,
+            "projected_exp_avg": projected_exp_avg,
+            "original_shape": tuple(p.shape),
+        }
+
+    def _apply_matrix_update_buckets(self, entries: list[dict], group: dict, diagnostics: dict | None) -> None:
+        if not entries:
+            return
+
+        buckets: dict[tuple, list[dict]] = {}
+        for entry in entries:
+            projected_exp_avg = entry["projected_exp_avg"]
+            key = (
+                group["orthogonalization"],
+                group["orthogonalization_scale_mode"],
+                tuple(projected_exp_avg.shape),
+                entry["original_shape"],
+                projected_exp_avg.dtype,
+                projected_exp_avg.device,
+                group["heavyball_orthogonalization_mode"],
+                group["aurora_pp_iterations"],
+                group["aurora_pp_beta"],
+            )
+            buckets.setdefault(key, []).append(entry)
+
+        for bucket_entries in buckets.values():
+            if len(bucket_entries) == 1:
+                update_hats = [
+                    self._orthogonalize_update(
+                        bucket_entries[0]["projected_exp_avg"],
+                        group,
+                        bucket_entries[0]["original_shape"],
+                    )
+                ]
+            else:
+                stacked = torch.stack([entry["projected_exp_avg"] for entry in bucket_entries])
+                stacked_update_hats = self._orthogonalize_update(stacked, group, bucket_entries[0]["original_shape"])
+                update_hats = list(stacked_update_hats.unbind(0))
+            for entry, update_hat in zip(bucket_entries, update_hats, strict=True):
+                self._apply_one_sided_matrix_update(entry, update_hat, group, diagnostics)
+
+    def _apply_one_sided_matrix_update(self, entry: dict, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
+        p = entry["param"]
+        grad = entry["grad"]
+        projector = entry["projector"]
+        projected_grad = entry["projected_grad"]
+
         if diagnostics is not None and group["orthogonalization"] in {"svd", "heavyball", "aurora"}:
             leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
             diagnostics["projected_leverage_cv_sum"] += leverage_cv
@@ -409,6 +500,11 @@ class SumoTrack(Optimizer):
 
     @staticmethod
     def _orthogonalize_heavyball(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
+        if update.ndim > 2:
+            work = SumoTrack._batched_newton_schulz5(update)
+            if group["orthogonalization_scale_mode"] == "muon":
+                work = SumoTrack._scale_orthogonalized_update(update, work, "muon", original_shape)
+            return work
         work = update.clone()
         scale_mode = group["orthogonalization_scale_mode"]
         heavyball_utils.inplace_orthogonal_(
@@ -446,8 +542,8 @@ class SumoTrack(Optimizer):
         tall form, balance, then transpose back, matching Aurora's convention.
         """
 
-        if update.ndim != 2:
-            raise ValueError(f"Aurora orthogonalization expects a 2D tensor, got shape {tuple(update.shape)}")
+        if update.ndim < 2:
+            raise ValueError(f"Aurora orthogonalization expects at least 2D input, got shape {tuple(update.shape)}")
         if pp_iterations < 1:
             raise ValueError(f"pp_iterations must be >= 1, got {pp_iterations}")
         if pp_beta <= 0:
@@ -458,7 +554,7 @@ class SumoTrack(Optimizer):
         transposed = update.shape[-2] < update.shape[-1]
         work = update.mT if transposed else update
         work32 = work.float()
-        rows, cols = work32.shape
+        rows, cols = work32.shape[-2:]
         target_row_sq = cols / rows
         diagonal = work32.norm(dim=-1, keepdim=True).clamp_min(eps).reciprocal()
         balanced = None
@@ -473,9 +569,37 @@ class SumoTrack(Optimizer):
 
     @staticmethod
     def _heavyball_polar(update: Tensor) -> Tensor:
+        if update.ndim > 2:
+            return SumoTrack._batched_newton_schulz5(update)
         work = update.clone()
         heavyball_utils.inplace_orthogonal_(work, mode="newtonschulz", out=work, scale_mode="none")
         return work
+
+    @staticmethod
+    def _batched_newton_schulz5(update: Tensor, eps: float = 1e-7) -> Tensor:
+        if update.ndim < 2:
+            raise ValueError(f"Newton-Schulz orthogonalization expects at least 2D input, got shape {tuple(update.shape)}")
+        work = update.float()
+        work = work / work.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        transposed = work.shape[-2] > work.shape[-1]
+        x = work.mT if transposed else work
+
+        for a, b, c in [
+            (4.0848, -6.8946, 2.9270),
+            (3.9505, -6.3029, 2.6377),
+            (3.7418, -5.5913, 2.3037),
+            (2.8769, -3.1427, 1.2046),
+            (2.8366, -3.0525, 1.2012),
+        ]:
+            gram = x @ x.mT
+            y = c * gram
+            y.diagonal(dim1=-2, dim2=-1).add_(b)
+            y = y @ gram
+            y.diagonal(dim1=-2, dim2=-1).add_(a)
+            x = y @ x
+
+        result = x.mT if transposed else x
+        return result.to(device=update.device, dtype=update.dtype)
 
     @staticmethod
     def _scale_orthogonalized_update(
@@ -489,6 +613,10 @@ class SumoTrack(Optimizer):
         if scale_mode == "scale":
             return orthogonalized_update * math.sqrt(max(1.0, original_update.shape[-2] / original_update.shape[-1]))
         if scale_mode == "graft":
+            if original_update.ndim > 2:
+                original_norm = original_update.norm(dim=(-2, -1), keepdim=True)
+                ortho_norm = orthogonalized_update.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+                return orthogonalized_update * (original_norm / ortho_norm)
             return orthogonalized_update * (original_update.norm() / orthogonalized_update.norm().clamp(min=1e-6))
         if scale_mode == "muon":
             if original_shape is None or len(original_shape) < 2:

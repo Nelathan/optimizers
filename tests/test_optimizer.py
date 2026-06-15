@@ -308,6 +308,40 @@ class SumoTrackTest(unittest.TestCase):
         self.assertGreater(aurora_min, 0.9)
         self.assertLess(aurora_max, 1.1)
 
+    def test_batched_aurora_balances_rectangular_large_axis_leverage(self):
+        torch.manual_seed(4)
+        updates = torch.randn(3, 256, 16)
+
+        aurora_updates = SumoTrack._orthogonalize_aurora(
+            updates,
+            {"orthogonalization_scale_mode": "none", "aurora_pp_iterations": 2, "aurora_pp_beta": 0.5},
+            updates.shape[-2:],
+        )
+
+        self.assertEqual(tuple(aurora_updates.shape), tuple(updates.shape))
+        for aurora_update in aurora_updates:
+            aurora_cv, aurora_min, aurora_max = SumoTrack._large_axis_leverage_stats(aurora_update)
+            self.assertLess(aurora_cv, 0.05)
+            self.assertGreater(aurora_min, 0.9)
+            self.assertLess(aurora_max, 1.1)
+
+    def test_same_shape_one_sided_bucket_updates_multiple_params(self):
+        torch.manual_seed(5)
+        first = torch.nn.Parameter(torch.randn(8, 5))
+        second = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack([first, second], lr=0.01, rank=2, subspace_update_method="none")
+        before_first = first.detach().clone()
+        before_second = second.detach().clone()
+
+        first.grad = torch.randn_like(first)
+        second.grad = torch.randn_like(second)
+        opt.step()
+
+        self.assertFalse(torch.equal(first, before_first))
+        self.assertFalse(torch.equal(second, before_second))
+        self.assertEqual(tuple(opt.state[first]["projected_exp_avg"].shape), (8, 2))
+        self.assertEqual(tuple(opt.state[second]["projected_exp_avg"].shape), (8, 2))
+
     def test_log_norm_diagnostics_include_projected_leverage(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SumoTrack([weight], lr=0.01, rank=2, orthogonalization="aurora")

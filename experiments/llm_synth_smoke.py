@@ -247,7 +247,15 @@ def mean_or_nan(values: list[float]) -> float:
     return sum(finite) / len(finite) if finite else float("nan")
 
 
-def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[str], val_texts: list[str], device: torch.device) -> dict[str, float | int | str]:
+def run_optimizer(
+    args,
+    optimizer_name: str,
+    model_name: str,
+    train_texts: list[str],
+    val_texts: list[str],
+    retention_texts: list[str] | None,
+    device: torch.device,
+) -> dict[str, float | int | str]:
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -256,6 +264,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
     trainable, param_stats = select_trainable_params(model, args.param_scope)
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len)
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
+    retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len) if retention_texts else None
 
     if optimizer_name == "subspace":
         optimizer_name = "sumotrack"
@@ -286,6 +295,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         raise ValueError(optimizer_name)
 
     initial_val = evaluate_loss(model, val_batches)
+    initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
     warmup_steps = []
     measured_steps = []
 
@@ -304,6 +314,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
     final_val = evaluate_loss(model, val_batches)
+    final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     warmup_losses = [step["loss"] for step in warmup_steps]
     measured_losses = [step["loss"] for step in measured_steps]
@@ -340,6 +351,9 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "state_bytes": state_bytes["total"],
         "initial_val_loss": initial_val,
         "final_val_loss": final_val,
+        "initial_retention_val_loss": initial_retention_val,
+        "final_retention_val_loss": final_retention_val,
+        "retention_val_loss_delta": final_retention_val - initial_retention_val,
         "first_warmup_loss": warmup_losses[0] if warmup_losses else float("nan"),
         "last_warmup_loss": warmup_losses[-1] if warmup_losses else float("nan"),
         "first_measured_train_loss": measured_losses[0],
@@ -365,7 +379,7 @@ def run_optimizer(args, optimizer_name: str, model_name: str, train_texts: list[
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
     }
-    del optimizer, model, tokenizer, train_batches, val_batches
+    del optimizer, model, tokenizer, train_batches, val_batches, retention_batches
     if device.type == "cuda":
         torch.cuda.empty_cache()
     gc.collect()
@@ -439,6 +453,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SumoTrack")
     parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
+    parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw,heavyball_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="matrices-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
@@ -447,6 +462,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-texts", type=int, default=8)
+    parser.add_argument("--retention-val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--projection-mode", choices=("one_sided", "two_sided"), default="one_sided")
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
@@ -483,10 +499,14 @@ def main() -> None:
     total_train_steps = args.warmup_steps + args.measure_steps
     train_texts = synth_texts(Path(args.data_dir), "train", limit=max(total_train_steps * args.grad_accum_steps, 4) * args.batch_size)
     val_texts = synth_texts(Path(args.data_dir), "val", limit=max(args.val_texts, 1) * args.batch_size)
+    retention_texts = None
+    if args.retention_data_dir:
+        retention_texts = synth_texts(Path(args.retention_data_dir), "val", limit=max(args.retention_val_texts, 1) * args.batch_size)
     print(f"device={device}")
     print(f"model={model_name}")
     print(f"data_dir={args.data_dir}")
-    print(f"train_texts={len(train_texts)} val_texts={len(val_texts)}")
+    print(f"retention_data_dir={args.retention_data_dir or 'none'}")
+    print(f"train_texts={len(train_texts)} val_texts={len(val_texts)} retention_texts={len(retention_texts) if retention_texts else 0}")
     print(
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
@@ -496,7 +516,7 @@ def main() -> None:
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
         if optimizer_name == "subspace":
             optimizer_name = "sumotrack"
-        result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, device)
+        result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, retention_texts, device)
         prefix = optimizer_name
         for key, value in result.items():
             if key == "optimizer":
