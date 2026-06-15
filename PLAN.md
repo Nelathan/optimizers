@@ -64,6 +64,8 @@ Open design questions:
 - Should side choice be architecture-aware for Gemma/LFM/Qwen rather than purely shape-aware?
 - Are we throwing away task-vital gradient components because they did not appear in the tracked/SVD subspace early enough?
 
+Current status: the LLM SYNTH harness supports `--projection-side-policy module-role`, which maps MLP up/gate and attention q/k/v projections to right-side hidden-input bases, and MLP down / attention output projections to left-side hidden-output bases. Unknown matrices stay on shape-based `AUTO`. A tiny LFM smoke with module-role policy selected 50 right-side, 32 left-side, and 10 auto matrix tensors, confirming that architecture semantics materially differ from pure shape habit.
+
 ### 2. Rank allocation
 
 Uniform rank is a baseline, not a product design.
@@ -84,6 +86,8 @@ Promising policies:
 - minimum rank for small-but-semantically-important matrices.
 
 Default rank remains `32` for library sanity, but real Gemma-scale evaluation should not pretend fixed rank `64` is a design conclusion.
+
+Current status: the LLM SYNTH harness supports `--rank-policy uniform|size|module-role`, `--min-rank`, `--max-rank`, and optional `--optimizer-state-budget-mb` matrix-state clamping. This is deliberately a harness policy layer over named parameters, not optimizer core machinery. It is good enough to ask whether role/size allocation changes adaptation per byte; it is not yet a learned or spectrum-calibrated allocator.
 
 ### 3. Subspace tracking as adaptation smoothing
 
@@ -150,6 +154,7 @@ Current implementation invariants:
 - Orthogonalization happens in projected space.
 - `orthogonalization="aurora"` with `orthogonalization_scale_mode="muon"` is the default projected direction. HeavyBall Newton-Schulz with the same scale semantics remains the fast baseline/fallback.
 - One-sided same-shape projected orthogonalization is bucketed. Two-sided projection remains on the simpler per-tensor path until it earns more product relevance.
+- Architecture-aware side/rank policy lives in the LLM harness via named-parameter groups. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
 Do not optimize kernel launches before the algorithmic shape is worth optimizing. Once the design is stable enough, the performance ladder is:
@@ -187,8 +192,8 @@ The next serious evaluation harness should support periodic validation and struc
 The next work should improve the algorithm under our feet:
 
 1. **Aurora productization path.** Treat Aurora as the default rectangular orthogonalization path unless a retention/source run contradicts it. Same-shape projected orthogonalization is now bucketed; the next product question is whether the bucketed overhead is negligible at realistic tokens/step and whether target movement preserves useful source behavior.
-2. **Architecture-aware side/rank inspection.** Inspect Gemma/LFM/Qwen module shapes and map which axis is hidden-state-facing for MLP up/gate/down and attention projections. Decide whether `AUTO` is aligned with the intended stability axis or merely lucky.
-3. **Budget-driven rank policy.** Add a minimal rank-policy layer that can allocate rank by module role or tensor size under a target state budget. Uniform rank remains available but should stop being the only serious mode.
+2. **Architecture-aware side/rank evaluation.** The minimal harness policy exists. Use it to compare shape `AUTO` against module-role hidden-axis policy on target+retention movement, not just to print prettier side counts.
+3. **Budget-driven rank policy evaluation.** The minimal rank-policy layer exists. Use `uniform`, `size`, and `module-role` under a comparable matrix-state budget; do not compare policies with different byte spend and call it geometry.
 4. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann vs SVD can be reasoned about as smoothing/adaptation-area control, not just speed.
 5. **Medium SYNTH adaptation run with retention/source validation.** After one implementation/productization cut above, run enough SYNTH to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
 
@@ -200,9 +205,10 @@ Minimum useful next session:
 
 1. Use the new optional retention/source validation output when a real source corpus is available. Do not use SYNTH-as-retention as evidence; that is only a plumbing check.
 2. Add a small timing-only amortization check for larger token counts if feasible locally (`4k`/`8k`/`16k`, not convergence runs) to estimate how much Aurora's bucketed per-step overhead disappears as tokens/step approaches product reality.
-3. Move next to architecture-aware side/rank policy; Aurora improves the direction map, but state still needs to be spent on the tensors and axes that matter.
-4. Keep two-sided square-core out of the mainline unless it shows a retention or rank-budget advantage. Its short fixed-basis target movement was weaker than one-sided.
-5. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
+3. Evaluate architecture-aware side/rank policy under equal matrix-state budget. Aurora improves the direction map, but state still needs to be spent on the tensors and axes that matter.
+4. Clean up the optimizer step path before adding more optimizer features; the bucketed one-sided path is working but now visibly too tangled.
+5. Keep two-sided square-core out of the mainline unless it shows a retention or rank-budget advantage. Its short fixed-basis target movement was weaker than one-sided.
+6. Do not spend the session on AdamW, broad topology proof, ECC, or projected-gradient hooks.
 
 Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if its per-step cost remains material at realistic tokens/step after straightforward bucketing, keep HeavyBall NS as the practical mainline and move to rank/side policy. Do not worship prettier row norms; also do not over-penalize a per-step cost measured at toy token counts.
 

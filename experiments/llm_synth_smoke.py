@@ -25,6 +25,8 @@ PREFERRED_MODELS = (
 )
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
+ProjectionSidePolicy = Literal["auto", "module-role"]
+RankPolicy = Literal["uniform", "size", "module-role"]
 
 
 def cached_model_snapshots(model_name: str) -> list[Path]:
@@ -131,7 +133,7 @@ def is_embedding_like_name(name: str) -> bool:
     return any(part in lowered for part in ("embed", "embedding", "wte", "wpe", "lm_head"))
 
 
-def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> tuple[list[torch.nn.Parameter], dict[str, int]]:
+def select_trainable_named_params(model: torch.nn.Module, param_scope: ParamScope) -> tuple[list[tuple[str, torch.nn.Parameter]], dict[str, int]]:
     trainable = []
     stats = {
         "selected_tensors": 0,
@@ -164,7 +166,7 @@ def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> 
         param.requires_grad_(wants_param)
         if not wants_param:
             continue
-        trainable.append(param)
+        trainable.append((name, param))
         stats["selected_tensors"] += 1
         stats["selected_params"] += param.numel()
         if param.ndim == 2:
@@ -177,6 +179,114 @@ def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> 
     if not trainable:
         raise RuntimeError(f"No trainable parameters selected for param_scope={param_scope}")
     return trainable, stats
+
+
+def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> tuple[list[torch.nn.Parameter], dict[str, int]]:
+    trainable, stats = select_trainable_named_params(model, param_scope)
+    return [param for _name, param in trainable], stats
+
+
+def module_role(name: str, param: torch.nn.Parameter) -> str:
+    lowered = name.lower()
+    if param.ndim != 2:
+        return "fallback"
+    if any(part in lowered for part in ("gate_proj", "up_proj", "w1", "w3", "fc1")):
+        return "mlp_up_gate"
+    if any(part in lowered for part in ("down_proj", "w2", "fc2")):
+        return "mlp_down"
+    if any(part in lowered for part in ("q_proj", "k_proj", "v_proj", "query", "key", "value")):
+        return "attention_qkv"
+    if any(part in lowered for part in ("o_proj", "out_proj", "dense")):
+        return "attention_out"
+    return "other_matrix"
+
+
+def side_for_policy(role: str, policy: ProjectionSidePolicy) -> str:
+    if policy == "auto":
+        return "auto"
+    if role in {"mlp_up_gate", "attention_qkv"}:
+        return "right"
+    if role in {"mlp_down", "attention_out"}:
+        return "left"
+    return "auto"
+
+
+def rank_for_policy(param: torch.nn.Parameter, role: str, rank: int, policy: RankPolicy, min_rank: int, max_rank: int | None, median_matrix_params: float) -> int:
+    if param.ndim != 2:
+        return rank
+    if policy == "uniform":
+        proposed = rank
+    elif policy == "size":
+        proposed = round(rank * (param.numel() / median_matrix_params) ** 0.5)
+    else:
+        multiplier = {
+            "mlp_up_gate": 1.5,
+            "mlp_down": 1.25,
+            "attention_qkv": 1.0,
+            "attention_out": 1.0,
+            "other_matrix": 0.75,
+        }.get(role, 1.0)
+        proposed = round(rank * multiplier)
+    cap = min(param.shape) if max_rank is None else min(max_rank, min(param.shape))
+    return max(1, min(cap, max(min_rank, proposed)))
+
+
+def matrix_state_cost_per_rank(param: torch.nn.Parameter) -> int:
+    return (param.shape[0] + param.shape[1]) * param.element_size()
+
+
+def apply_matrix_state_budget(param_options: dict[int, dict], named_params: list[tuple[str, torch.nn.Parameter]], budget_mb: float, min_rank: int) -> None:
+    if budget_mb <= 0:
+        return
+    budget_bytes = int(budget_mb * 1024 * 1024)
+    matrix_params = [param for _name, param in named_params if param.ndim == 2]
+    min_cost = sum(min(min_rank, min(param.shape)) * matrix_state_cost_per_rank(param) for param in matrix_params)
+    if min_cost > budget_bytes:
+        raise ValueError(f"optimizer_state_budget_mb={budget_mb} is below minimum matrix state cost {min_cost / 1024 / 1024:.2f} MB")
+
+    def total_cost() -> int:
+        return sum(param_options[id(param)]["rank"] * matrix_state_cost_per_rank(param) for param in matrix_params)
+
+    while total_cost() > budget_bytes:
+        candidates = [param for param in matrix_params if param_options[id(param)]["rank"] > min(min_rank, min(param.shape))]
+        if not candidates:
+            break
+        target = max(candidates, key=matrix_state_cost_per_rank)
+        param_options[id(target)]["rank"] -= 1
+
+
+def build_sumotrack_param_groups(
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    rank: int,
+    rank_policy: RankPolicy,
+    projection_side_policy: ProjectionSidePolicy,
+    min_rank: int,
+    max_rank: int | None,
+    optimizer_state_budget_mb: float,
+) -> tuple[list[dict], dict[str, int]]:
+    matrix_sizes = sorted(param.numel() for _name, param in named_params if param.ndim == 2)
+    median_matrix_params = float(matrix_sizes[len(matrix_sizes) // 2]) if matrix_sizes else 1.0
+    param_options = {}
+    policy_stats = {"rank_policy_min_rank": 0, "rank_policy_max_rank": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
+
+    for name, param in named_params:
+        role = module_role(name, param)
+        side = side_for_policy(role, projection_side_policy)
+        param_rank = rank_for_policy(param, role, rank, rank_policy, min_rank, max_rank, median_matrix_params)
+        param_options[id(param)] = {"rank": param_rank, "side": side}
+
+    apply_matrix_state_budget(param_options, named_params, optimizer_state_budget_mb, min_rank)
+
+    grouped: dict[tuple[int, str], list[torch.nn.Parameter]] = {}
+    for _name, param in named_params:
+        options = param_options[id(param)]
+        grouped.setdefault((options["rank"], options["side"]), []).append(param)
+        if param.ndim == 2:
+            policy_stats["rank_policy_min_rank"] = options["rank"] if not policy_stats["rank_policy_min_rank"] else min(policy_stats["rank_policy_min_rank"], options["rank"])
+            policy_stats["rank_policy_max_rank"] = max(policy_stats["rank_policy_max_rank"], options["rank"])
+            policy_stats[f"side_policy_{options['side']}_tensors"] += 1
+
+    return [{"params": params, "rank": group_rank, "side": group_side} for (group_rank, group_side), params in grouped.items()], policy_stats
 
 
 def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int):
@@ -261,7 +371,17 @@ def run_optimizer(
         torch.cuda.reset_peak_memory_stats(device)
     gc.collect()
     model, tokenizer = load_model_and_tokenizer(model_name, device)
-    trainable, param_stats = select_trainable_params(model, args.param_scope)
+    trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
+    trainable = [param for _name, param in trainable_named]
+    sumotrack_param_groups, policy_stats = build_sumotrack_param_groups(
+        trainable_named,
+        args.rank,
+        args.rank_policy,
+        args.projection_side_policy,
+        args.min_rank,
+        args.max_rank,
+        args.optimizer_state_budget_mb,
+    )
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len)
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len) if retention_texts else None
@@ -271,9 +391,8 @@ def run_optimizer(
 
     if optimizer_name == "sumotrack":
         optimizer = SumoTrack(
-            trainable,
+            sumotrack_param_groups,
             lr=args.sumotrack_lr,
-            rank=args.rank,
             beta=args.beta,
             projection_mode=args.projection_mode,
             orthogonalization=args.orthogonalization,
@@ -329,6 +448,13 @@ def run_optimizer(
     result = {
         "optimizer": optimizer_name,
         "param_scope": args.param_scope,
+        "rank_policy": args.rank_policy if optimizer_name == "sumotrack" else "n/a",
+        "projection_side_policy": args.projection_side_policy if optimizer_name == "sumotrack" else "n/a",
+        "rank_policy_min_rank": policy_stats["rank_policy_min_rank"] if optimizer_name == "sumotrack" else 0,
+        "rank_policy_max_rank": policy_stats["rank_policy_max_rank"] if optimizer_name == "sumotrack" else 0,
+        "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "sumotrack" else 0,
+        "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "sumotrack" else 0,
+        "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
         "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
         "projection_mode": args.projection_mode if optimizer_name == "sumotrack" else "n/a",
         "subspace_update_method": args.subspace_update_method if optimizer_name == "sumotrack" else "n/a",
@@ -464,7 +590,12 @@ def main() -> None:
     parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--retention-val-texts", type=int, default=8)
     parser.add_argument("--rank", type=int, default=128)
+    parser.add_argument("--rank-policy", choices=("uniform", "size", "module-role"), default="uniform")
+    parser.add_argument("--min-rank", type=int, default=1)
+    parser.add_argument("--max-rank", type=int, default=0, help="0 means cap only by tensor dimension")
+    parser.add_argument("--optimizer-state-budget-mb", type=float, default=0.0, help="optional matrix-state budget for rank clamping")
     parser.add_argument("--projection-mode", choices=("one_sided", "two_sided"), default="one_sided")
+    parser.add_argument("--projection-side-policy", choices=("auto", "module-role"), default="auto")
     parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
     parser.add_argument("--subspace-update-method", choices=("none", "svd_refresh", "grassmann"), default="grassmann")
     parser.add_argument("--orthogonalization", choices=("none", "svd", "heavyball", "aurora"), default="aurora")
@@ -488,6 +619,9 @@ def main() -> None:
         raise ValueError("measure_steps must be positive")
     if args.grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive")
+    if args.min_rank <= 0:
+        raise ValueError("min_rank must be positive")
+    args.max_rank = args.max_rank or None
     args.heavyball_orthogonalization_mode = args.heavyball_orthogonalization_mode or None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -510,7 +644,8 @@ def main() -> None:
     print(
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
-        f"rank={args.rank} subspace_init={args.subspace_init} orthogonalization={args.orthogonalization}"
+        f"rank={args.rank} rank_policy={args.rank_policy} projection_side_policy={args.projection_side_policy} "
+        f"subspace_init={args.subspace_init} orthogonalization={args.orthogonalization}"
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:

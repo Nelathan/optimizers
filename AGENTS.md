@@ -34,9 +34,9 @@ The next value is algorithm design, not smoke-test accumulation.
 
 High-leverage questions:
 
-- Is shape-based `AUTO` projection side aligned with transformer hidden-state semantics?
-- Should side/rank be architecture-aware for Gemma/LFM/Qwen module roles?
-- How should rank be allocated under a global optimizer-state budget?
+- Does harness-side `--projection-side-policy module-role` beat shape-based `AUTO` on target+retention movement?
+- Does `--rank-policy size|module-role` improve adaptation per byte under equal matrix-state budget?
+- How should the current minimal rank policy evolve toward spectrum/calibration-aware allocation?
 - Does Grassmann tracking provide useful smoothing against forgetting compared with sharper SVD refresh?
 - How should Aurora's per-step overhead be amortized and bucketed for realistic high-token steps?
 - When, if ever, does two-sided square-core projection improve retention/stability or rank-budget efficiency enough to justify the extra bottleneck?
@@ -93,11 +93,11 @@ Current invariants:
 
 Near-term implementation cuts should be one of:
 
-1. Aurora overhead productization: bucket same-shape projected orthogonalization and measure realistic-token-step amortization,
-2. architecture-aware projection side/rank policy,
-3. global state-budget rank allocation,
+1. clean up the now-tangled bucketed one-sided optimizer step path,
+2. evaluate architecture-aware projection side/rank policy under equal matrix-state budget,
+3. measure realistic-token-step amortization of bucketed Aurora,
 4. basis movement / residual diagnostics for tracking smoothness,
-5. minimal retention/source validation output when needed for a real medium adaptation run.
+5. use retention/source validation output for a real medium adaptation run.
 
 Do not add speculative abstractions. Every new knob should correspond to a named geometry question.
 
