@@ -48,7 +48,7 @@ Setup:
 - Model/data/scope: same LFM/SYNTH `matrices-no-embeddings` setup as above.
 - Trainable: 92 non-embedding 2D tensors, 1,035,993,088 params.
 - Rank: 64.
-- Init: `subspace_init=svd`.
+- Init: SVD basis initialization.
 - Steps: 20 optimizer steps.
 - Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
 - Validation texts: 16.
@@ -81,21 +81,20 @@ Setup:
 
 - Same LFM/SYNTH `matrices-no-embeddings` scope as above: 92 2D tensors, 1,035,993,088 trainable params.
 - Rank: 64.
-- Init: `subspace_init=svd`.
+- Init: SVD basis initialization.
 - Steps: 1 warmup + 40 measured optimizer steps.
 - Tokens/update: 1536 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=8`).
 - Validation texts: 16.
 - Norm logging: enabled. `update_norm` is the actual `SumoTrack` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
 
-Representative command shape:
+Representative command shape at the time:
 
 ```bash
 HF_HUB_OFFLINE=1 uv run python experiments/llm_synth_smoke.py \
   --optimizers subspace --param-scope matrices-no-embeddings \
   --warmup-steps 1 --measure-steps 40 \
   --seq-len 192 --batch-size 1 --grad-accum-steps 8 --val-texts 16 \
-  --rank 64 --subspace-init svd --orthogonalization <svd|none> \
-  --subspace-lr <lr> --log-norms
+  --rank 64 --basis-init svd --log-norms
 ```
 
 Results:
@@ -146,7 +145,7 @@ Rank-64 LFM/SYNTH comparison:
 
 - Same matrix-only LFM/SYNTH setup as above.
 - Rank: 64.
-- Init: `subspace_init=svd`.
+- Init: SVD basis initialization.
 - Steps: 1 warmup + 40 measured optimizer steps.
 - Tokens/update: 1536.
 - LR: `0.0025`.
@@ -172,7 +171,7 @@ Setup:
 - Model/data: `LiquidAI/LFM2.5-1.2B-Base` from local cache, local SYNTH shards, `HF_HUB_OFFLINE=1`.
 - Scope: `--param-scope broad-no-embeddings`; embeddings/lm-head frozen.
 - Trainable: 1,036,120,832 params across 146 tensors: 92 matrix tensors / 1,035,993,088 params and 54 fallback tensors / 127,744 params.
-- Rank/init: rank 64, `--subspace-init random`.
+- Rank/init: rank 64, random basis initialization.
 - Steps: 1 warmup + 20 measured optimizer steps.
 - Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
 - Validation texts: 8.
@@ -204,7 +203,7 @@ Setup:
 
 - Model/data: `LiquidAI/LFM2.5-1.2B-Base`, local SYNTH, `HF_HUB_OFFLINE=1`.
 - Scope: `--param-scope broad-no-embeddings`.
-- Rank/init: rank 64, fixed bases via `--subspace-update-method none` unless noted.
+- Rank/init: rank 64, fixed bases unless noted.
 - Steps: 1 warmup + 10 measured optimizer steps.
 - Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
 - Validation texts: 8.
@@ -225,3 +224,31 @@ Notes:
 - Aurora fixes that mechanically, reducing leverage CV to ~0.025 and max/mean to ~1.07, with similar update/param. It slightly lost immediate target movement and cost ~20% step time over this short run.
 - Two-sided square-core projection is stable and nearly state-neutral, but underperformed one-sided rectangular HeavyBall on immediate target movement. SVD init did not rescue it in this short fixed-basis comparison.
 - Interpretation: one-sided rectangular updates remain the mainline for target adaptation. Aurora is still worth a retention-aware run because its value may be smoother/less forgetting-prone movement, not faster 10-step target loss. Two-sided should stay experimental until it shows retention or rank-budget advantage.
+
+## 2026-06-17: Packed SDPA throughput sanity check
+
+Question: can the LFM broad-no-embeddings harness run a realistic no-grad-accum throughput shape without accidentally disabling fast attention?
+
+Findings:
+
+- Padded `padding=max_length` throughput batches were the wrong test shape. The resulting non-null `attention_mask` made PyTorch SDPA reject flash attention (`Flash Attention does not support non-null attn_mask`) and made HF expand GQA key/value heads instead of using native SDPA GQA.
+- Added packed full-sequence batches (`--pack-sequences`) that omit `attention_mask`; this preserves causal SDPA flash eligibility for throughput tests.
+- `causal-conv1d` was temporarily built and verified during measurement, making LFM report its short-conv fast path available. It is not kept as a repo dependency because proper installation needs a coherent CUDA extension toolchain, not ad-hoc local build scaffolding. `flash-attn` source build was abandoned after memory pressure; do not source-build it casually in this environment.
+- With `LiquidAI/LFM2.5-1.2B-Base`, broad-no-embeddings, rank 64, residual-facing side, CCE loss, packed `seq_len=1024`, and no grad accumulation, the local 12GB card fits `batch_size=4` but not `5`, `6`, `8`, or `16`.
+
+Measured fitting point:
+
+| batch × seq | tokens/step | checkpointing | compile | Aurora PP / NS | step seconds | tokens/sec | peak CUDA | state bytes |
+| ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 × 1024 | 4096 | off | off | 2 / 5 | 0.623791 | 6566 | 10.70 GB | 89.9 MB |
+| 4 × 1024 | 4096 | on | off | 2 / 5 | 0.625118 | 6552 | 10.75 GB | 89.9 MB |
+| 4 × 1024 | 4096 | off | on | 2 / 5 | 0.622031 | 6585 | 10.70 GB | 89.9 MB |
+| 4 × 1024 | 4096 | off | off | 1 / 5 | 0.607037 | 6748 | 10.70 GB | 89.9 MB |
+| 4 × 1024 | 4096 | off | off | 2 / 3 | 0.612473 | 6688 | 10.70 GB | 89.9 MB |
+| 4 × 1024 | 4096 | off | off | 1 / 3 | 0.601221 | 6813 | 10.70 GB | 89.9 MB |
+
+Notes:
+
+- Checkpointing and `torch.compile` were noise at this shape.
+- Reducing Aurora/polar cycles gave a modest optimizer-side speedup; `1` Aurora preconditioning pass and `3` NS steps was ~3.6% faster than the default timing point. This is throughput-only evidence, not quality evidence.
+- The remaining memory wall is LFM layer temporary/activation memory under dense broad training, not optimizer state and not SDPA masking.

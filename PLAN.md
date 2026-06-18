@@ -64,41 +64,28 @@ Open design questions:
 - Should side choice be architecture-aware for Gemma/LFM/Qwen rather than purely shape-aware?
 - Are we throwing away task-vital gradient components because they did not appear in the tracked/SVD subspace early enough?
 
-Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, equal ~89.9 MB state budget showed module-role side policy beating shape `AUTO` decisively on target validation (`1.600` vs `1.810` final val). This is evidence that aligning projection sides to the hidden-state axis improves adaptation at identical byte cost. The harness supports `--projection-side-policy module-role`, which maps MLP up/gate and attention q/k/v projections to right-side hidden-input bases, and MLP down / attention output projections to left-side hidden-output bases.
+Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, equal ~89.9 MB state budget showed residual-facing side policy beating shape `AUTO` decisively on target validation (`1.600` vs `1.810` final val). This is evidence that aligning projection sides to the hidden-state / backbone-facing axis improves adaptation at identical byte cost.
 
-### 2. Rank allocation
+Important convention: optimizer side names are **PyTorch weight-storage coordinates**. `nn.Linear.weight` is `[out_features, in_features]`. Therefore MLP up/gate and attention q/k/v weights have the residual stream on the forward input / activation side, which is storage `right` / columns. MLP down and attention output weights return to the residual stream on the output / top side, which is storage `left` / rows. The harness policy is named `residual-facing` to avoid making callers think in storage coordinates.
 
-Uniform rank is a baseline, not a product design.
+### 2. Uniform rank policy
 
-Rank should become budget-driven:
+Uniform rank is the active harness policy. Keep it boring until a real product-shaped budget or retention failure earns another allocation cut.
 
-```text
-optimizer_state_budget_mb = ...
-rank_policy = "uniform" | "size" | "spectrum" | "module_role"
-```
+Default rank remains `32` for the library optimizer constructor, but the LLM harness defaults to rank `64` because that is the current useful broad-model evaluation baseline.
 
-Promising policies:
-
-- larger rank for high-leverage MLP and attention matrices,
-- role-specific rank caps,
-- gradient-spectrum-aware rank after a short calibration window,
-- global byte budget allocation rather than rank-per-tensor habit,
-- minimum rank for small-but-semantically-important matrices.
-
-Default rank remains `32` for library sanity, but real Gemma-scale evaluation should not pretend fixed rank `64` is a design conclusion.
-
-Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, module-role side, ~89 MB state budget compared rank policies. Size-rank saved ~10 MB vs uniform (`79.7 MB` vs `89.9 MB`) with a marginal quality delta (`1.591` vs `1.600`, likely noise at 200 steps). Module-role rank overshot the budget clamp. The simplest winning config is module-role side + uniform rank 64. Size-rank is a cheap optimization if state tightens, not a necessary policy knob. Spectrum-calibrated allocation was attempted but blocked by HeavyBall compile issues; initial-gradient R99 was measured as ~35 mean, drifting down to ~9 after 200 steps as gradient structure concentrates during training.
+Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, residual-facing side, ~89 MB state budget compared several rank-allocation ideas. Size-rank saved ~10 MB vs uniform (`79.7 MB` vs `89.9 MB`) with a marginal quality delta (`1.591` vs `1.600`, likely noise at 200 steps). Role-based rank overshot the intended budget. Spectrum-calibrated allocation was attempted but blocked by HeavyBall compile issues; initial-gradient R99 was measured as ~35 mean, drifting down to ~9 after 200 steps as gradient structure concentrates during training. The decision from that noise pile is not “add knobs”; it is residual-facing side + uniform rank 64 as the default.
 
 ### 3. Subspace tracking as adaptation smoothing
 
-SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: burst refresh on a cadence interval. Equal-cadence burst-vs-round-robin measurements showed identical peak VRAM (~8.18 GB at 4096 tokens/step, ~5.03 GB at 64 tokens/step) — state is ~90 MB and activation/model memory dominates. Burst is the simpler default; refresh cadence is tuned via `subspace_refresh_interval`.
+SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: burst refresh on a cadence interval. Equal-cadence burst-vs-round-robin measurements showed identical peak VRAM (~8.18 GB at 4096 tokens/step, ~5.03 GB at 64 tokens/step) — state is ~90 MB and activation/model memory dominates. Burst is the simpler default; refresh cadence is tuned via `basis_refresh_interval` / `--basis-refresh-interval`.
 
 That smoothing may be central for distribution shift without total forgetting.
 
 Open design questions:
 
 - exact SVD init vs random init vs short calibration SVD,
-- refresh interval by layer depth or module role,
+- refresh interval by layer depth or transformer matrix role,
 - moment transport strength across basis changes,
 - whether basis motion should be slower in backbone-stability-critical modules.
 
@@ -120,8 +107,7 @@ Open design questions:
 
 - Aurora retention/source behavior after its target-movement win,
 - whether Muon scale semantics continue to hold under larger target/source runs,
-- whether projected tensor aspect ratio should influence rank allocation,
-- whether module role should influence Grassmann refresh cadence.
+- whether transformer matrix role should influence Grassmann refresh cadence.
 
 ### 5. Two-sided projection: removed from active path
 
@@ -153,9 +139,17 @@ Current implementation invariants:
 - Orthogonalization happens in projected space.
 - Aurora with fixed Muon scale semantics is the projected direction. HeavyBall Newton-Schulz remains an internal polar primitive.
 - One-sided same-shape projected orthogonalization is bucketed. Two-sided projection has been removed.
-- Grassmann basis tracking refreshes all bases on a burst cadence controlled by `subspace_refresh_interval`. Equal-cadence round-robin was measured and removed as complexity rent — state is too small to affect peak VRAM.
-- Architecture-aware side/rank policy lives in the LLM harness via named-parameter groups. The optimizer core remains responsible for projected state and updates, not model taxonomy.
+- Grassmann basis tracking refreshes all bases on a burst cadence controlled by `basis_refresh_interval`. Equal-cadence round-robin was measured and removed as complexity rent — state is too small to affect peak VRAM.
+- Architecture-aware side policy lives in the LLM harness via named-parameter groups. Rank allocation is uniform. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
+
+The harness should encode the current boring-best defaults so experiment commands stay lean. Prefer:
+
+```bash
+uv run python experiments/llm_synth_smoke.py --measure-steps 200 --seq-len 4096
+```
+
+over restating defaults such as `--optimizers sumotrack --rank 64 --projection-side-policy residual-facing --param-scope broad-no-embeddings`. Pass an argument only when the run is intentionally changing that axis.
 
 Do not optimize kernel launches before the algorithmic shape is worth optimizing. Once the design is stable enough, the performance ladder is:
 
@@ -187,25 +181,53 @@ Useful evaluation signals:
 
 The next serious evaluation harness should support periodic validation and structured output. But harness work is only justified when it lets us answer an algorithm question faster.
 
+## Future leads
+
+This is the active lead list distilled from the old phase checklist. It is not a museum of every knob ever implemented; if a lead no longer serves the current product thesis, cut it instead of polishing it.
+
+### Must carry forward
+
+1. **Retention/source validation is the next truth sensor.** Aurora has enough target-only evidence. The next meaningful run needs a distinct source corpus and periodic retention validation so target movement can be judged against forgetting.
+2. **Basis movement and residual diagnostics.** Add minimal per-step or per-refresh metrics for basis motion, projected-gradient residual, and transported-moment drift. Grassmann smoothing should be tuned by observed adaptation area, not by the pleasant scent of differential geometry.
+3. **Realistic-token throughput.** Measure bucketed Aurora at 32k+ tokens/optimizer step with no gratuitous norm logging. The useful signal is tokens/sec, peak CUDA, and whether gradient accumulation was actually avoided.
+4. **Fallback policy under broad training.** Non-2D fallback state is small in LFM, but embeddings, norms, biases, and tiny conv kernels need a principled policy before Gemma-scale claims. Decide what trains, what freezes, and what fallback optimizer is acceptable.
+5. **State and resume invariants.** Keep tests for matrix projected-state shape, fallback accounting, bf16 behavior, and mixed state-dict resume. Optimizer bugs love reload boundaries.
+6. **HeavyBall-native path only after geometry earns it.** Move hot paths toward HeavyBall transforms/ECC when Aurora + tracking + retention look worth productizing. Do not hide algorithm uncertainty behind framework plumbing.
+7. **Projected-gradient hooks remain isolated and late.** Avoiding full-gradient materialization may be the real memory frontier, but it needs equivalence tests against `project(full_gradient)` on tiny models before it touches the main optimizer.
+8. **Full backward-time gradient release is a future memory frontier.** Once `G_hat = project(G)` is materialized, SumoTrack can release the full gradient for that parameter. The current safe path can consume grads during optimizer step after projection, but flashoptim-style post-accumulate hooks need a bucket-aware/deferred design so immediate per-parameter release does not destroy same-shape Aurora batching or change basis-refresh semantics.
+
+### Conditional leads
+
+- **Role/depth refresh cadence:** worth testing after basis-motion diagnostics exist. Without those sensors it is knob gardening.
+- **Two-sided square-core projection:** recover from git only if one-sided Aurora shows retention damage that square-core geometry plausibly addresses.
+- **Stochastic rounding:** possible low-complexity precision win before full ECC/param-ECC. Worth testing for fp32 projected/Aurora math cast back to bf16 params or low-precision projected state, but only if it has a direct bf16 stability/quality comparison; do not let it become pseudo-ECC ceremony.
+- **Nesterov/perpendicular recovery/extra momentum knobs:** hold unless a named failure mode demands them. They are currently more likely to reintroduce noise and API clutter than product leverage.
+
+### Maintenance leads
+
+- Keep `experiments/llm_synth_smoke.py` as a lean lab harness, not a trainer framework. Defaults should represent the current best baseline; examples should override only the axis being tested.
+- Keep `RESULTS.md` as a brief experiment log: why the run existed, what was tested, what moved, and what was observed. Put exhaustive command/output detail in external logs when needed; keep current direction in this file.
+- Prefer deleting unsupported branches over keeping dormant flags. If an experiment is not active, preserve it in git history and docs, not in the public path.
+- Add tests for any policy default that encodes a design decision, especially backbone-facing side grouping and uniform-rank reporting.
+
 ## Near-term design cuts
 
 The next work should improve the algorithm under our feet:
 
-1. **Aurora productization path.** Aurora is now the default projected direction. Same-shape bucketing works. Aurora overhead shrinks from ~21% at 768 tokens/step to ~10% at 4096 tokens/step; at product-scale tokens it should become noise. Retention/source behavior remains unmeasured.
-2. **Architecture-aware side/rank policy.** Module-role side beats AUTO at identical state. The simplest winning config is module-role side + uniform rank 64. Size-rank is a cheap optimization if state tightens, not a necessary knob. Spectrum-aware allocation was explored but the single-step gradient R99 measurement drifted dramatically during training, and evaluation was blocked by HeavyBall compile issues.
-3. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
-4. **Medium SYNTH adaptation run with retention/source validation.** After defaulting the winning side/rank policy, run enough SYNTH with a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
+1. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
+2. **Medium SYNTH adaptation run with retention/source validation.** Use the current defaults and a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
+3. **Realistic-token Aurora amortization.** Run 32k+ tokens/optimizer step without `--log-norms` unless diagnostics are the point. Measure tokens/sec, peak CUDA, and whether no-gradient-accumulation is practical.
 
 ## Next session contract
 
-Start from the 1k Aurora result and the side/rank evaluation. Module-role side beats AUTO decisively, rank policy differences are marginal, Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
+Start from the 1k Aurora result and the side evaluation. Residual-facing side beats AUTO decisively, uniform rank 64 is the harness policy, and Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
 
 Minimum useful next session:
 
-1. Default the harness to module-role side + uniform rank 64. Record the defaults in code and docs.
-2. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
-3. Use the retention/source validation output with a real source corpus (not SYNTH-as-retention) when available.
-4. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or further rank-policy horse races.
+1. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
+2. Use the retention/source validation output with a real source corpus, not SYNTH-as-retention.
+3. Measure one realistic-token run using defaults unless deliberately testing one axis.
+4. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or rank-allocation horse races.
 
 Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if side-rank wins are noise at longer horizons, revisit the direction map and allocation.
 
@@ -215,7 +237,7 @@ Stop and rethink if:
 
 - SumoTrack cannot exploit higher tokens/step or larger model scope than serious alternatives on the target GPU,
 - orthogonalized one-sided updates improve target loss but cause unacceptable retention collapse,
-- rank allocation shows most state is being spent on low-leverage tensors,
+- uniform rank clearly spends most state on low-leverage tensors,
 - Grassmann tracking is too sluggish to adapt or too fast to smooth,
 - rectangular orthogonalization quality becomes the bottleneck,
 - the code starts serving old gates instead of the product thesis.

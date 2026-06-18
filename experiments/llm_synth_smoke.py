@@ -10,6 +10,7 @@ from typing import Literal
 
 import pyarrow.parquet as pq
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,40 +25,8 @@ PREFERRED_MODELS = (
 )
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
-ProjectionSidePolicy = Literal["auto", "module-role"]
-RankPolicy = Literal["uniform", "size", "module-role", "spectrum"]
-
-
-def compute_spectrum_ranks(
-    model,
-    named_params: list[tuple[str, torch.nn.Parameter]],
-    tokenizer,
-    train_texts: list[str],
-    device: torch.device,
-    batch_size: int,
-    seq_len: int,
-    threshold: float = 0.99,
-    min_rank: int = 1,
-    max_rank: int | None = None,
-) -> dict[int, int]:
-    model.train()
-    batches = make_batches(tokenizer, train_texts, device, batch_size, seq_len)
-    with torch.compiler.set_stance("force_eager"):
-        loss = model(**batches[0]).loss
-        loss.backward()
-
-    ranks: dict[int, int] = {}
-    for name, param in named_params:
-        if param.ndim != 2 or param.grad is None:
-            continue
-        grad_float = param.grad.float()
-        _, s, _ = torch.linalg.svd(grad_float, full_matrices=False)
-        cum_mass = (s**2).cumsum(0) / (s**2).sum()
-        needed = (cum_mass < threshold).sum().item() + 1
-        cap = min(param.shape) if max_rank is None else min(max_rank, min(param.shape))
-        ranks[id(param)] = max(min_rank, min(cap, needed))
-    model.zero_grad(set_to_none=True)
-    return ranks
+ProjectionSidePolicy = Literal["auto", "residual-facing"]
+LossImpl = Literal["hf", "chunked", "cce"]
 
 
 def cached_model_snapshots(model_name: str) -> list[Path]:
@@ -143,18 +112,26 @@ def choose_model(explicit: str | None) -> str:
     raise RuntimeError("No preferred model tokenizer is cached locally:\n" + "\n".join(errors))
 
 
-def load_model_and_tokenizer(model_name: str, device: torch.device):
+def load_model_and_tokenizer(model_name: str, device: torch.device, activation_checkpointing: bool, attn_implementation: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    model_kwargs = {}
+    if attn_implementation:
+        model_kwargs["attn_implementation"] = attn_implementation
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         local_files_only=True,
         trust_remote_code=True,
         dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         low_cpu_mem_usage=True,
+        **model_kwargs,
     )
     model.config.use_cache = False
+    if activation_checkpointing:
+        if not hasattr(model, "gradient_checkpointing_enable"):
+            raise RuntimeError(f"Model {model_name} does not expose gradient_checkpointing_enable()")
+        model.gradient_checkpointing_enable()
     model.to(device)
     return model, tokenizer
 
@@ -217,7 +194,7 @@ def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> 
     return [param for _name, param in trainable], stats
 
 
-def module_role(name: str, param: torch.nn.Parameter) -> str:
+def transformer_matrix_role(name: str, param: torch.nn.Parameter) -> str:
     lowered = name.lower()
     if param.ndim != 2:
         return "fallback"
@@ -232,7 +209,16 @@ def module_role(name: str, param: torch.nn.Parameter) -> str:
     return "other_matrix"
 
 
-def side_for_policy(role: str, policy: ProjectionSidePolicy) -> str:
+def storage_side_for_residual_axis(role: str, policy: ProjectionSidePolicy) -> str:
+    """Return the storage side that faces the residual/backbone stream.
+
+    `nn.Linear.weight` is stored as `[out_features, in_features]`. For MLP
+    up/gate and attention q/k/v matrices, the residual stream is the forward
+    input activation axis, i.e. the right/column side in storage. For MLP down
+    and attention output projections, the residual stream is the output/top side,
+    i.e. the left/row side in storage.
+    """
+
     if policy == "auto":
         return "auto"
     if role in {"mlp_up_gate", "attention_qkv"}:
@@ -242,103 +228,46 @@ def side_for_policy(role: str, policy: ProjectionSidePolicy) -> str:
     return "auto"
 
 
-def rank_for_policy(
-    param: torch.nn.Parameter,
-    role: str,
-    rank: int,
-    policy: RankPolicy,
-    min_rank: int,
-    max_rank: int | None,
-    median_matrix_params: float,
-    spectrum_ranks: dict[int, int] | None = None,
-) -> int:
-    if param.ndim != 2:
-        return rank
-    if policy == "spectrum" and spectrum_ranks is not None:
-        return spectrum_ranks.get(id(param), rank)
-    if policy == "uniform":
-        proposed = rank
-    elif policy == "size":
-        proposed = round(rank * (param.numel() / median_matrix_params) ** 0.5)
-    else:
-        multiplier = {
-            "mlp_up_gate": 1.5,
-            "mlp_down": 1.25,
-            "attention_qkv": 1.0,
-            "attention_out": 1.0,
-            "other_matrix": 0.75,
-        }.get(role, 1.0)
-        proposed = round(rank * multiplier)
-    cap = min(param.shape) if max_rank is None else min(max_rank, min(param.shape))
-    return max(1, min(cap, max(min_rank, proposed)))
-
-
-def matrix_state_cost_per_rank(param: torch.nn.Parameter) -> int:
-    return (param.shape[0] + param.shape[1]) * param.element_size()
-
-
-def apply_matrix_state_budget(param_options: dict[int, dict], named_params: list[tuple[str, torch.nn.Parameter]], budget_mb: float, min_rank: int) -> None:
-    if budget_mb <= 0:
-        return
-    budget_bytes = int(budget_mb * 1024 * 1024)
-    matrix_params = [param for _name, param in named_params if param.ndim == 2]
-    min_cost = sum(min(min_rank, min(param.shape)) * matrix_state_cost_per_rank(param) for param in matrix_params)
-    if min_cost > budget_bytes:
-        raise ValueError(f"optimizer_state_budget_mb={budget_mb} is below minimum matrix state cost {min_cost / 1024 / 1024:.2f} MB")
-
-    def total_cost() -> int:
-        return sum(param_options[id(param)]["rank"] * matrix_state_cost_per_rank(param) for param in matrix_params)
-
-    while total_cost() > budget_bytes:
-        candidates = [param for param in matrix_params if param_options[id(param)]["rank"] > min(min_rank, min(param.shape))]
-        if not candidates:
-            break
-        target = max(candidates, key=matrix_state_cost_per_rank)
-        param_options[id(target)]["rank"] -= 1
-
-
 def build_sumotrack_param_groups(
     named_params: list[tuple[str, torch.nn.Parameter]],
     rank: int,
-    rank_policy: RankPolicy,
     projection_side_policy: ProjectionSidePolicy,
-    min_rank: int,
-    max_rank: int | None,
-    optimizer_state_budget_mb: float,
-    spectrum_ranks: dict[int, int] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
-    matrix_sizes = sorted(param.numel() for _name, param in named_params if param.ndim == 2)
-    median_matrix_params = float(matrix_sizes[len(matrix_sizes) // 2]) if matrix_sizes else 1.0
-    param_options = {}
-    policy_stats = {"rank_policy_min_rank": 0, "rank_policy_max_rank": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
+    if rank <= 0:
+        raise ValueError(f"rank must be positive, got {rank}")
+    policy_stats = {"effective_rank_min": 0, "effective_rank_max": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
 
+    grouped: dict[str, list[torch.nn.Parameter]] = {}
     for name, param in named_params:
-        role = module_role(name, param)
-        side = side_for_policy(role, projection_side_policy)
-        param_rank = rank_for_policy(param, role, rank, rank_policy, min_rank, max_rank, median_matrix_params, spectrum_ranks)
-        param_options[id(param)] = {"rank": param_rank, "side": side}
-
-    apply_matrix_state_budget(param_options, named_params, optimizer_state_budget_mb, min_rank)
-
-    grouped: dict[tuple[int, str], list[torch.nn.Parameter]] = {}
-    for _name, param in named_params:
-        options = param_options[id(param)]
-        grouped.setdefault((options["rank"], options["side"]), []).append(param)
+        role = transformer_matrix_role(name, param)
+        side = storage_side_for_residual_axis(role, projection_side_policy)
+        grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
-            policy_stats["rank_policy_min_rank"] = options["rank"] if not policy_stats["rank_policy_min_rank"] else min(policy_stats["rank_policy_min_rank"], options["rank"])
-            policy_stats["rank_policy_max_rank"] = max(policy_stats["rank_policy_max_rank"], options["rank"])
-            policy_stats[f"side_policy_{options['side']}_tensors"] += 1
+            effective_rank = min(rank, *param.shape)
+            policy_stats["effective_rank_min"] = effective_rank if not policy_stats["effective_rank_min"] else min(policy_stats["effective_rank_min"], effective_rank)
+            policy_stats["effective_rank_max"] = max(policy_stats["effective_rank_max"], effective_rank)
+            policy_stats[f"side_policy_{side}_tensors"] += 1
 
-    return [{"params": params, "rank": group_rank, "side": group_side} for (group_rank, group_side), params in grouped.items()], policy_stats
+    return [{"params": params, "rank": rank, "side": side} for side, params in grouped.items()], policy_stats
 
 
-def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int):
+def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, min_batches: int):
+    encoded = tokenizer("\n\n".join(texts), return_tensors="pt", add_special_tokens=False)["input_ids"].flatten()
+    needed = max(min_batches, 1) * batch_size * seq_len
+    if encoded.numel() < 2:
+        raise RuntimeError("not enough tokens to build packed batches")
+    repeats = (needed + encoded.numel() - 1) // encoded.numel()
+    tokens = encoded.repeat(repeats)[:needed].view(max(min_batches, 1), batch_size, seq_len).to(device)
+    return [{"input_ids": batch, "labels": batch.clone()} for batch in tokens]
+
+
+def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, pad_to_max_length: bool):
     batches = []
     for start in range(0, len(texts), batch_size):
         encoded = tokenizer(
             texts[start : start + batch_size],
             return_tensors="pt",
-            padding=True,
+            padding="max_length" if pad_to_max_length else True,
             truncation=True,
             max_length=seq_len,
         )
@@ -346,6 +275,10 @@ def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: 
         attention_mask = encoded["attention_mask"].to(device)
         batches.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": input_ids.clone()})
     return batches
+
+
+def batch_tokens(batch: dict[str, torch.Tensor]) -> int:
+    return int(batch["input_ids"].numel())
 
 
 @torch.no_grad()
@@ -358,6 +291,80 @@ def evaluate_loss(model, batches) -> float:
     return sum(losses) / len(losses)
 
 
+def _inner_causal_lm_modules(model):
+    inner = getattr(model, "_orig_mod", model)
+    base = getattr(inner, "model", None)
+    lm_head = getattr(inner, "lm_head", None)
+    if base is None or lm_head is None:
+        raise RuntimeError("chunked LM loss requires a causal LM with .model and .lm_head modules")
+    return base, lm_head
+
+
+def cce_causal_lm_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    from cut_cross_entropy import linear_cross_entropy
+
+    base, lm_head = _inner_causal_lm_modules(model)
+    outputs = base(
+        input_ids=batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+        use_cache=False,
+    )
+    targets = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        targets = targets.masked_fill(attention_mask == 0, -100)
+    return linear_cross_entropy(outputs.last_hidden_state, lm_head.weight, targets, ignore_index=-100, shift=True)
+
+
+def chunked_causal_lm_loss(model, batch: dict[str, torch.Tensor], chunk_tokens: int, loss_impl: LossImpl) -> torch.Tensor:
+    if loss_impl == "hf":
+        return model(**batch).loss
+    if loss_impl == "cce":
+        return cce_causal_lm_loss(model, batch)
+    if chunk_tokens <= 0:
+        raise ValueError("chunked loss requires chunked_lm_loss_tokens > 0")
+    base, lm_head = _inner_causal_lm_modules(model)
+    outputs = base(
+        input_ids=batch["input_ids"],
+        attention_mask=batch.get("attention_mask"),
+        use_cache=False,
+    )
+    hidden = outputs.last_hidden_state
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+    total_loss = hidden.new_zeros(())
+    total_items = 0
+    for start in range(0, hidden.shape[1] - 1, chunk_tokens):
+        end = min(start + chunk_tokens, hidden.shape[1] - 1)
+        logits = lm_head(hidden[:, start:end, :]).float()
+        labels = input_ids[:, start + 1 : end + 1]
+        if attention_mask is not None:
+            labels = labels.masked_fill(attention_mask[:, start + 1 : end + 1] == 0, -100)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.reshape(-1).to(logits.device),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        total_loss = total_loss + loss
+        total_items += int((labels != -100).sum().detach().cpu())
+    if total_items == 0:
+        raise RuntimeError("chunked LM loss saw zero non-padding target tokens")
+    return total_loss / total_items
+
+
+@torch.no_grad()
+def evaluate_loss_chunked(model, batches, chunk_tokens: int, loss_impl: LossImpl) -> float:
+    if loss_impl == "hf":
+        return evaluate_loss(model, batches)
+    model.eval()
+    losses = []
+    for batch in batches:
+        losses.append(float(chunked_causal_lm_loss(model, batch, chunk_tokens, loss_impl).detach().float().cpu()))
+    model.train()
+    return sum(losses) / len(losses)
+
+
 def train_step(
     model,
     optimizer: torch.optim.Optimizer,
@@ -366,12 +373,14 @@ def train_step(
     start_index: int,
     grad_accum_steps: int,
     log_norms: bool,
+    chunked_lm_loss_tokens: int,
+    loss_impl: LossImpl,
 ) -> dict[str, float]:
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
         batch = batches[(start_index + offset) % len(batches)]
-        loss = model(**batch).loss
+        loss = chunked_causal_lm_loss(model, batch, chunked_lm_loss_tokens, loss_impl)
         (loss / grad_accum_steps).backward()
         losses.append(float(loss.detach().float().cpu()))
     grad_norm = gradient_norm(trainable) if log_norms else float("nan")
@@ -413,28 +422,25 @@ def run_optimizer(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     gc.collect()
-    model, tokenizer = load_model_and_tokenizer(model_name, device)
+    model, tokenizer = load_model_and_tokenizer(model_name, device, args.activation_checkpointing, args.attn_implementation)
     trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
     trainable = [param for _name, param in trainable_named]
-    spectrum_ranks = None
-    if args.rank_policy == "spectrum":
-        spectrum_ranks = compute_spectrum_ranks(
-            model, trainable_named, tokenizer, train_texts[:1], device,
-            args.batch_size, args.seq_len, 0.99, args.min_rank, args.max_rank,
-        )
     sumotrack_param_groups, policy_stats = build_sumotrack_param_groups(
         trainable_named,
         args.rank,
-        args.rank_policy,
         args.projection_side_policy,
-        args.min_rank,
-        args.max_rank,
-        args.optimizer_state_budget_mb,
-        spectrum_ranks,
     )
-    train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len)
-    val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len)
-    retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len) if retention_texts else None
+    if args.pack_sequences:
+        train_batches = make_packed_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps)
+        val_batches = make_packed_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, max(args.val_texts, 1))
+        retention_batches = make_packed_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, max(args.retention_val_texts, 1)) if retention_texts else None
+    else:
+        train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length)
+        val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length)
+        retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length) if retention_texts else None
+
+    if args.torch_compile:
+        model = torch.compile(model)
 
     if optimizer_name == "subspace":
         optimizer_name = "sumotrack"
@@ -444,9 +450,12 @@ def run_optimizer(
             sumotrack_param_groups,
             lr=args.sumotrack_lr,
             beta=args.beta,
-            subspace_init=args.subspace_init,
+            basis_init=args.basis_init,
             grassmann_step_size=args.grassmann_step_size,
-            subspace_refresh_interval=args.subspace_refresh_interval,
+            basis_refresh_interval=args.basis_refresh_interval,
+            aurora_pp_iterations=args.aurora_pp_iterations,
+            polar_ns_steps=args.polar_ns_steps,
+            consume_grad=not args.keep_grads_after_step,
         )
         optimizer.diagnostics_enabled = args.log_norms
     elif optimizer_name in {"adamw", "torch_adamw"}:
@@ -454,13 +463,13 @@ def run_optimizer(
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
 
-    initial_val = evaluate_loss(model, val_batches)
-    initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
+    initial_val = evaluate_loss_chunked(model, val_batches, args.chunked_lm_loss_tokens, args.loss_impl) if not args.skip_validation else float("nan")
+    initial_retention_val = evaluate_loss_chunked(model, retention_batches, args.chunked_lm_loss_tokens, args.loss_impl) if retention_batches is not None and not args.skip_validation else float("nan")
     measured_steps = []
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
-        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms)
+        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms, args.chunked_lm_loss_tokens, args.loss_impl)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -468,12 +477,12 @@ def run_optimizer(
     start_time = time.perf_counter()
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
-        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
+        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms, args.chunked_lm_loss_tokens, args.loss_impl))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
-    final_val = evaluate_loss(model, val_batches)
-    final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
+    final_val = evaluate_loss_chunked(model, val_batches, args.chunked_lm_loss_tokens, args.loss_impl) if not args.skip_validation else float("nan")
+    final_retention_val = evaluate_loss_chunked(model, retention_batches, args.chunked_lm_loss_tokens, args.loss_impl) if retention_batches is not None and not args.skip_validation else float("nan")
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
@@ -486,16 +495,29 @@ def run_optimizer(
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
-        "rank_policy": args.rank_policy if optimizer_name == "sumotrack" else "n/a",
         "projection_side_policy": args.projection_side_policy if optimizer_name == "sumotrack" else "n/a",
-        "rank_policy_min_rank": policy_stats["rank_policy_min_rank"] if optimizer_name == "sumotrack" else 0,
-        "rank_policy_max_rank": policy_stats["rank_policy_max_rank"] if optimizer_name == "sumotrack" else 0,
+        "rank": args.rank if optimizer_name == "sumotrack" else 0,
+        "effective_rank_min": policy_stats["effective_rank_min"] if optimizer_name == "sumotrack" else 0,
+        "effective_rank_max": policy_stats["effective_rank_max"] if optimizer_name == "sumotrack" else 0,
         "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "sumotrack" else 0,
         "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "sumotrack" else 0,
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
-        "subspace_init": args.subspace_init if optimizer_name == "sumotrack" else "n/a",
-        "subspace_refresh_interval": args.subspace_refresh_interval if optimizer_name == "sumotrack" else 0,
-        "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
+        "basis_init": args.basis_init if optimizer_name == "sumotrack" else "n/a",
+        "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "sumotrack" else 0,
+        "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "sumotrack" else 0,
+        "polar_ns_steps": args.polar_ns_steps if optimizer_name == "sumotrack" else 0,
+        "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "sumotrack" else False,
+        "activation_checkpointing": args.activation_checkpointing,
+        "torch_compile": args.torch_compile,
+        "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
+        "pad_to_max_length": args.pad_to_max_length,
+        "pack_sequences": args.pack_sequences,
+        "loss_impl": args.loss_impl,
+        "chunked_lm_loss_tokens": args.chunked_lm_loss_tokens,
+        "skip_validation": args.skip_validation,
+        "actual_sequence_tokens": batch_tokens(train_batches[0]),
+        "tokens_per_optimizer_step": batch_tokens(train_batches[0]) * args.grad_accum_steps,
+        "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / measured_elapsed,
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
         "state_bytes": state_bytes["total"],
@@ -586,13 +608,13 @@ def print_shape_summary(model_name: str) -> None:
     print_shapes(model_name, remote_shapes)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SumoTrack")
     parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
-    parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="matrices-no-embeddings")
+    parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=192)
@@ -600,21 +622,32 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-texts", type=int, default=8)
     parser.add_argument("--retention-val-texts", type=int, default=8)
-    parser.add_argument("--rank", type=int, default=128)
-    parser.add_argument("--rank-policy", choices=("uniform", "size", "module-role", "spectrum"), default="uniform")
-    parser.add_argument("--min-rank", type=int, default=1)
-    parser.add_argument("--max-rank", type=int, default=0, help="0 means cap only by tensor dimension")
-    parser.add_argument("--optimizer-state-budget-mb", type=float, default=0.0, help="optional matrix-state budget for rank clamping")
-    parser.add_argument("--projection-side-policy", choices=("auto", "module-role"), default="auto")
-    parser.add_argument("--subspace-init", choices=("svd", "random"), default="svd")
+    parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing"), default="residual-facing")
+    parser.add_argument("--basis-init", choices=("svd", "random"), default="svd")
     parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
-    parser.add_argument("--subspace-lr", dest="sumotrack_lr", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
-    parser.add_argument("--subspace-refresh-interval", type=int, default=100)
+    parser.add_argument("--basis-refresh-interval", type=int, default=100)
+    parser.add_argument("--aurora-pp-iterations", type=int, default=2)
+    parser.add_argument("--polar-ns-steps", type=int, default=5)
+    parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
+    parser.add_argument("--torch-compile", action="store_true", help="compile the model forward/backward with torch.compile")
+    parser.add_argument("--attn-implementation", default="", help="optional Transformers attention implementation, e.g. flash_attention_2, sdpa, eager")
+    parser.add_argument("--pad-to-max-length", action="store_true", help="pad batches to seq_len so throughput runs really use the requested token count")
+    parser.add_argument("--pack-sequences", action="store_true", help="pack text into full seq_len blocks without an attention_mask so SDPA can use causal flash kernels")
+    parser.add_argument("--loss-impl", choices=("hf", "chunked", "cce"), default="hf", help="causal LM loss implementation")
+    parser.add_argument("--chunked-lm-loss-tokens", type=int, default=0, help="compute causal LM head/loss in token chunks to avoid full seq*vocab logits allocation")
+    parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
+    parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
     parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SumoTrack update norms; adds reduction overhead")
     parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.warmup_steps < 0:
@@ -623,11 +656,18 @@ def main() -> None:
         raise ValueError("measure_steps must be positive")
     if args.grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive")
-    if args.min_rank <= 0:
-        raise ValueError("min_rank must be positive")
-    if args.subspace_refresh_interval <= 0:
-        raise ValueError("subspace_refresh_interval must be positive")
-    args.max_rank = args.max_rank or None
+    if args.rank <= 0:
+        raise ValueError("rank must be positive")
+    if args.basis_refresh_interval <= 0:
+        raise ValueError("basis_refresh_interval must be positive")
+    if args.aurora_pp_iterations <= 0:
+        raise ValueError("aurora_pp_iterations must be positive")
+    if not 1 <= args.polar_ns_steps <= 5:
+        raise ValueError("polar_ns_steps must be in [1, 5]")
+    if args.chunked_lm_loss_tokens < 0:
+        raise ValueError("chunked_lm_loss_tokens must be non-negative")
+    if args.loss_impl == "chunked" and args.chunked_lm_loss_tokens <= 0:
+        raise ValueError("--loss-impl chunked requires --chunked-lm-loss-tokens > 0")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = choose_model(args.model or None)
@@ -649,8 +689,12 @@ def main() -> None:
     print(
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
-        f"rank={args.rank} rank_policy={args.rank_policy} projection_side_policy={args.projection_side_policy} "
-        f"subspace_init={args.subspace_init} subspace_refresh_interval={args.subspace_refresh_interval} orthogonalization=aurora"
+        f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
+        f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} "
+        f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
+        f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
+        f"pad_to_max_length={args.pad_to_max_length} pack_sequences={args.pack_sequences} loss_impl={args.loss_impl} chunked_lm_loss_tokens={args.chunked_lm_loss_tokens} "
+        f"skip_validation={args.skip_validation} consume_grad={not args.keep_grads_after_step}"
     )
 
     for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:

@@ -4,6 +4,7 @@ import torch
 
 import sumotrack
 from sumotrack import SumoTrack, optimizer_state_bytes_by_category
+from sumotrack.optimizer import ORTHOGONALIZATION_SCALE_MODE
 
 
 class SumoTrackTest(unittest.TestCase):
@@ -16,7 +17,9 @@ class SumoTrackTest(unittest.TestCase):
         opt = SumoTrack([weight])
 
         self.assertNotIn("orthogonalization", opt.param_groups[0])
-        self.assertEqual(opt.param_groups[0]["orthogonalization_scale_mode"], "muon")
+        self.assertEqual(ORTHOGONALIZATION_SCALE_MODE, "muon")
+        self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 2)
+        self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 5)
 
     def test_step_updates_matrix_and_fallback_params(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -35,6 +38,37 @@ class SumoTrackTest(unittest.TestCase):
         self.assertGreater(opt.last_step_diagnostics["update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["fallback_update_norm"], 0.0)
+
+    def test_step_consumes_grads_after_projection_by_default(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        bias = torch.nn.Parameter(torch.randn(4))
+        opt = SumoTrack([weight, bias], lr=0.01, rank=2)
+
+        (weight.square().mean() + bias.square().mean()).backward()
+        opt.step()
+
+        self.assertIsNone(weight.grad)
+        self.assertIsNone(bias.grad)
+
+    def test_consume_grad_can_be_disabled_for_debugging(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, consume_grad=False)
+
+        weight.square().mean().backward()
+        opt.step()
+
+        self.assertIsNotNone(weight.grad)
+
+    def test_aurora_cycle_counts_are_configurable(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack([weight], lr=0.01, rank=2, aurora_pp_iterations=1, polar_ns_steps=3)
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 1)
+        self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 3)
+        self.assertEqual(tuple(opt.state[weight]["projected_exp_avg"].shape), (8, 2))
 
     def test_matrix_state_keeps_projected_moment_only(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
@@ -161,9 +195,9 @@ class SumoTrackTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             SumoTrack([weight], param_ecc="bf16+8")
 
-    def test_random_subspace_init_wires_into_matrix_state(self):
+    def test_random_basis_init_wires_into_matrix_state(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SumoTrack([weight], lr=0.01, rank=2, subspace_init="random")
+        opt = SumoTrack([weight], lr=0.01, rank=2, basis_init="random")
 
         weight.grad = torch.randn_like(weight)
         opt.step()
@@ -173,7 +207,7 @@ class SumoTrackTest(unittest.TestCase):
         gram = basis @ basis.mT
         self.assertEqual(tuple(basis.shape), (2, 5))
         self.assertTrue(torch.allclose(gram, torch.eye(2), atol=1e-5))
-        self.assertEqual(opt.param_groups[0]["subspace_init"], "random")
+        self.assertEqual(opt.param_groups[0]["basis_init"], "random")
 
     def test_muon_scale_uses_original_matrix_shape_not_projected_rank(self):
         update = torch.ones(1024, 64)
@@ -204,7 +238,7 @@ class SumoTrackTest(unittest.TestCase):
         heavyball_update = SumoTrack._heavyball_polar(update)
         aurora_update = SumoTrack._orthogonalize_aurora(
             update,
-            {"orthogonalization_scale_mode": "none", "aurora_pp_iterations": 2, "aurora_pp_beta": 0.5},
+            {},
             update.shape,
         )
 
@@ -221,7 +255,7 @@ class SumoTrackTest(unittest.TestCase):
 
         aurora_updates = SumoTrack._orthogonalize_aurora(
             updates,
-            {"orthogonalization_scale_mode": "none", "aurora_pp_iterations": 2, "aurora_pp_beta": 0.5},
+            {},
             updates.shape[-2:],
         )
 
@@ -251,7 +285,7 @@ class SumoTrackTest(unittest.TestCase):
 
     def test_refresh_interval_updates_all_bases_on_interval_step(self):
         params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
-        opt = SumoTrack(params, subspace_refresh_interval=2)
+        opt = SumoTrack(params, basis_refresh_interval=2)
         group = opt.param_groups[0]
 
         first = opt._refresh_param_ids(group, params)
@@ -263,8 +297,8 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(third, {id(param) for param in params})
 
     def test_log_norm_diagnostics_include_projected_leverage(self):
-        weight = torch.nn.Parameter(torch.randn(8, 5))
-        opt = SumoTrack([weight], lr=0.01, rank=2)
+        weight = torch.nn.Parameter(torch.randn(256, 16))
+        opt = SumoTrack([weight], lr=0.01, rank=16)
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -282,7 +316,7 @@ class SumoTrackTest(unittest.TestCase):
             lr=0.01,
             rank=2,
             grassmann_step_size=0.01,
-            subspace_refresh_interval=1,
+            basis_refresh_interval=1,
         )
 
         weight.grad = torch.randn_like(weight)
@@ -291,13 +325,14 @@ class SumoTrackTest(unittest.TestCase):
         old_basis = state["basis"].clone()
         old_moment = state["projected_exp_avg"].clone()
 
-        weight.grad = torch.randn_like(weight)
+        second_grad = torch.randn_like(weight)
+        weight.grad = second_grad.clone()
         old_lifted_moment = old_moment @ old_basis
         opt.step()
 
         new_basis = state["basis"]
         transported = old_lifted_moment @ new_basis.mT
-        self.assertTrue(torch.allclose(state["projected_exp_avg"], 0.9 * transported + 0.1 * (weight.grad @ new_basis.mT), atol=1e-5))
+        self.assertTrue(torch.allclose(state["projected_exp_avg"], 0.9 * transported + 0.1 * (second_grad @ new_basis.mT), atol=1e-5))
         self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
 
 

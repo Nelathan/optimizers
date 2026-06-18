@@ -13,10 +13,21 @@ from heavyball import utils as heavyball_utils
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
 
 
+AURORA_PP_ITERATIONS = 2
+AURORA_PP_BETA = 0.5
+ORTHOGONALIZATION_SCALE_MODE = "muon"
+NEWTON_SCHULZ_COEFFICIENTS = (
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+)
+
+
 @dataclass
 class MatrixUpdate:
     param: Tensor
-    grad: Tensor
     projector: SubspaceProjector
     projected_grad: Tensor
     projected_exp_avg: Tensor
@@ -42,9 +53,12 @@ class SumoTrack(Optimizer):
         weight_decay: float = 0.0,
         rank: int = 32,
         side: ProjectionSide | str = ProjectionSide.AUTO,
-        subspace_init: str = "svd",
+        basis_init: str = "svd",
         grassmann_step_size: float = 0.01,
-        subspace_refresh_interval: int = 100,
+        basis_refresh_interval: int = 100,
+        aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
+        polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
+        consume_grad: bool = True,
         ecc: str | None = None,
         param_ecc: str | None = None,
     ) -> None:
@@ -65,11 +79,15 @@ class SumoTrack(Optimizer):
             raise ValueError(f"weight_decay must be non-negative, got {weight_decay}")
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
-        subspace_init = ProjectorInitMethod(subspace_init).value
+        basis_init = ProjectorInitMethod(basis_init).value
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
-        if subspace_refresh_interval <= 0:
-            raise ValueError(f"subspace_refresh_interval must be positive, got {subspace_refresh_interval}")
+        if basis_refresh_interval <= 0:
+            raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
+        if aurora_pp_iterations <= 0:
+            raise ValueError(f"aurora_pp_iterations must be positive, got {aurora_pp_iterations}")
+        if not 1 <= polar_ns_steps <= len(NEWTON_SCHULZ_COEFFICIENTS):
+            raise ValueError(f"polar_ns_steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {polar_ns_steps}")
 
         defaults = dict(
             lr=lr,
@@ -79,13 +97,13 @@ class SumoTrack(Optimizer):
             weight_decay=weight_decay,
             rank=rank,
             side=ProjectionSide(side).value,
-            orthogonalization_scale_mode="muon",
-            aurora_pp_iterations=2,
-            aurora_pp_beta=0.5,
-            subspace_init=subspace_init,
+            basis_init=basis_init,
             grassmann_step_size=grassmann_step_size,
-            subspace_refresh_interval=subspace_refresh_interval,
-            subspace_refresh_step=0,
+            basis_refresh_interval=basis_refresh_interval,
+            aurora_pp_iterations=aurora_pp_iterations,
+            polar_ns_steps=polar_ns_steps,
+            consume_grad=consume_grad,
+            basis_refresh_step=0,
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
@@ -98,20 +116,7 @@ class SumoTrack(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        diagnostics = (
-            {
-                "matrix_update_norm_sq": 0.0,
-                "fallback_update_norm_sq": 0.0,
-                "matrix_params": 0,
-                "fallback_params": 0,
-                "projected_leverage_cv_sum": 0.0,
-                "projected_leverage_min_ratio_sum": 0.0,
-                "projected_leverage_max_ratio_sum": 0.0,
-                "projected_leverage_tensors": 0,
-            }
-            if self.diagnostics_enabled
-            else None
-        )
+        diagnostics = self._new_diagnostics()
 
         for group in self.param_groups:
             matrix_params = [p for p in group["params"] if p.grad is not None and p.ndim == 2]
@@ -126,37 +131,50 @@ class SumoTrack(Optimizer):
                     raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
                     matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids))
+                    if group["consume_grad"]:
+                        p.grad = None
                 else:
                     self._step_fallback_param(p, grad, group, diagnostics)
+                    if group["consume_grad"]:
+                        p.grad = None
             self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
 
-        if diagnostics is not None:
-            matrix_update_norm = diagnostics["matrix_update_norm_sq"] ** 0.5
-            fallback_update_norm = diagnostics["fallback_update_norm_sq"] ** 0.5
-            diagnostics["matrix_update_norm"] = matrix_update_norm
-            diagnostics["fallback_update_norm"] = fallback_update_norm
-            diagnostics["update_norm"] = (diagnostics["matrix_update_norm_sq"] + diagnostics["fallback_update_norm_sq"]) ** 0.5
-            count = diagnostics["projected_leverage_tensors"]
-            if count:
-                diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count
-                diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count
-                diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count
-            else:
-                diagnostics["mean_projected_leverage_cv"] = float("nan")
-                diagnostics["mean_projected_leverage_min_ratio"] = float("nan")
-                diagnostics["mean_projected_leverage_max_ratio"] = float("nan")
-            self.last_step_diagnostics = diagnostics
-        else:
-            self.last_step_diagnostics = {}
+        self.last_step_diagnostics = self._finalize_diagnostics(diagnostics)
 
         return loss
+
+    def _new_diagnostics(self) -> dict[str, float] | None:
+        if not self.diagnostics_enabled:
+            return None
+        return {
+            "matrix_update_norm_sq": 0.0,
+            "fallback_update_norm_sq": 0.0,
+            "matrix_params": 0,
+            "fallback_params": 0,
+            "projected_leverage_cv_sum": 0.0,
+            "projected_leverage_min_ratio_sum": 0.0,
+            "projected_leverage_max_ratio_sum": 0.0,
+            "projected_leverage_tensors": 0,
+        }
+
+    def _finalize_diagnostics(self, diagnostics: dict[str, float] | None) -> dict[str, float]:
+        if diagnostics is None:
+            return {}
+        diagnostics["matrix_update_norm"] = diagnostics["matrix_update_norm_sq"] ** 0.5
+        diagnostics["fallback_update_norm"] = diagnostics["fallback_update_norm_sq"] ** 0.5
+        diagnostics["update_norm"] = (diagnostics["matrix_update_norm_sq"] + diagnostics["fallback_update_norm_sq"]) ** 0.5
+        count = diagnostics["projected_leverage_tensors"]
+        diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
+        diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
+        diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count if count else float("nan")
+        return diagnostics
 
     def _refresh_param_ids(self, group: dict, matrix_params: list[Tensor]) -> set[int]:
         if not matrix_params:
             return set()
-        step = group["subspace_refresh_step"]
-        group["subspace_refresh_step"] = step + 1
-        if step > 0 and step % group["subspace_refresh_interval"] == 0:
+        step = group["basis_refresh_step"]
+        group["basis_refresh_step"] = step + 1
+        if step > 0 and step % group["basis_refresh_interval"] == 0:
             return {id(param) for param in matrix_params}
         return set()
 
@@ -177,7 +195,6 @@ class SumoTrack(Optimizer):
 
         return MatrixUpdate(
             param=p,
-            grad=grad,
             projector=projector,
             projected_grad=projected_grad,
             projected_exp_avg=projected_exp_avg,
@@ -191,12 +208,7 @@ class SumoTrack(Optimizer):
         buckets: dict[tuple, list[MatrixUpdate]] = {}
         for entry in entries:
             projected_exp_avg = entry.projected_exp_avg
-            key = (
-                tuple(projected_exp_avg.shape),
-                entry.original_shape,
-                projected_exp_avg.dtype,
-                projected_exp_avg.device,
-            )
+            key = (tuple(projected_exp_avg.shape), entry.original_shape)
             buckets.setdefault(key, []).append(entry)
 
         for bucket_entries in buckets.values():
@@ -293,21 +305,28 @@ class SumoTrack(Optimizer):
         return SumoTrack._orthogonalize_aurora(update, group, original_shape)
 
     @staticmethod
-    def _orthogonalize_aurora(update: Tensor, group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
+    def _orthogonalize_aurora(update: Tensor, _group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
         aurora_update = SumoTrack._aurora_leverage_uniform_polar(
             update,
-            pp_iterations=group["aurora_pp_iterations"],
-            pp_beta=group["aurora_pp_beta"],
+            pp_iterations=_group.get("aurora_pp_iterations", AURORA_PP_ITERATIONS),
+            pp_beta=AURORA_PP_BETA,
+            polar_ns_steps=_group.get("polar_ns_steps", len(NEWTON_SCHULZ_COEFFICIENTS)),
         )
         return SumoTrack._scale_orthogonalized_update(
             update,
             aurora_update,
-            group["orthogonalization_scale_mode"],
+            ORTHOGONALIZATION_SCALE_MODE,
             original_shape,
         )
 
     @staticmethod
-    def _aurora_leverage_uniform_polar(update: Tensor, pp_iterations: int = 2, pp_beta: float = 0.5, eps: float = 1e-7) -> Tensor:
+    def _aurora_leverage_uniform_polar(
+        update: Tensor,
+        pp_iterations: int = 2,
+        pp_beta: float = 0.5,
+        eps: float = 1e-7,
+        polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
+    ) -> Tensor:
         """Aurora-style leverage-uniform polar direction for rectangular projected moments.
 
         SumoTrack owns momentum, LR, weight decay, and full-matrix Muon scaling. This
@@ -323,8 +342,10 @@ class SumoTrack(Optimizer):
             raise ValueError(f"pp_iterations must be >= 1, got {pp_iterations}")
         if pp_beta <= 0:
             raise ValueError(f"pp_beta must be positive, got {pp_beta}")
+        if not 1 <= polar_ns_steps <= len(NEWTON_SCHULZ_COEFFICIENTS):
+            raise ValueError(f"polar_ns_steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {polar_ns_steps}")
         if update.shape[-2] == update.shape[-1]:
-            return SumoTrack._heavyball_polar(update)
+            return SumoTrack._heavyball_polar(update, steps=polar_ns_steps)
 
         transposed = update.shape[-2] < update.shape[-1]
         work = update.mT if transposed else update
@@ -334,7 +355,7 @@ class SumoTrack(Optimizer):
         diagonal = work32.norm(dim=-1, keepdim=True).clamp_min(eps).reciprocal()
         balanced = None
         for iteration in range(pp_iterations):
-            balanced = SumoTrack._heavyball_polar(diagonal * work32).float()
+            balanced = SumoTrack._heavyball_polar(diagonal * work32, steps=polar_ns_steps).float()
             if iteration < pp_iterations - 1:
                 row_sq = balanced.square().sum(dim=-1, keepdim=True).clamp_min(eps * eps)
                 diagonal = diagonal * (target_row_sq / row_sq).pow(pp_beta)
@@ -343,29 +364,21 @@ class SumoTrack(Optimizer):
         return result.to(device=update.device, dtype=update.dtype)
 
     @staticmethod
-    def _heavyball_polar(update: Tensor) -> Tensor:
-        if update.ndim > 2:
-            return SumoTrack._batched_newton_schulz5(update)
-        work = update.clone()
-        heavyball_utils.inplace_orthogonal_(work, mode="newtonschulz", out=work, scale_mode="none")
-        return work
+    def _heavyball_polar(update: Tensor, steps: int = len(NEWTON_SCHULZ_COEFFICIENTS)) -> Tensor:
+        return SumoTrack._batched_newton_schulz(update, steps=steps)
 
     @staticmethod
-    def _batched_newton_schulz5(update: Tensor, eps: float = 1e-7) -> Tensor:
+    def _batched_newton_schulz(update: Tensor, steps: int = len(NEWTON_SCHULZ_COEFFICIENTS), eps: float = 1e-7) -> Tensor:
         if update.ndim < 2:
             raise ValueError(f"Newton-Schulz orthogonalization expects at least 2D input, got shape {tuple(update.shape)}")
+        if not 1 <= steps <= len(NEWTON_SCHULZ_COEFFICIENTS):
+            raise ValueError(f"steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {steps}")
         work = update.float()
         work = work / work.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
         transposed = work.shape[-2] > work.shape[-1]
         x = work.mT if transposed else work
 
-        for a, b, c in [
-            (4.0848, -6.8946, 2.9270),
-            (3.9505, -6.3029, 2.6377),
-            (3.7418, -5.5913, 2.3037),
-            (2.8769, -3.1427, 1.2046),
-            (2.8366, -3.0525, 1.2012),
-        ]:
+        for a, b, c in NEWTON_SCHULZ_COEFFICIENTS[:steps]:
             gram = x @ x.mT
             y = c * gram
             y.diagonal(dim1=-2, dim2=-1).add_(b)
@@ -420,7 +433,7 @@ class SumoTrack(Optimizer):
         projector = SubspaceProjector(
             rank=group["rank"],
             side=ProjectionSide(group["side"]),
-            init_method=ProjectorInitMethod(group["subspace_init"]),
+            init_method=ProjectorInitMethod(group["basis_init"]),
         )
         basis = state.get("basis")
         if basis is not None:
