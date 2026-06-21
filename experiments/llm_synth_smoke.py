@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import sys
 import time
 from pathlib import Path
@@ -10,7 +9,6 @@ from typing import Literal
 
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,22 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sumotrack import SumoTrack, optimizer_state_bytes_by_category
 
 
-PREFERRED_MODELS = (
-    "LiquidAI/LFM2.5-1.2B-Base",
-    "Qwen/Qwen3.5-2B-Base",
-    "Qwen/Qwen3-4B",
-)
+DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing"]
-LossImpl = Literal["hf", "chunked", "cce"]
-
-
-def cached_model_snapshots(model_name: str) -> list[Path]:
-    cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{model_name.replace('/', '--')}" / "snapshots"
-    if not cache_dir.exists():
-        return []
-    return sorted([path for path in cache_dir.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 @torch.no_grad()
@@ -95,33 +81,19 @@ def synth_texts(data_dir: Path, split: str, limit: int) -> list[str]:
     return texts
 
 
-def choose_model(explicit: str | None) -> str:
-    candidates = (explicit,) if explicit else PREFERRED_MODELS
-    errors = []
-    for name in candidates:
-        try:
-            AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=True)
-            has_weights = any(snapshot.glob("*.safetensors") for snapshot in cached_model_snapshots(name)) or any(
-                snapshot.glob("*.bin") for snapshot in cached_model_snapshots(name)
-            )
-            if not has_weights:
-                raise FileNotFoundError(f"tokenizer/config cached but no local weight files for {name}")
-            return name
-        except Exception as error:  # noqa: BLE001 - printed as terrain
-            errors.append(f"{name}: {type(error).__name__}: {error}")
-    raise RuntimeError("No preferred model tokenizer is cached locally:\n" + "\n".join(errors))
+def packed_text_limit(blocks: int, batch_size: int, seq_len: int) -> int:
+    # SYNTH rows are often shorter than 1k tokens, so row count must scale with
+    # requested token blocks. The packer still verifies enough real tokens exist.
+    return max(blocks * batch_size, (blocks * batch_size * seq_len + 511) // 512, 16)
 
 
 def load_model_and_tokenizer(model_name: str, device: torch.device, activation_checkpointing: bool, attn_implementation: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model_kwargs = {}
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        local_files_only=True,
         trust_remote_code=True,
         dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         low_cpu_mem_usage=True,
@@ -252,43 +224,27 @@ def build_sumotrack_param_groups(
 
 
 def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, min_batches: int):
-    encoded = tokenizer("\n\n".join(texts), return_tensors="pt", add_special_tokens=False)["input_ids"].flatten()
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise RuntimeError("tokenizer must define eos_token_id for packed no-mask LM batches")
+    stream: list[int] = []
     needed = max(min_batches, 1) * batch_size * seq_len
-    if encoded.numel() < 2:
-        raise RuntimeError("not enough tokens to build packed batches")
-    repeats = (needed + encoded.numel() - 1) // encoded.numel()
-    tokens = encoded.repeat(repeats)[:needed].view(max(min_batches, 1), batch_size, seq_len).to(device)
+    for text in texts:
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not token_ids:
+            continue
+        stream.extend(token_ids)
+        stream.append(eos_token_id)
+        if len(stream) >= needed:
+            break
+    if len(stream) < needed:
+        raise RuntimeError(f"not enough real tokens to build packed batches: need {needed}, got {len(stream)}")
+    tokens = torch.tensor(stream[:needed], dtype=torch.long).view(max(min_batches, 1), batch_size, seq_len).to(device)
     return [{"input_ids": batch, "labels": batch.clone()} for batch in tokens]
-
-
-def make_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, pad_to_max_length: bool):
-    batches = []
-    for start in range(0, len(texts), batch_size):
-        encoded = tokenizer(
-            texts[start : start + batch_size],
-            return_tensors="pt",
-            padding="max_length" if pad_to_max_length else True,
-            truncation=True,
-            max_length=seq_len,
-        )
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-        batches.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": input_ids.clone()})
-    return batches
 
 
 def batch_tokens(batch: dict[str, torch.Tensor]) -> int:
     return int(batch["input_ids"].numel())
-
-
-@torch.no_grad()
-def evaluate_loss(model, batches) -> float:
-    model.eval()
-    losses = []
-    for batch in batches:
-        losses.append(float(model(**batch).loss.detach().float().cpu()))
-    model.train()
-    return sum(losses) / len(losses)
 
 
 def _inner_causal_lm_modules(model):
@@ -296,7 +252,7 @@ def _inner_causal_lm_modules(model):
     base = getattr(inner, "model", None)
     lm_head = getattr(inner, "lm_head", None)
     if base is None or lm_head is None:
-        raise RuntimeError("chunked LM loss requires a causal LM with .model and .lm_head modules")
+        raise RuntimeError("CCE LM loss requires a causal LM with .model and .lm_head modules")
     return base, lm_head
 
 
@@ -306,63 +262,23 @@ def cce_causal_lm_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     base, lm_head = _inner_causal_lm_modules(model)
     outputs = base(
         input_ids=batch["input_ids"],
-        attention_mask=batch.get("attention_mask"),
         use_cache=False,
     )
-    targets = batch["input_ids"]
-    attention_mask = batch.get("attention_mask")
-    if attention_mask is not None:
-        targets = targets.masked_fill(attention_mask == 0, -100)
-    return linear_cross_entropy(outputs.last_hidden_state, lm_head.weight, targets, ignore_index=-100, shift=True)
-
-
-def chunked_causal_lm_loss(model, batch: dict[str, torch.Tensor], chunk_tokens: int, loss_impl: LossImpl) -> torch.Tensor:
-    if loss_impl == "hf":
-        return model(**batch).loss
-    if loss_impl == "cce":
-        return cce_causal_lm_loss(model, batch)
-    if chunk_tokens <= 0:
-        raise ValueError("chunked loss requires chunked_lm_loss_tokens > 0")
-    base, lm_head = _inner_causal_lm_modules(model)
-    outputs = base(
-        input_ids=batch["input_ids"],
-        attention_mask=batch.get("attention_mask"),
-        use_cache=False,
-    )
-    hidden = outputs.last_hidden_state
-    input_ids = batch["input_ids"]
-    attention_mask = batch.get("attention_mask")
-    total_loss = hidden.new_zeros(())
-    total_items = 0
-    for start in range(0, hidden.shape[1] - 1, chunk_tokens):
-        end = min(start + chunk_tokens, hidden.shape[1] - 1)
-        logits = lm_head(hidden[:, start:end, :]).float()
-        labels = input_ids[:, start + 1 : end + 1]
-        if attention_mask is not None:
-            labels = labels.masked_fill(attention_mask[:, start + 1 : end + 1] == 0, -100)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            labels.reshape(-1).to(logits.device),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        total_loss = total_loss + loss
-        total_items += int((labels != -100).sum().detach().cpu())
-    if total_items == 0:
-        raise RuntimeError("chunked LM loss saw zero non-padding target tokens")
-    return total_loss / total_items
+    return linear_cross_entropy(outputs.last_hidden_state, lm_head.weight, batch["input_ids"], ignore_index=-100, shift=True)
 
 
 @torch.no_grad()
-def evaluate_loss_chunked(model, batches, chunk_tokens: int, loss_impl: LossImpl) -> float:
-    if loss_impl == "hf":
-        return evaluate_loss(model, batches)
+def evaluate_loss(model, batches) -> float:
+    was_training = model.training
     model.eval()
-    losses = []
-    for batch in batches:
-        losses.append(float(chunked_causal_lm_loss(model, batch, chunk_tokens, loss_impl).detach().float().cpu()))
-    model.train()
-    return sum(losses) / len(losses)
+    try:
+        losses = []
+        for batch in batches:
+            losses.append(cce_causal_lm_loss(model, batch).detach().float())
+        return float(torch.stack(losses).mean().cpu())
+    finally:
+        if was_training:
+            model.train()
 
 
 def train_step(
@@ -373,23 +289,21 @@ def train_step(
     start_index: int,
     grad_accum_steps: int,
     log_norms: bool,
-    chunked_lm_loss_tokens: int,
-    loss_impl: LossImpl,
 ) -> dict[str, float]:
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
         batch = batches[(start_index + offset) % len(batches)]
-        loss = chunked_causal_lm_loss(model, batch, chunked_lm_loss_tokens, loss_impl)
+        loss = cce_causal_lm_loss(model, batch)
         (loss / grad_accum_steps).backward()
-        losses.append(float(loss.detach().float().cpu()))
+        losses.append(loss.detach().float())
     grad_norm = gradient_norm(trainable) if log_norms else float("nan")
     param_norm = parameter_norm(trainable) if log_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if log_norms else float("nan")
     leverage_cv, leverage_min_ratio, leverage_max_ratio = optimizer_projected_leverage_stats(optimizer) if log_norms else (float("nan"), float("nan"), float("nan"))
     return {
-        "loss": sum(losses) / len(losses),
+        "loss": float(torch.stack(losses).mean().cpu()),
         "grad_norm": grad_norm,
         "param_norm": param_norm,
         "update_norm": update_norm,
@@ -430,14 +344,9 @@ def run_optimizer(
         args.rank,
         args.projection_side_policy,
     )
-    if args.pack_sequences:
-        train_batches = make_packed_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps)
-        val_batches = make_packed_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, max(args.val_texts, 1))
-        retention_batches = make_packed_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, max(args.retention_val_texts, 1)) if retention_texts else None
-    else:
-        train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length)
-        val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length)
-        retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.pad_to_max_length) if retention_texts else None
+    train_batches = make_packed_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps)
+    val_batches = make_packed_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks)
+    retention_batches = make_packed_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks) if retention_texts else None
 
     if args.torch_compile:
         model = torch.compile(model)
@@ -463,13 +372,13 @@ def run_optimizer(
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
 
-    initial_val = evaluate_loss_chunked(model, val_batches, args.chunked_lm_loss_tokens, args.loss_impl) if not args.skip_validation else float("nan")
-    initial_retention_val = evaluate_loss_chunked(model, retention_batches, args.chunked_lm_loss_tokens, args.loss_impl) if retention_batches is not None and not args.skip_validation else float("nan")
+    initial_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
+    initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     measured_steps = []
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
-        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms, args.chunked_lm_loss_tokens, args.loss_impl)
+        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -477,12 +386,12 @@ def run_optimizer(
     start_time = time.perf_counter()
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
-        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms, args.chunked_lm_loss_tokens, args.loss_impl))
+        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
-    final_val = evaluate_loss_chunked(model, val_batches, args.chunked_lm_loss_tokens, args.loss_impl) if not args.skip_validation else float("nan")
-    final_retention_val = evaluate_loss_chunked(model, retention_batches, args.chunked_lm_loss_tokens, args.loss_impl) if retention_batches is not None and not args.skip_validation else float("nan")
+    final_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
+    final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
@@ -510,10 +419,8 @@ def run_optimizer(
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
-        "pad_to_max_length": args.pad_to_max_length,
-        "pack_sequences": args.pack_sequences,
-        "loss_impl": args.loss_impl,
-        "chunked_lm_loss_tokens": args.chunked_lm_loss_tokens,
+        "batching": "eos_packed_no_mask",
+        "loss_impl": "cce",
         "skip_validation": args.skip_validation,
         "actual_sequence_tokens": batch_tokens(train_batches[0]),
         "tokens_per_optimizer_step": batch_tokens(train_batches[0]) * args.grad_accum_steps,
@@ -545,83 +452,20 @@ def run_optimizer(
     return result
 
 
-def local_safetensor_shapes(model_name: str) -> dict[str, tuple[int, ...]]:
-    for snapshot in cached_model_snapshots(model_name):
-        index_path = snapshot / "model.safetensors.index.json"
-        if index_path.exists():
-            with index_path.open("r", encoding="utf-8") as handle:
-                index = json.load(handle)
-            # Index files usually omit shape metadata; fall through to shard headers.
-            safetensors_paths = sorted({snapshot / file_name for file_name in index.get("weight_map", {}).values()})
-        else:
-            safetensors_paths = sorted(snapshot.glob("*.safetensors"))
-        if not safetensors_paths:
-            continue
-
-        shapes: dict[str, tuple[int, ...]] = {}
-        for path in safetensors_paths:
-            with path.open("rb") as handle:
-                header_size = int.from_bytes(handle.read(8), byteorder="little")
-                header = json.loads(handle.read(header_size))
-            for tensor_name, tensor_info in header.items():
-                if tensor_name == "__metadata__":
-                    continue
-                shapes[tensor_name] = tuple(tensor_info["shape"])
-        return shapes
-    return {}
-
-
-def print_shapes(model_name: str, shapes: dict[str, tuple[int, ...]]) -> None:
-    shapes_by_dim: dict[int, tuple[int, int]] = {}
-    total_params = 0
-    for shape in shapes.values():
-        dim = len(shape)
-        count, params = shapes_by_dim.get(dim, (0, 0))
-        param_count = 1
-        for size in shape:
-            param_count *= size
-        total_params += param_count
-        shapes_by_dim[dim] = (count + 1, params + param_count)
-
-    print(f"shape_summary_model={model_name}")
-    print(f"shape_summary_total_params={total_params}")
-    for dim, (count, params) in sorted(shapes_by_dim.items()):
-        print(f"shape_summary_dim_{dim}_tensors={count}")
-        print(f"shape_summary_dim_{dim}_params={params}")
-    for tensor_name, shape in sorted(shapes.items()):
-        if len(shape) == 3:
-            print(f"shape_summary_3d={tensor_name}:{shape}")
-
-
-def print_shape_summary(model_name: str) -> None:
-    local_shapes = local_safetensor_shapes(model_name)
-    if local_shapes:
-        print_shapes(model_name, local_shapes)
-        return
-
-    from huggingface_hub import get_safetensors_metadata
-
-    metadata = get_safetensors_metadata(model_name)
-    remote_shapes = {}
-    for tensor_name, tensor_info in metadata.tensors.items():
-        remote_shapes[tensor_name] = tuple(tensor_info.shape)
-    print_shapes(model_name, remote_shapes)
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Short cached pretrained-LLM SYNTH smoke for SumoTrack")
-    parser.add_argument("--model", default="LiquidAI/LFM2.5-1.2B-Base", help="HF model name; default = cached LFM 1.2B")
+    parser = argparse.ArgumentParser(description="Short pretrained-LLM SYNTH smoke for SumoTrack")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"HF model name; default = {DEFAULT_MODEL}")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=3)
-    parser.add_argument("--seq-len", type=int, default=192)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--val-texts", type=int, default=8)
-    parser.add_argument("--retention-val-texts", type=int, default=8)
+    parser.add_argument("--val-blocks", type=int, default=8, help="number of packed validation blocks")
+    parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of packed retention validation blocks")
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing"), default="residual-facing")
     parser.add_argument("--basis-init", choices=("svd", "random"), default="svd")
@@ -635,14 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
     parser.add_argument("--torch-compile", action="store_true", help="compile the model forward/backward with torch.compile")
     parser.add_argument("--attn-implementation", default="", help="optional Transformers attention implementation, e.g. flash_attention_2, sdpa, eager")
-    parser.add_argument("--pad-to-max-length", action="store_true", help="pad batches to seq_len so throughput runs really use the requested token count")
-    parser.add_argument("--pack-sequences", action="store_true", help="pack text into full seq_len blocks without an attention_mask so SDPA can use causal flash kernels")
-    parser.add_argument("--loss-impl", choices=("hf", "chunked", "cce"), default="hf", help="causal LM loss implementation")
-    parser.add_argument("--chunked-lm-loss-tokens", type=int, default=0, help="compute causal LM head/loss in token chunks to avoid full seq*vocab logits allocation")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
     parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SumoTrack update norms; adds reduction overhead")
-    parser.add_argument("--print-shape-summary", action="store_true", help="print HF safetensor shape metadata and exit")
     return parser
 
 
@@ -656,6 +495,14 @@ def main() -> None:
         raise ValueError("measure_steps must be positive")
     if args.grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive")
+    if args.seq_len <= 1:
+        raise ValueError("seq_len must be greater than 1")
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if args.val_blocks <= 0:
+        raise ValueError("val_blocks must be positive")
+    if args.retention_val_blocks <= 0:
+        raise ValueError("retention_val_blocks must be positive")
     if args.rank <= 0:
         raise ValueError("rank must be positive")
     if args.basis_refresh_interval <= 0:
@@ -664,23 +511,18 @@ def main() -> None:
         raise ValueError("aurora_pp_iterations must be positive")
     if not 1 <= args.polar_ns_steps <= 5:
         raise ValueError("polar_ns_steps must be in [1, 5]")
-    if args.chunked_lm_loss_tokens < 0:
-        raise ValueError("chunked_lm_loss_tokens must be non-negative")
-    if args.loss_impl == "chunked" and args.chunked_lm_loss_tokens <= 0:
-        raise ValueError("--loss-impl chunked requires --chunked-lm-loss-tokens > 0")
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = choose_model(args.model or None)
-    if args.print_shape_summary:
-        print_shape_summary(model_name)
-        return
+    model_name = args.model
 
     total_train_steps = args.warmup_steps + args.measure_steps
-    train_texts = synth_texts(Path(args.data_dir), "train", limit=max(total_train_steps * args.grad_accum_steps, 4) * args.batch_size)
-    val_texts = synth_texts(Path(args.data_dir), "val", limit=max(args.val_texts, 1) * args.batch_size)
+    train_blocks = max(total_train_steps * args.grad_accum_steps, 1)
+    val_blocks = args.val_blocks
+    train_texts = synth_texts(Path(args.data_dir), "train", limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len))
+    val_texts = synth_texts(Path(args.data_dir), "val", limit=packed_text_limit(val_blocks, args.batch_size, args.seq_len))
     retention_texts = None
     if args.retention_data_dir:
-        retention_texts = synth_texts(Path(args.retention_data_dir), "val", limit=max(args.retention_val_texts, 1) * args.batch_size)
+        retention_blocks = args.retention_val_blocks
+        retention_texts = synth_texts(Path(args.retention_data_dir), "val", limit=packed_text_limit(retention_blocks, args.batch_size, args.seq_len))
     print(f"device={device}")
     print(f"model={model_name}")
     print(f"data_dir={args.data_dir}")
@@ -693,7 +535,7 @@ def main() -> None:
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
-        f"pad_to_max_length={args.pad_to_max_length} pack_sequences={args.pack_sequences} loss_impl={args.loss_impl} chunked_lm_loss_tokens={args.chunked_lm_loss_tokens} "
+        f"batching=eos_packed_no_mask loss_impl=cce "
         f"skip_validation={args.skip_validation} consume_grad={not args.keep_grads_after_step}"
     )
 

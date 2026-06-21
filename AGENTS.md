@@ -12,6 +12,18 @@ This repo is the SumoTrack lab: a place to design and test a memory-efficient op
 
 The product target is usable distribution adaptation under memory pressure: move a pretrained model across a real data shift without full AdamW state, slow gradient accumulation, or adapter-only capacity limits. The near-term hardware target is a single RTX 5090-class machine training Gemma 4 12B-class models with high tokens per step.
 
+## Working posture
+
+Act as a partner, not an autopilot. The job is not to complete the requested command at all costs; the job is to preserve the question we are trying to answer. If the route stops answering that question, stop and say so before spending more compute or writing more code.
+
+A benchmark is only meaningful when the model, data, loss path, batch shape, attention path, optimizer scope, and measurement target match the intended claim. If any of those drift — a named model is unavailable, a cached substitute appears convenient, HF full-logits loss replaces CCE, padded batches create an `attention_mask`, an ablation sneaks into a benchmark, or a smoke test is being mistaken for product evidence — stop. State the mismatch and the consequence for the claim. Do not paper over it with warnings and continue producing benchmark-shaped garbage.
+
+Do not overcorrect by building option gardens. First make the contract explicit in plain language. If the next move changes defaults, benchmark meaning, model choice, or user-facing workflow, propose the clean design cut and wait for review. Implement only after alignment. Prefer one clean path with explicit stop conditions over many escape hatches.
+
+Every line must earn its place. Do not add flags, branches, adapters, warnings, compatibility layers, or “just in case” scaffolding to preserve momentum. When the system shape is wrong, prefer deletion, simplification, or a sharper boundary over shotgun accommodation. Code that makes invalid states easy to run is worse than missing code.
+
+Keep talking when alignment matters. Short progress notes should expose changed assumptions, invalidated routes, and decisions needed from the user. Silence during a strategic mismatch is a failure mode, even if the code keeps running.
+
 ## Current optimizer invariants
 
 - Public optimizer name: **SumoTrack**.
@@ -30,7 +42,15 @@ The product target is usable distribution adaptation under memory pressure: move
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to broad no-embedding training, uniform rank 64, and residual-facing projection side. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults.
+The LLM harness defaults to broad no-embedding training, uniform rank 64, SVD basis init, residual-facing projection side, EOS-packed no-mask batches, `batch_size=4`, `seq_len=1024`, and CCE loss. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults.
+
+Random basis init is for performance/fit measurements where SVD cold-start cost is explicitly not the claim. For convergence or optimizer-quality work, use the SVD default.
+
+CCE is the loss path because the HF full-logits route is strictly worse for the memory/throughput questions this repo is asking. If a run needs an unoptimized loss route, stop immediately and re-evaluate the plan. Continue only if the work is explicitly reframed as an ablation outside the faithful benchmark path.
+
+EOS-packed no-mask batches are the throughput route because padded batches create `attention_mask` and can disable PyTorch SDPA flash attention in this stack. If a run needs non-packed/padded batches, stop immediately unless padded behavior is the explicit ablation.
+
+Default harness model is `LiquidAI/LFM2.5-350M-Base`. `LiquidAI/LFM2.5-1.2B-Base` remains a reference baseline for continuity, but use it by naming it explicitly.
 
 Rank allocation is uniform. Do not reintroduce rank-allocation knobs without a fresh product-shaped reason and a direct comparison against uniform rank 64.
 
@@ -59,6 +79,10 @@ Avoid these traps:
 - adding HeavyBall-native/ECC plumbing before the algorithm earns it,
 - implementing projected-gradient hooks before ordinary-gradient SumoTrack is proven,
 - expanding harness ceremony without a sharper algorithm question.
+
+If the user names a specific model, dataset, path, or script, treat that as the target contract. If it is unavailable in the current environment, say so plainly, verify the assumption if possible, and ask what to do next. Do not silently substitute a nearby cached or convenient alternative.
+
+If the user says the named thing “should be cached,” treat that as an expectation to verify, not as permission to swap targets.
 
 ## HeavyBall and adjacent repos
 

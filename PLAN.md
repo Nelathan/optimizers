@@ -97,7 +97,7 @@ But very tall rectangular NS may not spread information as well as desired. Auro
 
 SumoTrack should treat Aurora as a **projected direction map**, not as a replacement optimizer. Momentum, basis tracking, full-matrix Muon scaling, LR, fallback semantics, and state accounting remain SumoTrack's responsibility.
 
-Current status: Aurora-style leverage-uniform polar is the projected direction map. Muon scale semantics are fixed, not a user-facing scale-mode knob. `--log-norms` reports projected leverage diagnostics so a run can answer whether the large-side energy actually became more uniform.
+Current status: Aurora-style leverage-uniform polar is the projected direction map. Muon scale semantics are fixed, not a user-facing scale-mode knob. `--log-norms` reports projected leverage diagnostics so a run can answer whether the large-side energy actually became more uniform. Packed SDPA batches, the CCE harness path, and Aurora cycle knobs are now wired through the smoke harness; the remaining question is whether they matter at realistic token counts rather than tiny smokes. Qwen3.5-2B-Base plus `flash-linear-attention` is now present, and `causal-conv1d` is now buildable in this repo environment. The repo floor is pinned to Python 3.13 via `.python-version`.
 
 The Aurora question has moved. A 1k-step broad-no-embeddings LFM/SYNTH target run at rank 64, random init, Grassmann tracking, 768 tokens/step, LR `0.0025`, and Muon scale showed Aurora beating HeavyBall NS on target validation (`1.590971` vs `1.663156`) at matched update/param and identical peak memory, while reducing mean projected leverage CV from `1.2257` to `0.0197`. The measured `~21%` step-time cost happened at an unrealistically small token count, where per-step orthogonalization overhead is least amortized. Treat this as evidence that leverage-uniform rectangular orthogonalization is behaviorally useful, not merely prettier telemetry.
 
@@ -143,10 +143,10 @@ Current implementation invariants:
 - Architecture-aware side policy lives in the LLM harness via named-parameter groups. Rank allocation is uniform. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
-The harness should encode the current boring-best defaults so experiment commands stay lean. Prefer:
+The harness should encode the current boring-best defaults so experiment commands stay lean. The default route is SVD basis init, `batch_size=4`, `seq_len=1024`, EOS-packed no-mask batches plus CCE; HF/full-logits loss or non-packed/padded batches are stop conditions for faithful throughput/memory work. Random basis init is only for performance/fit measurements where SVD cold-start cost is explicitly not the claim. Continue only when the work is explicitly reframed as an unoptimized ablation outside the faithful benchmark path. Prefer:
 
 ```bash
-uv run python experiments/llm_synth_smoke.py --measure-steps 200 --seq-len 4096
+uv run python experiments/llm_synth_smoke.py --measure-steps 200
 ```
 
 over restating defaults such as `--optimizers sumotrack --rank 64 --projection-side-policy residual-facing --param-scope broad-no-embeddings`. Pass an argument only when the run is intentionally changing that axis.
@@ -216,18 +216,22 @@ The next work should improve the algorithm under our feet:
 
 1. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
 2. **Medium SYNTH adaptation run with retention/source validation.** Use the current defaults and a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
-3. **Realistic-token Aurora amortization.** Run 32k+ tokens/optimizer step without `--log-norms` unless diagnostics are the point. Measure tokens/sec, peak CUDA, and whether no-gradient-accumulation is practical.
+3. **Realistic-token Aurora amortization.** Run 32k+ tokens/optimizer step without `--log-norms` unless diagnostics are the point. Measure tokens/sec, peak CUDA, and whether no-gradient-accumulation is practical. The packed 256-token smoke shows cycle knobs matter at tiny shapes, but it does not answer the amortized product question.
+4. **Qwen3.5 fast-path throughput follow-up.** The memory check says `batch=1, seq=1024` fits with random basis init, but `batch=4, seq=1024` is still a near-edge fit/OOM depending on GPU occupancy. The next question is whether batch 3 is the practical ceiling on this card under the faithful CCE/no-mask route.
 
 ## Next session contract
 
-Start from the 1k Aurora result and the side evaluation. Residual-facing side beats AUTO decisively, uniform rank 64 is the harness policy, and Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
+Start from the 1k Aurora result and the side evaluation. Residual-facing side beats AUTO decisively, uniform rank 64 is the harness policy, CCE is the default loss path, and Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
+
+Default harness model is `LiquidAI/LFM2.5-350M-Base`; `LiquidAI/LFM2.5-1.2B-Base` remains a continuity/reference baseline. Use the 1.2B only by naming it explicitly when preserving comparison continuity matters. Do not let cache convenience choose the model.
 
 Minimum useful next session:
 
 1. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
 2. Use the retention/source validation output with a real source corpus, not SYNTH-as-retention.
-3. Measure one realistic-token run using defaults unless deliberately testing one axis.
-4. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or rank-allocation horse races.
+3. Measure one realistic-token run using defaults unless deliberately testing one axis; on the local 12GB card, use random basis init if exact SVD cold-start OOMs again.
+4. If pursuing Qwen3.5, solve the `causal-conv1d` toolchain first; `flash-linear-attention` alone does not clear the target ceiling.
+5. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or rank-allocation horse races.
 
 Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if side-rank wins are noise at longer horizons, revisit the direction map and allocation.
 

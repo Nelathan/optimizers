@@ -252,3 +252,144 @@ Notes:
 - Checkpointing and `torch.compile` were noise at this shape.
 - Reducing Aurora/polar cycles gave a modest optimizer-side speedup; `1` Aurora preconditioning pass and `3` NS steps was ~3.6% faster than the default timing point. This is throughput-only evidence, not quality evidence.
 - The remaining memory wall is LFM layer temporary/activation memory under dense broad training, not optimizer state and not SDPA masking.
+
+## 2026-06-18: Packed SDPA, CCE path, and Aurora-cycle smoke
+
+Question: do packed batches keep SDPA on the flash path, does the CCE harness path run, and do Aurora cycle knobs buy real throughput on the local 12GB card?
+
+Setup:
+
+- Model/data: `LiquidAI/LFM2.5-1.2B-Base`, local SYNTH, `HF_HUB_OFFLINE=1`.
+- Scope: `--param-scope broad-no-embeddings`, rank 64, residual-facing side.
+- Shape: packed `seq_len=256`, `batch_size=1`, `--skip-validation`.
+- Init: `basis_init=random` for perf-path smoke; exact SVD init OOMed at this shape on the local card.
+- Loss paths: `hf` and `cce` (`--chunked-lm-loss-tokens 128`).
+
+Results:
+
+| loss / Aurora cycles | tokens/step | step seconds | tokens/sec | peak CUDA |
+| --- | ---: | ---: | ---: | ---: |
+| HF / default `2/5` | 256 | 0.220295 | 1162.079 | 4.53 GB |
+| HF / reduced `1/3` | 256 | 0.086944 | 2944.421 | 4.53 GB |
+| CCE / default `2/5` | 256 | 0.187094 | 1368.299 | 4.53 GB |
+
+Notes:
+
+- Packed batches omit `attention_mask`, so the harness keeps SDPA flash eligibility instead of falling back to padded-mask behavior.
+- The CCE path works in this harness shape with random basis init.
+- On this tiny-token smoke, lowering Aurora preconditioning / Newton-Schulz cycles was a big throughput win with no visible memory change. That is optimizer-side overhead amortization, not a quality claim.
+- SVD basis initialization is still the cold-start tax; on this 12GB card it OOMed at the same packed shape, so throughput-path runs should use random init unless the init cost is the point.
+- Follow-up packed smoke at `seq_len=512`, `batch_size=2` (1024 tokens/step, random init, HF loss) sharpened the cycle story: default `2/5` cycles OOMed on this card, while reduced `1/3` cycles fit and ran at `5701 tok/s` with `5.27 GB` peak CUDA. Cycle count is therefore not just a micro-optimization at this shape; it can be the difference between fit and no fit.
+- These throughput numbers were taken without `causal-conv1d`; the environment fell back to LFM2's Torch `Conv1d` short-conv path because no Triton/`causal-conv1d` package was installed.
+
+## 2026-06-18: Qwen3.5-2B-Base + FLA pull
+
+Question: does pulling Qwen3.5-2B-Base plus `flash-linear-attention` lift the local 12GB throughput ceiling?
+
+Setup:
+
+- Model: `Qwen/Qwen3.5-2B-Base`, now fully cached locally.
+- Extra dependency: `flash-linear-attention` installed successfully; `causal-conv1d` build was attempted but failed because the environment lacks `nvcc` and the package does not cleanly build under the current Python/CUDA toolchain.
+- Fast-path status: transformers still reports Qwen3.5 fast path unavailable because one required library is missing, so the model falls back to Torch for the short-conv path.
+
+Results:
+
+| shape | outcome | tokens/sec | peak CUDA |
+| --- | --- | ---: | ---: |
+| `batch=1, seq=128` | fit | 661 | 6.66 GB |
+| `batch=2, seq=1024` | OOM in MLP | n/a | ~10.30 GB |
+| `batch=4, seq=1024` | OOM | n/a | ~10.30 GB |
+
+Notes:
+
+- Qwen3.5 does load and train offline, but without `causal-conv1d` it does not unlock the intended fast path.
+- The model switch alone does not buy the bs4×1k target on this 12GB card; it still blows up around the MLP/activation side before the optimizer matters.
+- Net: `flash-linear-attention` is useful, but it is not the missing piece by itself.
+
+## 2026-06-18: causal-conv1d build blocker
+
+Question: can `causal-conv1d` be made uv-native on this Fedora box without hand-built hacks?
+
+Findings:
+
+- The project floor was dropped to Python `3.13`, and `uv sync --python 3.13` works.
+- `uv add causal-conv1d --no-build-isolation-package causal-conv1d --no-binary-package causal-conv1d` still fails when the build uses the local CUDA 13.3 toolkit.
+- The actual blocker is the host compiler: Fedora ships GCC `16.1`, while CUDA 13.3 rejects compilers newer than `15`.
+
+Required next step:
+
+- Install GCC 15 (`gcc15`, `gcc15-c++`) and point `CC`/`CXX` at it for the build shell, then retry the `uv add` command under `--python 3.13`.
+
+## 2026-06-18: causal-conv1d built and Qwen fast path enabled
+
+Question: did the Fedora box now satisfy the real build contract for `causal-conv1d`?
+
+Findings:
+
+- `.python-version` now pins the repo to Python `3.13`, so `uv run` / `uv sync` stop drifting back to system 3.14.
+- Building `causal-conv1d` succeeded when the shell used `/usr/bin/gcc-15` and `/usr/bin/g++-15` explicitly together with CUDA 13.3 and Python 3.13.
+- Verification signal: `transformers.utils.import_utils.is_causal_conv1d_available()` returns `True`, and `transformers.models.qwen3_5.modeling_qwen3_5.causal_conv1d_fn` / `causal_conv1d_update` are both bound.
+
+Meaning:
+
+- Qwen3.5’s short-conv fast path is now live in this repo environment; the remaining work is throughput measurement, not kernel archaeology.
+
+## 2026-06-18: Qwen3.5 throughput try
+
+Question: does Qwen3.5-2B-Base with `causal-conv1d` and FLA actually clear the earlier bs4×1k ceiling?
+
+Result:
+
+- No. `batch=4, seq=1024` still OOMed during the Qwen3.5 linear-attention / MLP path.
+- `batch=1, seq=1024` also OOMed, and activation checkpointing did not rescue it.
+
+Meaning:
+
+- Enabling the fast short-conv path is necessary plumbing, but it does not by itself make Qwen3.5 the 12GB bs4×1k vehicle. The remaining wall is still model activations / temporary tensors, not optimizer state.
+
+## 2026-06-18: Qwen3.5 memory math check
+
+Follow-up smoke runs with `basis_init=random` separated the loss path from the basis-init path:
+
+- `batch=1, seq=1024, loss_impl=cce` fit at `7.28 GB` peak CUDA.
+- `batch=1, seq=1024, loss_impl=hf` fit at `10.04 GB` peak CUDA.
+- `batch=4, seq=1024, loss_impl=cce` OOMed in `causal_conv1d_fn` while allocating a `48.00 MiB` buffer (`empty_like(x)`), with only `31.88 MiB` free on the GPU.
+
+Math:
+
+- Qwen3.5-2B-Base has `2,274,069,824` parameters total.
+- The text-side language model is `1,881,825,088` params; the non-embedding text-side trainable set is `1,373,265,728` params.
+- One packed `bf16` activation at `batch=4, seq=1024, hidden=6144` is `4*1024*6144*2 = 50,331,648` bytes, i.e. the exact `48 MiB` buffer that failed.
+
+Takeaway:
+
+- The OOM is not a mystery leak. `batch=4, seq=1024` is already at the edge of the 11.59 GiB card once weights + grads + optimizer state + per-layer temporaries are resident, and the causal-conv output buffer is the shove that finally tips it over.
+
+## 2026-06-21: Clean LFM 350M packed CCE throughput ceiling
+
+Question: after cleaning the harness to one faithful route — EOS-packed no-mask batches plus CCE loss, no model fallback, no HF/chunked loss switch — what token step fits on the local 11.59 GiB 4070 SUPER with the default `LiquidAI/LFM2.5-350M-Base`?
+
+Setup:
+
+- Model/data: `LiquidAI/LFM2.5-350M-Base`, local SYNTH shards.
+- Scope: `--param-scope broad-no-embeddings`, rank 64, residual-facing side.
+- Batching/loss: EOS-packed fixed-length blocks, no `attention_mask`, CCE loss.
+- Init: `--basis-init random`, because this was a throughput/fit check rather than an SVD cold-start quality claim.
+- Shape: `seq_len=1024`, no grad accumulation, `--skip-validation`, one warmup + three measured steps.
+
+Results:
+
+| batch × seq | tokens/step | checkpointing | outcome | tokens/sec | step seconds | peak CUDA | state bytes |
+| ---: | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 4 × 1024 | 4096 | off | fit | 18,873 | 0.217 | 5.24 GB | 48.5 MB |
+| 8 × 1024 | 8192 | off | fit | 18,859 | 0.434 | 9.70 GB | 48.5 MB |
+| 9 × 1024 | 9216 | off | OOM in forward MLP | n/a | n/a | ~10.2 GB allocated at failure | n/a |
+| 10 × 1024 | 10240 | off | OOM in forward MLP | n/a | n/a | ~10.2 GB allocated at failure | n/a |
+| 16 × 1024 | 16384 | off/on | OOM in forward MLP | n/a | n/a | ~10.2 GB allocated at failure | n/a |
+
+Notes:
+
+- The clean no-mask CCE route works and reports `attn_implementation=sdpa`.
+- The practical no-grad-accum ceiling at `seq_len=1024` is `batch_size=8` / `8192` tokens per optimizer step on the current card state.
+- OOMs happen during the model forward MLP path before optimizer state matters. Activation checkpointing did not rescue `batch_size=16`, consistent with a forward temporary/activation wall rather than a backward-only saved-activation wall.
+- SumoTrack state is ~48.5 MB total at this 350M broad-no-embeddings topology: ~48.0 MB matrix state and ~0.5 MB fallback state.
