@@ -2,6 +2,188 @@
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
+## 2026-06-24: Faithful SYNTH LR knee sweep
+
+Question: under the faithful `bs8 + activation_checkpointing` diagnostic lane, where is the useful SumoTrack LR/update-scale knee? SumoTrack already applies Muon-style scaling, so do not assume it needs Muon's larger raw LR priors.
+
+Shared setup:
+
+- Model: `LiquidAI/LFM2.5-350M-Base`.
+- Source sensor: first parquet shard from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (`data/train-00000-of-00100.parquet`). This is a source-behavior sensor, not proof of broad retention.
+- Harness defaults unless named: faithful SYNTH right-padded no-mask batches, CCE, broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, Aurora, `basis_refresh_interval=100`, `batch_size=8`, `seq_len=1024`, activation checkpointing, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`.
+- Actual supervised tokens/update: `6399`; sequence tokens/update: `8192`; optimizer state bytes: `48,486,400`; peak allocated CUDA: `9,878,730,240`; peak reserved CUDA: `10,368,319,488`.
+
+Command shape:
+
+```bash
+uv run python experiments/llm_synth_smoke.py \
+  --batch-size 8 \
+  --measure-steps 1000 \
+  --eval-every 100 \
+  --activation-checkpointing \
+  --sumotrack-lr <lr> \
+  --wandb-run sumotrack-350m-faithful-bs8-checkpoint-lr-<lr>-1k \
+  --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
+```
+
+Runs:
+
+| LR | wandb | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1e-5` | https://wandb.ai/pink-marker/sumotrack/runs/ppo5piwj | `2.300632 → 2.099905` (`-0.200727`) | `2.899438 → 2.911166` (`+0.011728`) | `2.179358` | `11.277402` | `0.015174` | `0.000061` |
+| `3e-5` | https://wandb.ai/pink-marker/sumotrack/runs/wuvt5f7h | `2.300728 → 1.977568` (`-0.323160`) | `2.899438 → 2.943315` (`+0.043877`) | `2.041459` | `10.295789` | `0.023435` | `0.000095` |
+| `1e-4` | https://wandb.ai/pink-marker/sumotrack/runs/58s0amuo | `2.300731 → 1.844126` (`-0.456605`) | `2.899406 → 2.999864` (`+0.100457`) | `1.891413` | `9.731564` | `0.039362` | `0.000159` |
+| `3e-4` | https://wandb.ai/pink-marker/sumotrack/runs/2m9eq5r4 | `2.300731 → 1.749390` (`-0.551341`) | `2.899438 → 3.020600` (`+0.121162`) | `1.786439` | `9.280159` | `0.070321` | `0.000284` |
+| `1e-3` | https://wandb.ai/pink-marker/sumotrack/runs/k9olzza0 | `2.300731 → 1.779225` (`-0.521506`) | `2.899438 → 3.167889` (`+0.268451`) | `1.787664` | `8.282332` | `0.165576` | `0.000669` |
+
+Interpretation:
+
+- `1e-5` is conservative and keeps the source sensor almost flat, but underfits the target at 1k steps.
+- `1e-4` is the clean balance point in this sweep: strong target movement with moderate source rise.
+- `3e-4` gives the best target validation loss and train loss, with a slightly higher source cost. This is the aggressive useful side of the knee.
+- `1e-3` is past the knee: target is worse than `3e-4` while source degradation is much larger.
+- The prior default LR `0.0025` / update norm around `0.35` was not proven intrinsically bad by its absolute norm, but this sweep shows the faithful lane gets a better target/source tradeoff at much lower update scales (`~0.04-0.07` update norm, `~1.6e-4-2.8e-4` update/param).
+
+Next useful cut: refine around `1e-4` to `3e-4` depending on source tolerance, before adding tracking knobs or changing refresh cadence. Do not read the source shard as broad retention solved or failed; it is one accessible sensor.
+
+## 2026-06-24: Faithful SYNTH 1k tracking comparison
+
+Question: after making faithful SYNTH right-padded no-mask batching the default diagnostic lane, does target learning improve more from frequent basis refresh, larger token mass via checkpointed `batch_size=8`, or both?
+
+Shared setup:
+
+- Model: `LiquidAI/LFM2.5-350M-Base`.
+- Source sensor: first parquet shard from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (`data/train-00000-of-00100.parquet`).
+- Harness defaults unless named: broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, Aurora, CCE, faithful SYNTH right-padded no-mask batches, `seq_len=1024`, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`, wandb log cadence 20.
+- Core wandb sensors were cleaned to cadence-log train loss, raw grad norm, update norm, and update/param. Heavier projected-leverage diagnostics now require `--log-norms` explicitly. Final wandb summaries are curated rather than dumping every numeric config field.
+- `peak_cuda_bytes` is PyTorch peak allocated tensor memory, not driver-visible reserved VRAM. The harness now also records `peak_cuda_reserved_bytes` for future runs because checkpointed runs can still leave the card nearly full even when allocated peak is below total VRAM.
+
+Runs:
+
+| run | wandb | supervised tokens/update | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param | step sec | peak allocated |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bs4`, refresh 20 | https://wandb.ai/pink-marker/sumotrack/runs/5ol91981 | 3340 | `2.226388 → 2.196474` | `2.875980 → 3.593040` | `2.172782` | `10.574589` | `0.354263` | `0.001426` | `0.223883` | `5,311,750,144` |
+| `bs8`, checkpoint, refresh 100 | https://wandb.ai/pink-marker/sumotrack/runs/se1ggkj0 | 6399 | `2.300725 → 2.024565` | `2.899438 → 3.508711` | `2.015278` | `7.305237` | `0.354651` | `0.001428` | `0.448283` | `9,878,730,240` |
+| `bs8`, checkpoint, refresh 20 | https://wandb.ai/pink-marker/sumotrack/runs/38z9bjca | 6399 | `2.300731 → 2.022594` | `2.899438 → 3.519228` | `2.003851` | `7.168745` | `0.355365` | `0.001431` | `0.464087` | `9,878,730,240` |
+
+Interpretation:
+
+- `bs4 + refresh20` did not rescue the faithful lane. It made only small target progress and the source sensor rose hard. Frequent basis refresh at low token mass is not the obvious main fix.
+- `bs8 + activation checkpointing` is the useful improvement. More supervised tokens/update gave better train loss and much better target validation movement, with slightly less source damage than `bs4 + refresh20`.
+- Adding frequent refresh on top of `bs8 + checkpointing` was essentially indifferent: target was almost identical, source was slightly worse, and step time rose. Leave `basis_refresh_interval=100` as the boring default until a more targeted tracking metric proves otherwise.
+- Update magnitude was strikingly stable across runs: update norm around `0.354-0.355`, update/param around `0.00143`. The better `bs8` curve therefore looks like better signal going into the same update scale, not a quieter optimizer. That update scale is not obviously wrong in isolation and may be in the normal LoRA-training ballpark; the question is empirical target/source tradeoff. Because SumoTrack already applies Muon-style scaling, do not assume it needs Muon's larger raw LR priors. An earlier short faithful `2e-4` probe had update norm around `0.075` and source nearly flat, so a 1k `bs8 + checkpointing` LR/update-scale sweep across roughly `1e-5` to `1e-3` is the next clean cut, not because `0.35` is proven bad, but because the source curve needs a scale response.
+- Checkpointing allowed `batch_size=8`, and the larger token mass clearly improved the signal, but it did not create enough headroom for another clean batch-size rung. PyTorch allocated peak was about `9.88 GB` and driver-visible reserved VRAM was observed near the card limit, so `batch_size=16` is not a free next move on this card. If `bs16`-equivalent signal is needed, the honest routes are grad accumulation or deeper memory cuts, not simply more checkpointing. Future memory reports need both allocated and reserved peaks.
+
+## 2026-06-24: Stable side-Gram EIGH basis init
+
+Question: is full SVD necessary for SumoTrack's one-sided basis initialization, or can side-Gram `eigh` be the default without cargo-culting SVD as a correctness rail?
+
+Answer: full SVD is unnecessary for the current projector contract. SumoTrack only needs one dominant side subspace: right basis from top eigenvectors of `GᵀG`, left basis from top eigenvectors of `GGᵀ`. The implemented default now uses stable `eigh`: fp32 finite check, Frobenius normalization, symmetric Gram, and trace-scaled jitter retry only if the eigensolve backend fails. Random init remains an explicit ablation/stress path; `svd` is no longer an accepted basis-init method.
+
+Empirical basis probe on a faithful-format LFM-350M first-step gradient, all 92 matrix tensors:
+
+- `eigh` was faster than exact SVD on every measured shape: about 2.1x on `[512,1024]` qkv and about 5.4-7.3x on larger/square groups.
+- Projection-energy deltas versus SVD were about `1e-3`; subspaces agreed within fp noise for the rank-64 basis contract.
+- `eigh` bases had better measured orthonormality (`~1e-6`) than SVD bases in this probe (SVD up to `~6e-4`).
+- Symmetrization and Frobenius normalization are mathematically neutral for the subspace and protect the eigensolve contract. Always-on jitter did not improve clean gradients, so it is a retry/degeneracy fallback, not sauce.
+- MoleGrad's tiny projected `YᵀY` trick is a different optimizer design. The portable lesson here is stable Gram eigensolve hygiene, not Mbar/scout/erf damping.
+
+Implementation smoke after switching defaults:
+
+```bash
+uv run python experiments/llm_synth_smoke.py \
+  --batch-size 4 \
+  --warmup-steps 0 \
+  --measure-steps 1 \
+  --batching synth_right_padded_no_mask \
+  --log-norms \
+  --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
+```
+
+- Model: `LiquidAI/LFM2.5-350M-Base`.
+- `basis_init=eigh` through the harness default; no SVD path involved.
+- Actual supervised tokens/update: `3340` (`4096` sequence tokens).
+- Initial/final held-out SYNTH loss: `2.226388 → 2.207341`.
+- Initial/final source loss: `2.875980 → 2.931102`; one-step movement only, not retention evidence.
+- Mean grad norm: `17.132582`; update/param: `0.002921`; peak CUDA: `5.18 GB`.
+
+Validation: `uv run python -m unittest discover -s tests` passed 50 tests.
+
+## 2026-06-24: Source-mix completion sanity eval
+
+Status after later input-format audit: **not interpretable as retention evidence**. Keep this entry as a harness/plumbing record for periodic target/source eval and wandb logging, not as evidence that source behavior was preserved.
+
+Question: after the 1k Aurora target-only win, does current SumoTrack make target SYNTH progress while avoiding obvious base-model sandblasting on a broad text-completion source sensor?
+
+Source sensor:
+
+- Dataset: first parquet shard only from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled`, resolved as `data/train-00000-of-00100.parquet`.
+- This is not the original LFM pretraining distribution and not a proof of broad retention. It is an accessible, diverse pretraining-mixture completion set, but the later audit found the training stream formatting was not faithful enough to interpret retention/source movement.
+- Metrics were intentionally minimal: target SYNTH validation loss, source-mix validation loss, ordinary global grad norm at wandb log cadence. No KL, prompt suite, or extra projector diagnostics.
+
+Harness changes for this run:
+
+- `experiments/llm_synth_smoke.py` can load source/retention texts from the first parquet of a Hugging Face dataset via `--retention-hf-dataset`.
+- Periodic target/source validation logging is controlled by `--eval-every`.
+- Wandb logging is explicit via `--wandb-run`, default entity `pink-marker`; empty run name keeps local/dummy behavior.
+
+350M run:
+
+```bash
+uv run python experiments/llm_synth_smoke.py \
+  --batch-size 8 \
+  --measure-steps 200 \
+  --eval-every 25 \
+  --log-grad-norm \
+  --wandb-run sumotrack-350m-source-mix-200 \
+  --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
+```
+
+- Model: `LiquidAI/LFM2.5-350M-Base`.
+- Tokens/update: `8192` (`batch_size=8`, `seq_len=1024`, no grad accumulation).
+- Defaults at the time: broad no embeddings, rank 64, residual-facing side policy, SVD basis init, Aurora, CCE, packed no-mask batches. Current code now defaults basis init to stable `eigh`.
+- Wandb: `https://wandb.ai/pink-marker/sumotrack/runs/0spqj89v`.
+
+| metric | initial | final | delta |
+| --- | ---: | ---: | ---: |
+| target SYNTH val loss | 3.983130 | 2.235465 | -1.747665 |
+| source-mix val loss | 4.328842 | 3.409084 | -0.919758 |
+
+Other signals: last train loss `2.139143`, mean logged grad norm `7.256254`, state bytes `48,486,400` (`47,972,352` matrix / `514,048` fallback), peak CUDA `9,722,962,432`, measured step seconds `0.486636`.
+
+1.2B run:
+
+- `batch_size=4` fit initial validation but OOMed on the first backward, so it was not an optimizer result.
+- Successful rerun used `batch_size=2`, keeping the same model, source shard, loss path, and optimizer defaults.
+
+```bash
+uv run python experiments/llm_synth_smoke.py \
+  --model LiquidAI/LFM2.5-1.2B-Base \
+  --batch-size 2 \
+  --measure-steps 200 \
+  --eval-every 25 \
+  --log-grad-norm \
+  --wandb-run sumotrack-1p2b-source-mix-200-b2 \
+  --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
+```
+
+- Tokens/update: `2048` (`batch_size=2`, `seq_len=1024`, no grad accumulation).
+- Wandb: `https://wandb.ai/pink-marker/sumotrack/runs/z35dj5dg`.
+
+| metric | initial | final | delta |
+| --- | ---: | ---: | ---: |
+| target SYNTH val loss | 3.124986 | 1.787799 | -1.337187 |
+| source-mix val loss | 3.642093 | 2.700852 | -0.941241 |
+
+Other signals: last train loss `1.756662`, mean logged grad norm `10.424753`, state bytes `89,888,768` (`88,866,816` matrix / `1,021,952` fallback), peak CUDA `6,591,101,440`, measured step seconds `0.376855`.
+
+Interpretation:
+
+- Both models reduced loss on the current SYNTH stream and the source-mix completion loss also improved, but this should not be read as useful target progress or retention signal after the input-format audit. The safest interpretation is adaptation to a mismatched training stream.
+- Later inspection of decoded packed blocks showed the current SYNTH stream can begin with raw query/reasoning/answer text and no visible BOS, EOS, or divider inside the first 1024-token block. The harness appends EOS after rows, but long rows can push that boundary outside the block. Basic document separators and conscious BOS/EOS/label-masking policy are missing.
+- Therefore the honest claim is only: periodic target/source eval plumbing works and wandb logging works. The run does not answer whether SumoTrack preserves source behavior under faithful continued-pretraining formatting.
+- The next algorithmic comparison should wait until formatting and gradient-scale probes are corrected. Relevant later comparisons remain SUMO/Muon-style and SubTrack/GaLore-style baselines, not full AdamW as the main opponent. AdamW destruction at medium/high LR is unsurprising and not the sharp question.
+
 ## 2026-06-13: LFM/SYNTH matrix-path smoke
 
 Setup:
@@ -278,7 +460,7 @@ Notes:
 - Packed batches omit `attention_mask`, so the harness keeps SDPA flash eligibility instead of falling back to padded-mask behavior.
 - The CCE path works in this harness shape with random basis init.
 - On this tiny-token smoke, lowering Aurora preconditioning / Newton-Schulz cycles was a big throughput win with no visible memory change. That is optimizer-side overhead amortization, not a quality claim.
-- SVD basis initialization is still the cold-start tax; on this 12GB card it OOMed at the same packed shape, so throughput-path runs should use random init unless the init cost is the point.
+- Historical note: exact SVD basis initialization was the cold-start tax at the time of this smoke and OOMed at the same packed shape on the local card. Current SumoTrack defaults to stable side-Gram `eigh`, so rerun throughput-path fit/perf claims before carrying this old random-init workaround forward.
 - Follow-up packed smoke at `seq_len=512`, `batch_size=2` (1024 tokens/step, random init, HF loss) sharpened the cycle story: default `2/5` cycles OOMed on this card, while reduced `1/3` cycles fit and ran at `5701 tok/s` with `5.27 GB` peak CUDA. Cycle count is therefore not just a micro-optimization at this shape; it can be the difference between fit and no fit.
 - These throughput numbers were taken without `causal-conv1d`; the environment fell back to LFM2's Torch `Conv1d` short-conv path because no Triton/`causal-conv1d` package was installed.
 

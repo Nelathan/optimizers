@@ -40,6 +40,30 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), (3, 3))
         self.assertEqual(tuple(low.shape), (3, 9))
 
+    def test_eigh_init_captures_known_right_subspace(self):
+        right_modes, _ = torch.linalg.qr(torch.randn(7, 3), mode="reduced")
+        coeffs = torch.randn(11, 3) * torch.tensor([4.0, 2.0, 1.0])
+        grad = coeffs @ right_modes.mT
+        projector = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
+
+        basis = projector.fit(grad)
+
+        overlap = torch.linalg.svdvals(basis @ right_modes)
+        self.assertGreater(float(overlap.min()), 1 - 1e-5)
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
+    def test_eigh_init_captures_known_left_subspace(self):
+        left_modes, _ = torch.linalg.qr(torch.randn(5, 4), mode="reduced")
+        coeffs = torch.randn(4, 13) * torch.tensor([[4.0], [2.0], [1.0], [0.5]])
+        grad = left_modes @ coeffs
+        projector = SubspaceProjector(rank=4, side=ProjectionSide.LEFT)
+
+        basis = projector.fit(grad)
+
+        overlap = torch.linalg.svdvals(basis.mT @ left_modes)
+        self.assertGreater(float(overlap.min()), 1 - 1e-5)
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
     def test_random_init_right_projection_shape_and_orthonormality(self):
         grad = torch.randn(11, 7)
         projector = SubspaceProjector(rank=3, init_method="random")
@@ -85,6 +109,27 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(low.shape), (4, 2))
         self.assertEqual(tuple(lifted.shape), tuple(grad.shape))
 
+    def test_zero_matrix_uses_orthonormal_fallback_basis(self):
+        grad = torch.zeros(4, 10)
+        projector = SubspaceProjector(rank=2, side=ProjectionSide.RIGHT)
+
+        basis = projector.fit(grad)
+
+        self.assertEqual(tuple(basis.shape), (2, 10))
+        self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
+    def test_rejects_non_finite_matrix_for_spectral_fit(self):
+        grad = torch.randn(4, 10)
+        grad[0, 0] = float("nan")
+        projector = SubspaceProjector(rank=2, side=ProjectionSide.RIGHT)
+
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            projector.fit(grad)
+
+    def test_rejects_removed_svd_init_method(self):
+        with self.assertRaises(ValueError):
+            SubspaceProjector(rank=2, init_method="svd")
+
     def test_rejects_non_matrix(self):
         projector = SubspaceProjector(rank=2)
 
@@ -108,7 +153,7 @@ class SubspaceProjectorTest(unittest.TestCase):
     def test_grassmann_update_preserves_orthonormality_and_device(self):
         grad = torch.randn(9, 5)
         projector = SubspaceProjector(rank=3)
-        old_basis = projector.fit_svd(grad).clone()
+        old_basis = projector.fit_eigh(grad).clone()
 
         projector.update_grassmann(torch.randn_like(grad), step_size=0.01)
 

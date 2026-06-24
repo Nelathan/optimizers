@@ -300,6 +300,7 @@ class SumoTrackTest(unittest.TestCase):
         weight = torch.nn.Parameter(torch.randn(256, 16))
         opt = SumoTrack([weight], lr=0.01, rank=16)
         opt.diagnostics_enabled = True
+        opt.diagnostics_leverage_enabled = True
 
         weight.grad = torch.randn_like(weight)
         opt.step()

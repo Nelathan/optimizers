@@ -4,8 +4,9 @@ import argparse
 import gc
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pyarrow.parquet as pq
 import torch
@@ -17,29 +18,34 @@ from sumotrack import SumoTrack, optimizer_state_bytes_by_category
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
+DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled"
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing"]
+BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
+SYNTH_DIVIDER = "\n---\n"
 
 
 @torch.no_grad()
-def tensor_global_norm(tensors) -> float:
-    norm_sq = 0.0
+def tensor_global_norm(tensors) -> torch.Tensor:
+    norm_sq = None
     for tensor in tensors:
         if tensor is None:
             continue
         norm = tensor.detach().float().norm()
-        norm_sq += float(norm.square().cpu())
-    return norm_sq**0.5
+        norm_sq = norm.square() if norm_sq is None else norm_sq + norm.square()
+    if norm_sq is None:
+        return torch.tensor(float("nan"))
+    return norm_sq.sqrt()
 
 
 @torch.no_grad()
-def parameter_norm(params: list[torch.nn.Parameter]) -> float:
+def parameter_norm(params: list[torch.nn.Parameter]) -> torch.Tensor:
     return tensor_global_norm(params)
 
 
 @torch.no_grad()
-def gradient_norm(params: list[torch.nn.Parameter]) -> float:
+def gradient_norm(params: list[torch.nn.Parameter]) -> torch.Tensor:
     return tensor_global_norm([param.grad for param in params if param.grad is not None])
 
 
@@ -48,6 +54,41 @@ def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float:
     if not diagnostics:
         return float("nan")
     return float(diagnostics.get("update_norm", float("nan")))
+
+
+def scalar(value: float | int | torch.Tensor) -> float:
+    if isinstance(value, (float, int)):
+        return float(value)
+    return float(value.detach().float().cpu())
+
+
+def mean_scalar(values: list[float | int | torch.Tensor]) -> float:
+    finite = []
+    for value in values:
+        number = scalar(value)
+        if number == number:
+            finite.append(number)
+    return sum(finite) / len(finite) if finite else float("nan")
+
+
+def final_wandb_metrics(prefix: str, result: dict[str, float | int | str]) -> dict[str, float | int]:
+    keys = (
+        "initial_val_loss",
+        "final_val_loss",
+        "initial_retention_val_loss",
+        "final_retention_val_loss",
+        "retention_val_loss_delta",
+        "last_measured_train_loss",
+        "mean_logged_grad_norm",
+        "mean_logged_param_norm",
+        "mean_logged_update_norm",
+        "mean_logged_update_to_param_ratio",
+        "measured_tokens_per_second",
+        "measured_step_seconds",
+        "peak_cuda_bytes",
+        "peak_cuda_reserved_bytes",
+    )
+    return {f"{prefix}/final_{key}": value for key in keys if isinstance((value := result.get(key)), (int, float))}
 
 
 def optimizer_projected_leverage_stats(optimizer: torch.optim.Optimizer) -> tuple[float, float, float]:
@@ -61,24 +102,52 @@ def optimizer_projected_leverage_stats(optimizer: torch.optim.Optimizer) -> tupl
     )
 
 
+def parquet_table_to_texts(table) -> list[str]:
+    names = set(table.column_names)
+    if "text" in names:
+        return [text for text in table.column("text").to_pylist() if text]
+    if {"query", "synthetic_reasoning", "synthetic_answer"}.issubset(names):
+        rows = zip(
+            table.column("query").to_pylist(),
+            table.column("synthetic_reasoning").to_pylist(),
+            table.column("synthetic_answer").to_pylist(),
+        )
+        texts = []
+        for query, reasoning, answer in rows:
+            parts = [part for part in (query, reasoning, answer) if part]
+            if parts:
+                texts.append("\n\n".join(parts))
+        return texts
+    raise ValueError(f"Unsupported parquet schema, expected text or SYNTH columns, got: {table.column_names}")
+
+
+def parquet_texts(parquet_path: Path, limit: int) -> list[str]:
+    pf = pq.ParquetFile(parquet_path)
+    texts = []
+    for row_group in range(pf.num_row_groups):
+        texts.extend(parquet_table_to_texts(pf.read_row_group(row_group)))
+        if len(texts) >= limit:
+            return texts[:limit]
+    return texts
+
+
 def synth_texts(data_dir: Path, split: str, limit: int) -> list[str]:
     shards = sorted(data_dir.glob("synth_*.parquet"))
     if not shards:
         raise FileNotFoundError(f"No SYNTH parquet shards found in {data_dir}")
     shard = shards[-1] if split == "val" else shards[0]
-    table = pq.ParquetFile(shard).read_row_group(0, columns=["query", "synthetic_reasoning", "synthetic_answer"])
-    rows = zip(
-        table.column("query").to_pylist(),
-        table.column("synthetic_reasoning").to_pylist(),
-        table.column("synthetic_answer").to_pylist(),
-    )
-    texts = []
-    for query, reasoning, answer in rows:
-        parts = [part for part in (query, reasoning, answer) if part]
-        texts.append("\n\n".join(parts))
-        if len(texts) >= limit:
-            break
-    return texts
+    return parquet_texts(shard, limit)
+
+
+def hf_first_parquet_texts(repo_id: str, limit: int) -> tuple[list[str], str]:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    parquets = sorted(path for path in list_repo_files(repo_id, repo_type="dataset") if path.endswith(".parquet"))
+    if not parquets:
+        raise FileNotFoundError(f"No parquet files found in Hugging Face dataset {repo_id}")
+    first_parquet = parquets[0]
+    local_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=first_parquet)
+    return parquet_texts(Path(local_path), limit), first_parquet
 
 
 def packed_text_limit(blocks: int, batch_size: int, seq_len: int) -> int:
@@ -243,8 +312,91 @@ def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch
     return [{"input_ids": batch, "labels": batch.clone()} for batch in tokens]
 
 
+def synth_masked_examples(texts: list[str]) -> list[tuple[str, str]]:
+    examples = []
+    for text in texts:
+        query, separator, body = text.partition("\n\n")
+        if not separator or not query.strip() or not body.strip():
+            continue
+        prefix = f"{query}{SYNTH_DIVIDER}"
+        examples.append((f"{prefix}{body}", prefix))
+    return examples
+
+
+def full_lm_examples(texts: list[str]) -> list[tuple[str, str]]:
+    return [(text, "") for text in texts if text]
+
+
+def make_right_padded_batches(
+    tokenizer,
+    examples: list[tuple[str, str]],
+    device: torch.device,
+    batch_size: int,
+    seq_len: int,
+    min_batches: int,
+):
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+    if eos_token_id is None or pad_token_id is None:
+        raise RuntimeError("tokenizer must define eos_token_id and pad_token_id or eos fallback for right-padded LM batches")
+
+    rows = []
+    needed_rows = max(min_batches, 1) * batch_size
+    bos_token_id = tokenizer.bos_token_id
+    for text, masked_prefix in examples:
+        text_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not text_ids:
+            continue
+        prefix_ids = tokenizer(masked_prefix, add_special_tokens=False)["input_ids"] if masked_prefix else []
+        input_ids = ([bos_token_id] if bos_token_id is not None else []) + text_ids + [eos_token_id]
+        labels = input_ids.copy()
+        masked_until = (1 if bos_token_id is not None else 0) + min(len(prefix_ids), len(text_ids))
+        labels[:masked_until] = [-100] * masked_until
+        if len(input_ids) > seq_len:
+            input_ids = input_ids[:seq_len]
+            labels = labels[:seq_len]
+        if not any(label != -100 for label in labels):
+            continue
+        padding = seq_len - len(input_ids)
+        if padding > 0:
+            input_ids.extend([pad_token_id] * padding)
+            labels.extend([-100] * padding)
+        rows.append((input_ids, labels))
+        if len(rows) >= needed_rows:
+            break
+
+    if len(rows) < needed_rows:
+        raise RuntimeError(f"not enough usable examples to build right-padded batches: need {needed_rows}, got {len(rows)}")
+
+    input_tensor = torch.tensor([row[0] for row in rows], dtype=torch.long).view(max(min_batches, 1), batch_size, seq_len).to(device)
+    label_tensor = torch.tensor([row[1] for row in rows], dtype=torch.long).view(max(min_batches, 1), batch_size, seq_len).to(device)
+    return [{"input_ids": input_batch, "labels": label_batch} for input_batch, label_batch in zip(input_tensor, label_tensor)]
+
+
+def make_batches(
+    tokenizer,
+    texts: list[str],
+    device: torch.device,
+    batch_size: int,
+    seq_len: int,
+    min_batches: int,
+    batching: BatchingMode,
+    stream: Literal["synth", "source"],
+):
+    if batching == "eos_packed_no_mask":
+        return make_packed_batches(tokenizer, texts, device, batch_size, seq_len, min_batches)
+    if batching == "synth_right_padded_no_mask":
+        examples = synth_masked_examples(texts) if stream == "synth" else full_lm_examples(texts)
+        return make_right_padded_batches(tokenizer, examples, device, batch_size, seq_len, min_batches)
+    raise ValueError(f"unknown batching mode: {batching}")
+
+
 def batch_tokens(batch: dict[str, torch.Tensor]) -> int:
     return int(batch["input_ids"].numel())
+
+
+def batch_supervised_tokens(batch: dict[str, torch.Tensor]) -> int:
+    return int((batch["labels"] != -100).sum().item())
 
 
 def _inner_causal_lm_modules(model):
@@ -264,7 +416,7 @@ def cce_causal_lm_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         input_ids=batch["input_ids"],
         use_cache=False,
     )
-    return linear_cross_entropy(outputs.last_hidden_state, lm_head.weight, batch["input_ids"], ignore_index=-100, shift=True)
+    return linear_cross_entropy(outputs.last_hidden_state, lm_head.weight, batch.get("labels", batch["input_ids"]), ignore_index=-100, shift=True)
 
 
 @torch.no_grad()
@@ -288,8 +440,13 @@ def train_step(
     batches,
     start_index: int,
     grad_accum_steps: int,
-    log_norms: bool,
-) -> dict[str, float]:
+    collect_norms: bool,
+    collect_leverage: bool,
+) -> dict[str, float | torch.Tensor]:
+    if hasattr(optimizer, "diagnostics_enabled"):
+        optimizer.diagnostics_enabled = collect_norms
+    if hasattr(optimizer, "diagnostics_leverage_enabled"):
+        optimizer.diagnostics_leverage_enabled = collect_leverage
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
@@ -297,30 +454,28 @@ def train_step(
         loss = cce_causal_lm_loss(model, batch)
         (loss / grad_accum_steps).backward()
         losses.append(loss.detach().float())
-    grad_norm = gradient_norm(trainable) if log_norms else float("nan")
-    param_norm = parameter_norm(trainable) if log_norms else float("nan")
+    grad_norm = gradient_norm(trainable) if collect_norms else float("nan")
+    param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
-    update_norm = optimizer_update_norm(optimizer) if log_norms else float("nan")
-    leverage_cv, leverage_min_ratio, leverage_max_ratio = optimizer_projected_leverage_stats(optimizer) if log_norms else (float("nan"), float("nan"), float("nan"))
+    update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
+    leverage_cv, leverage_min_ratio, leverage_max_ratio = optimizer_projected_leverage_stats(optimizer) if collect_leverage else (float("nan"), float("nan"), float("nan"))
+    param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
+    update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
     return {
-        "loss": float(torch.stack(losses).mean().cpu()),
+        "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
         "param_norm": param_norm,
         "update_norm": update_norm,
-        "update_to_param_ratio": update_norm / param_norm if param_norm > 0 else float("nan"),
+        "update_to_param_ratio": update_to_param_ratio,
         "projected_leverage_cv": leverage_cv,
         "projected_leverage_min_ratio": leverage_min_ratio,
         "projected_leverage_max_ratio": leverage_max_ratio,
     }
 
 
-def finite_values(values: list[float]) -> list[float]:
-    return [value for value in values if value == value]
-
-
-def mean_or_nan(values: list[float]) -> float:
-    finite = finite_values(values)
-    return sum(finite) / len(finite) if finite else float("nan")
+def wandb_log(wandb_run: Any | None, data: Mapping[str, float | int | str], step: int) -> None:
+    if wandb_run is not None:
+        wandb_run.log(data, step=step)
 
 
 def run_optimizer(
@@ -331,6 +486,7 @@ def run_optimizer(
     val_texts: list[str],
     retention_texts: list[str] | None,
     device: torch.device,
+    wandb_run: Any | None = None,
 ) -> dict[str, float | int | str]:
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -344,9 +500,9 @@ def run_optimizer(
         args.rank,
         args.projection_side_policy,
     )
-    train_batches = make_packed_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps)
-    val_batches = make_packed_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks)
-    retention_batches = make_packed_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks) if retention_texts else None
+    train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps, args.batching, "synth")
+    val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
+    retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
     if args.torch_compile:
         model = torch.compile(model)
@@ -366,7 +522,6 @@ def run_optimizer(
             polar_ns_steps=args.polar_ns_steps,
             consume_grad=not args.keep_grads_after_step,
         )
-        optimizer.diagnostics_enabled = args.log_norms
     elif optimizer_name in {"adamw", "torch_adamw"}:
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
     else:  # pragma: no cover
@@ -374,11 +529,20 @@ def run_optimizer(
 
     initial_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
+    wandb_log(
+        wandb_run,
+        {
+            f"{optimizer_name}/target_val_loss": initial_val,
+            f"{optimizer_name}/source_val_loss": initial_retention_val,
+        },
+        step=0,
+    )
     measured_steps = []
+    loss_window = []
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
-        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms)
+        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, False, False)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -386,13 +550,64 @@ def run_optimizer(
     start_time = time.perf_counter()
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
-        measured_steps.append(train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.log_norms))
+        global_step = step + 1
+        should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
+        should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
+        collect_norms = should_log_train
+        step_result = train_step(
+            model,
+            optimizer,
+            trainable,
+            train_batches,
+            batch_index,
+            args.grad_accum_steps,
+            collect_norms,
+            args.log_norms and should_log_train,
+        )
+        measured_steps.append(step_result)
+        loss_window.append(step_result["loss"])
+        if should_log_train:
+            train_loss = scalar(torch.stack(loss_window).mean())
+            loss_window.clear()
+            train_metrics = {
+                f"{optimizer_name}/train_loss": train_loss,
+                f"{optimizer_name}/grad_norm": scalar(step_result["grad_norm"]),
+                f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
+                f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
+            }
+            if args.log_norms:
+                train_metrics.update(
+                    {
+                        f"{optimizer_name}/param_norm": scalar(step_result["param_norm"]),
+                        f"{optimizer_name}/projected_leverage_cv": scalar(step_result["projected_leverage_cv"]),
+                        f"{optimizer_name}/projected_leverage_min_ratio": scalar(step_result["projected_leverage_min_ratio"]),
+                        f"{optimizer_name}/projected_leverage_max_ratio": scalar(step_result["projected_leverage_max_ratio"]),
+                    }
+                )
+            wandb_log(
+                wandb_run,
+                train_metrics,
+                step=global_step,
+            )
+        if should_eval and not args.skip_validation:
+            eval_val = evaluate_loss(model, val_batches)
+            eval_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
+            print(f"{optimizer_name}_step={global_step} target_val_loss={eval_val:.6f} source_val_loss={eval_retention_val:.6f}")
+            wandb_log(
+                wandb_run,
+                {
+                    f"{optimizer_name}/target_val_loss": eval_val,
+                    f"{optimizer_name}/source_val_loss": eval_retention_val,
+                },
+                step=global_step,
+            )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
     final_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+    peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
     measured_param_norms = [step["param_norm"] for step in measured_steps]
@@ -419,11 +634,13 @@ def run_optimizer(
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
-        "batching": "eos_packed_no_mask",
+        "batching": args.batching,
         "loss_impl": "cce",
         "skip_validation": args.skip_validation,
         "actual_sequence_tokens": batch_tokens(train_batches[0]),
+        "actual_supervised_tokens": batch_supervised_tokens(train_batches[0]),
         "tokens_per_optimizer_step": batch_tokens(train_batches[0]) * args.grad_accum_steps,
+        "supervised_tokens_per_optimizer_step": batch_supervised_tokens(train_batches[0]) * args.grad_accum_steps,
         "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / measured_elapsed,
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
@@ -433,17 +650,18 @@ def run_optimizer(
         "initial_retention_val_loss": initial_retention_val,
         "final_retention_val_loss": final_retention_val,
         "retention_val_loss_delta": final_retention_val - initial_retention_val,
-        "last_measured_train_loss": measured_losses[-1],
-        "mean_measured_grad_norm": mean_or_nan(measured_grad_norms),
-        "mean_measured_param_norm": mean_or_nan(measured_param_norms),
-        "mean_measured_update_norm": mean_or_nan(measured_update_norms),
-        "mean_measured_update_to_param_ratio": mean_or_nan(measured_update_to_param_ratios),
-        "mean_measured_projected_leverage_cv": mean_or_nan(measured_leverage_cvs),
-        "mean_measured_projected_leverage_min_ratio": mean_or_nan(measured_leverage_min_ratios),
-        "mean_measured_projected_leverage_max_ratio": mean_or_nan(measured_leverage_max_ratios),
+        "last_measured_train_loss": scalar(measured_losses[-1]),
+        "mean_logged_grad_norm": mean_scalar(measured_grad_norms),
+        "mean_logged_param_norm": mean_scalar(measured_param_norms),
+        "mean_logged_update_norm": mean_scalar(measured_update_norms),
+        "mean_logged_update_to_param_ratio": mean_scalar(measured_update_to_param_ratios),
+        "mean_logged_projected_leverage_cv": mean_scalar(measured_leverage_cvs),
+        "mean_logged_projected_leverage_min_ratio": mean_scalar(measured_leverage_min_ratios),
+        "mean_logged_projected_leverage_max_ratio": mean_scalar(measured_leverage_max_ratios),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
+        "peak_cuda_reserved_bytes": peak_reserved,
     }
     del optimizer, model, tokenizer, train_batches, val_batches, retention_batches
     if device.type == "cuda":
@@ -457,6 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"HF model name; default = {DEFAULT_MODEL}")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
+    parser.add_argument("--retention-hf-dataset", default="", help=f"optional Hugging Face source/retention dataset; first parquet shard only, e.g. {DEFAULT_SOURCE_HF_DATASET}")
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
@@ -464,11 +683,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--val-blocks", type=int, default=8, help="number of packed validation blocks")
-    parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of packed retention validation blocks")
+    parser.add_argument("--val-blocks", type=int, default=8, help="number of validation batches/blocks to build")
+    parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of source validation batches/blocks to build")
+    parser.add_argument("--batching", choices=("synth_right_padded_no_mask", "eos_packed_no_mask"), default="synth_right_padded_no_mask", help="batch construction policy; default is faithful SYNTH diagnostics; choose eos_packed_no_mask explicitly for throughput")
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing"), default="residual-facing")
-    parser.add_argument("--basis-init", choices=("svd", "random"), default="svd")
+    parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
     parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
@@ -481,7 +701,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn-implementation", default="", help="optional Transformers attention implementation, e.g. flash_attention_2, sdpa, eager")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
-    parser.add_argument("--log-norms", action="store_true", help="log grad/param norms and SumoTrack update norms; adds reduction overhead")
+    parser.add_argument("--eval-every", type=int, default=0, help="periodically log target/source validation loss every N measured steps; 0 disables")
+    parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
+    parser.add_argument("--wandb-entity", default="pink-marker")
+    parser.add_argument("--wandb-project", default="sumotrack")
+    parser.add_argument("--wandb-log-every", type=int, default=20, help="log train loss and core grad/update norms every N measured steps")
+    parser.add_argument("--log-norms", action="store_true", help="also log heavier norm/geometry diagnostics at wandb-log cadence")
     return parser
 
 
@@ -503,6 +728,12 @@ def main() -> None:
         raise ValueError("val_blocks must be positive")
     if args.retention_val_blocks <= 0:
         raise ValueError("retention_val_blocks must be positive")
+    if args.eval_every < 0:
+        raise ValueError("eval_every must be non-negative")
+    if args.wandb_log_every < 0:
+        raise ValueError("wandb_log_every must be non-negative")
+    if args.retention_data_dir and args.retention_hf_dataset:
+        raise ValueError("Use either --retention-data-dir or --retention-hf-dataset, not both")
     if args.rank <= 0:
         raise ValueError("rank must be positive")
     if args.basis_refresh_interval <= 0:
@@ -520,13 +751,19 @@ def main() -> None:
     train_texts = synth_texts(Path(args.data_dir), "train", limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len))
     val_texts = synth_texts(Path(args.data_dir), "val", limit=packed_text_limit(val_blocks, args.batch_size, args.seq_len))
     retention_texts = None
+    retention_source = "none"
     if args.retention_data_dir:
         retention_blocks = args.retention_val_blocks
         retention_texts = synth_texts(Path(args.retention_data_dir), "val", limit=packed_text_limit(retention_blocks, args.batch_size, args.seq_len))
+        retention_source = args.retention_data_dir
+    elif args.retention_hf_dataset:
+        retention_blocks = args.retention_val_blocks
+        retention_texts, first_parquet = hf_first_parquet_texts(args.retention_hf_dataset, limit=packed_text_limit(retention_blocks, args.batch_size, args.seq_len))
+        retention_source = f"{args.retention_hf_dataset}:{first_parquet}"
     print(f"device={device}")
     print(f"model={model_name}")
     print(f"data_dir={args.data_dir}")
-    print(f"retention_data_dir={args.retention_data_dir or 'none'}")
+    print(f"retention_source={retention_source}")
     print(f"train_texts={len(train_texts)} val_texts={len(val_texts)} retention_texts={len(retention_texts) if retention_texts else 0}")
     print(
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
@@ -535,22 +772,34 @@ def main() -> None:
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
-        f"batching=eos_packed_no_mask loss_impl=cce "
-        f"skip_validation={args.skip_validation} consume_grad={not args.keep_grads_after_step}"
+        f"batching={args.batching} loss_impl=cce "
+        f"skip_validation={args.skip_validation} eval_every={args.eval_every} log_norms={args.log_norms} "
+        f"wandb_run={args.wandb_run or 'none'} wandb_entity={args.wandb_entity} consume_grad={not args.keep_grads_after_step}"
     )
 
-    for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
-        if optimizer_name == "subspace":
-            optimizer_name = "sumotrack"
-        result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, retention_texts, device)
-        prefix = optimizer_name
-        for key, value in result.items():
-            if key == "optimizer":
-                continue
-            if isinstance(value, float):
-                print(f"{prefix}_{key}={value:.6f}")
-            else:
-                print(f"{prefix}_{key}={value}")
+    wandb_run = None
+    if args.wandb_run:
+        import wandb
+
+        wandb_run = wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run, config=vars(args))
+
+    try:
+        for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
+            if optimizer_name == "subspace":
+                optimizer_name = "sumotrack"
+            result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, retention_texts, device, wandb_run=wandb_run)
+            prefix = optimizer_name
+            wandb_log(wandb_run, final_wandb_metrics(prefix, result), step=args.measure_steps)
+            for key, value in result.items():
+                if key == "optimizer":
+                    continue
+                if isinstance(value, float):
+                    print(f"{prefix}_{key}={value:.6f}")
+                else:
+                    print(f"{prefix}_{key}={value}")
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":

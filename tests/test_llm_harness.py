@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, packed_text_limit, select_trainable_params
-from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches
+from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
 def assert_param_membership(test_case, param, params, expected: bool) -> None:
@@ -34,29 +34,30 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.param_scope, "broad-no-embeddings")
         self.assertEqual(args.seq_len, 1024)
         self.assertEqual(args.batch_size, 4)
+        self.assertEqual(args.batching, "synth_right_padded_no_mask")
         self.assertEqual(args.rank, 64)
         self.assertEqual(args.projection_side_policy, "residual-facing")
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
+        self.assertEqual(args.wandb_log_every, 20)
         self.assertEqual(args.aurora_pp_iterations, 2)
         self.assertEqual(args.polar_ns_steps, 5)
-        self.assertEqual(args.basis_init, "svd")
+        self.assertEqual(args.basis_init, "eigh")
         self.assertFalse(args.activation_checkpointing)
         self.assertFalse(args.torch_compile)
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
 
-    def test_cli_has_no_loss_or_padding_mode_switches(self):
+    def test_cli_has_no_loss_or_padding_option_garden(self):
         option_strings = {option for action in build_parser()._actions for option in action.option_strings}
 
         self.assertNotIn("--loss-impl", option_strings)
         self.assertNotIn("--chunked-lm-loss-tokens", option_strings)
         self.assertNotIn("--pad-to-max-length", option_strings)
-        self.assertNotIn("--pack-sequences", option_strings)
-        self.assertNotIn("--no-pack-sequences", option_strings)
         self.assertNotIn("--val-texts", option_strings)
         self.assertNotIn("--retention-val-texts", option_strings)
         self.assertNotIn("--print-shape-summary", option_strings)
+        self.assertNotIn("--log-grad-norm", option_strings)
 
     def test_packed_text_limit_scales_with_requested_tokens(self):
         self.assertEqual(packed_text_limit(blocks=1, batch_size=1, seq_len=128), 16)
@@ -155,6 +156,26 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertTrue(torch.equal(batches[0]["input_ids"], batches[0]["labels"]))
         self.assertTrue((batches[0]["input_ids"] == 99).any())
 
+    def test_right_padded_synth_batches_mask_context_without_attention_mask(self):
+        class TokenizerStub:
+            bos_token_id = 11
+            eos_token_id = 99
+            pad_token_id = 0
+
+            vocab = {"Q": 1, "\n": 2, "-": 3, "A": 4, "B": 5}
+
+            def __call__(self, text, add_special_tokens):
+                if add_special_tokens:
+                    raise AssertionError("tokenizer stub called with unexpected kwargs")
+                return {"input_ids": [self.vocab[char] for char in text]}
+
+        examples = synth_masked_examples(["Q\n\nAB"])
+        batches = make_right_padded_batches(TokenizerStub(), examples, torch.device("cpu"), batch_size=1, seq_len=10, min_batches=1)
+
+        self.assertNotIn("attention_mask", batches[0])
+        self.assertTrue(torch.equal(batches[0]["input_ids"], torch.tensor([[11, 1, 2, 3, 3, 3, 2, 4, 5, 99]])))
+        self.assertTrue(torch.equal(batches[0]["labels"], torch.tensor([[-100, -100, -100, -100, -100, -100, -100, 4, 5, 99]])))
+
     def test_cce_causal_lm_loss_uses_hidden_states_without_full_logits(self):
         captured = {}
 
@@ -187,6 +208,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             model = types.SimpleNamespace(_orig_mod=ModelStub())
             batch = {
                 "input_ids": torch.tensor([[1, 2, 3]]),
+                "labels": torch.tensor([[-100, 2, 3]]),
             }
 
             loss = cce_causal_lm_loss(model, batch)
@@ -199,7 +221,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(loss.shape, torch.Size([]))
         self.assertEqual(captured["ignore_index"], -100)
         self.assertTrue(captured["shift"])
-        self.assertTrue(torch.equal(captured["targets"], torch.tensor([[1, 2, 3]])))
+        self.assertTrue(torch.equal(captured["targets"], torch.tensor([[-100, 2, 3]])))
 
 
 if __name__ == "__main__":

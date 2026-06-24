@@ -62,7 +62,7 @@ Open design questions:
 - Should the chosen side always be the hidden-state / backbone-facing axis when module structure is known?
 - Should attention projections, MLP up/gate/down projections, and output projections use different side policies?
 - Should side choice be architecture-aware for Gemma/LFM/Qwen rather than purely shape-aware?
-- Are we throwing away task-vital gradient components because they did not appear in the tracked/SVD subspace early enough?
+- Are we throwing away task-vital gradient components because they did not appear in the tracked spectral subspace early enough?
 
 Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 tokens/step, rank 64, equal ~89.9 MB state budget showed residual-facing side policy beating shape `AUTO` decisively on target validation (`1.600` vs `1.810` final val). This is evidence that aligning projection sides to the hidden-state / backbone-facing axis improves adaptation at identical byte cost.
 
@@ -78,13 +78,13 @@ Current status: a 200-step broad-no-embeddings LFM/SYNTH evaluation at 4096 toke
 
 ### 3. Subspace tracking as adaptation smoothing
 
-SVD initialization is a useful quality/correctness rail. Grassmann tracking then controls smoothing: burst refresh on a cadence interval. Equal-cadence burst-vs-round-robin measurements showed identical peak VRAM (~8.18 GB at 4096 tokens/step, ~5.03 GB at 64 tokens/step) — state is ~90 MB and activation/model memory dominates. Burst is the simpler default; refresh cadence is tuned via `basis_refresh_interval` / `--basis-refresh-interval`.
+Stable side-Gram `eigh` initialization is the basis-init path. It computes the one-sided dominant singular subspace SumoTrack actually uses, without carrying full SVD as hot-path ceremony. Grassmann tracking then controls smoothing: burst refresh on a cadence interval. Equal-cadence burst-vs-round-robin measurements showed identical peak VRAM (~8.18 GB at 4096 tokens/step, ~5.03 GB at 64 tokens/step) — state is ~90 MB and activation/model memory dominates. Burst is the simpler default; refresh cadence is tuned via `basis_refresh_interval` / `--basis-refresh-interval`.
 
 That smoothing may be central for distribution shift without total forgetting.
 
 Open design questions:
 
-- exact SVD init vs random init vs short calibration SVD,
+- whether `eigh` init plus Grassmann tracking needs a short calibration phase,
 - refresh interval by layer depth or transformer matrix role,
 - moment transport strength across basis changes,
 - whether basis motion should be slower in backbone-stability-critical modules.
@@ -143,7 +143,7 @@ Current implementation invariants:
 - Architecture-aware side policy lives in the LLM harness via named-parameter groups. Rank allocation is uniform. The optimizer core remains responsible for projected state and updates, not model taxonomy.
 - Unsupported ECC/param-ECC must fail loudly until implemented honestly through HeavyBall state hooks.
 
-The harness should encode the current boring-best defaults so experiment commands stay lean. The default route is SVD basis init, `batch_size=4`, `seq_len=1024`, EOS-packed no-mask batches plus CCE; HF/full-logits loss or non-packed/padded batches are stop conditions for faithful throughput/memory work. Random basis init is only for performance/fit measurements where SVD cold-start cost is explicitly not the claim. Continue only when the work is explicitly reframed as an unoptimized ablation outside the faithful benchmark path. Prefer:
+The harness should encode the current boring-best defaults so experiment commands stay lean. The default quality/diagnostic route is stable `eigh` basis init, `batch_size=4`, `seq_len=1024`, faithful SYNTH right-padded no-mask batches plus CCE. EOS-packed no-mask batches are still the explicit throughput route; use them only when the claim is packed throughput or packed-LM behavior. HF/full-logits loss remains a stop condition unless the work is explicitly reframed as an unoptimized ablation. Random basis init is an explicit ablation/stress path, not a default-quality shortcut. Prefer:
 
 ```bash
 uv run python experiments/llm_synth_smoke.py --measure-steps 200
@@ -167,19 +167,26 @@ SYNTH is not a toy here. Clean, low-noise target data is useful for measuring ad
 
 The evaluation target is distribution adaptation with retention, not merely short-run loss descent.
 
+The current faithful stream contract is: train on SYNTH train, evaluate target movement on held-out SYNTH, and evaluate source behavior on a separate broad pretraining-style corpus. The accessible source corpus is `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled`, using the first parquet shard when a small local source sensor is needed. If source loss improves during SYNTH adaptation, report that literally: this source shard did not expose forgetting. Do not call it retention solved.
+
+Input formatting is a first-class evaluation risk. The harness now has a faithful SYNTH diagnostic lane by default: one row per sequence, right-padded fixed length, explicit first divider, labels masked with `-100` for padding plus question/divider, and training on the reasoning/answer body. Before treating an optimizer curve as meaningful, still inspect the exact text stream when the format changes: SYNTH row conversion, HF row conversion, tokenizer BOS/EOS behavior, document separators, decoded blocks, and absence of chat/template contamination. A base model that greedily emits ordinary document/wiki prose while the harness trains on query + markdown reasoning traces is a format-contact fact, not decoration. BOS can be present as context while its label is masked with `-100`; this does not require an `attention_mask` when examples are right-padded under causal attention.
+
+Gradient norms are also a first-class sensor, but only when their definition is explicit. Raw dense `.grad` norms are not optimizer update norms. Aurora, orthogonalization, and Muon scaling happen after raw gradients are formed. If raw norms look wrong, compare CCE to ordinary CE on the same batch, break the norm down by parameter scope/class, compare another model on the same packed text, then measure update/param. Do not blame SumoTrack geometry for a pre-step gradient until the update path is measured.
+
 Useful evaluation signals:
 
 - target validation loss curve,
 - source/retention validation loss curve,
-- tokens per optimizer step without gradient accumulation,
-- wall-clock tokens/sec,
-- peak CUDA memory,
-- optimizer state bytes by matrix/fallback/total,
+- exact decoded train/eval packed blocks, tokenizer special-token behavior, and document boundary policy,
+- raw gradient norm by data stream, model, and parameter scope,
 - update/param and grad/param diagnostics,
+- peak CUDA memory when scale changes,
+- optimizer state bytes by matrix/fallback/total,
 - basis motion / orthonormality diagnostics when testing tracking,
+- tokens per optimizer step and wall-clock tokens/sec only when throughput is the named question,
 - qualitative generation only after quantitative movement is real.
 
-The next serious evaluation harness should support periodic validation and structured output. But harness work is only justified when it lets us answer an algorithm question faster.
+The harness should support periodic validation and structured output, but harness work is only justified when it lets us answer an algorithm question faster. Output sample text artifacts to files when investigating format; do not force the user to infer stream shape from summary prose.
 
 ## Future leads
 
@@ -187,14 +194,15 @@ This is the active lead list distilled from the old phase checklist. It is not a
 
 ### Must carry forward
 
-1. **Retention/source validation is the next truth sensor.** Aurora has enough target-only evidence. The next meaningful run needs a distinct source corpus and periodic retention validation so target movement can be judged against forgetting.
-2. **Basis movement and residual diagnostics.** Add minimal per-step or per-refresh metrics for basis motion, projected-gradient residual, and transported-moment drift. Grassmann smoothing should be tuned by observed adaptation area, not by the pleasant scent of differential geometry.
-3. **Realistic-token throughput.** Measure bucketed Aurora at 32k+ tokens/optimizer step with no gratuitous norm logging. The useful signal is tokens/sec, peak CUDA, and whether gradient accumulation was actually avoided.
-4. **Fallback policy under broad training.** Non-2D fallback state is small in LFM, but embeddings, norms, biases, and tiny conv kernels need a principled policy before Gemma-scale claims. Decide what trains, what freezes, and what fallback optimizer is acceptable.
-5. **State and resume invariants.** Keep tests for matrix projected-state shape, fallback accounting, bf16 behavior, and mixed state-dict resume. Optimizer bugs love reload boundaries.
-6. **HeavyBall-native path only after geometry earns it.** Move hot paths toward HeavyBall transforms/ECC when Aurora + tracking + retention look worth productizing. Do not hide algorithm uncertainty behind framework plumbing.
-7. **Projected-gradient hooks remain isolated and late.** Avoiding full-gradient materialization may be the real memory frontier, but it needs equivalence tests against `project(full_gradient)` on tiny models before it touches the main optimizer.
-8. **Full backward-time gradient release is a future memory frontier.** Once `G_hat = project(G)` is materialized, SumoTrack can release the full gradient for that parameter. The current safe path can consume grads during optimizer step after projection, but flashoptim-style post-accumulate hooks need a bucket-aware/deferred design so immediate per-parameter release does not destroy same-shape Aurora batching or change basis-refresh semantics.
+1. **Input stream faithfulness remains a truth sensor, now encoded in the harness default.** Save and inspect actual decoded examples whenever the row format, tokenizer, or batching mode changes. The old packed artifacts explain why the previous curves were not retention evidence; the current default faithful lane avoids row-boundary attention and masks the SYNTH question/divider.
+2. **Gradient-scale and update-scale separation.** Current probes show LFM2.5-350M has high raw dense gradients on SYNTH contact while CCE and ordinary CE agree. A Qwen3.5-2B-Base probe on the same text showed much lower raw norms but still above the user's normal pretraining/LoRA intuition. A faithful `bs8 + checkpointing` LR sweep found the useful knee below the old default: `1e-4` is the clean balance point and `3e-4` is the aggressive target-winning point, while `1e-3` is already past the knee on the source sensor. Do not reason from absolute update norm alone; let target/source curves choose.
+3. **Retention/source validation under the faithful lane.** Aurora has enough target-only evidence, but the earlier packed SYNTH/source curves are not retention evidence. Meaningful retention runs need the explicit stream contract: train SYNTH train, target eval held-out SYNTH, source eval external pretraining-style corpus, with boundary policy visible in decoded samples. Loss descent on a malformed stream is adaptation to mismatch, not product signal.
+4. **Basis movement and residual diagnostics remain useful, but later.** Add minimal per-refresh energy-capture/basis-motion sensors when they answer a specific failure mode. Do not revive broad projected-residual telemetry as metric gardening, but do not discard the lead; it remains relevant after format and scale are trustworthy.
+5. **Fallback policy under broad training.** Non-2D fallback state is small in LFM, but embeddings, norms, biases, and tiny conv kernels need a principled policy before Gemma-scale claims. Decide what trains, what freezes, and what fallback optimizer is acceptable.
+6. **State and resume invariants.** Keep tests for matrix projected-state shape, fallback accounting, bf16 behavior, and mixed state-dict resume. Optimizer bugs love reload boundaries.
+7. **HeavyBall-native path only after geometry earns it.** Move hot paths toward HeavyBall transforms/ECC when Aurora + tracking + retention look worth productizing. Do not hide algorithm uncertainty behind framework plumbing.
+8. **Projected-gradient hooks remain isolated and late.** Avoiding full-gradient materialization may be the real memory frontier, but it needs equivalence tests against `project(full_gradient)` on tiny models before it touches the main optimizer.
+9. **Full backward-time gradient release is a future memory frontier.** Once `G_hat = project(G)` is materialized, SumoTrack can release the full gradient for that parameter. The current safe path can consume grads during optimizer step after projection, but flashoptim-style post-accumulate hooks need a bucket-aware/deferred design so immediate per-parameter release does not destroy same-shape Aurora batching or change basis-refresh semantics.
 
 ### Conditional leads
 
@@ -209,29 +217,31 @@ This is the active lead list distilled from the old phase checklist. It is not a
 - Keep `RESULTS.md` as a brief experiment log: why the run existed, what was tested, what moved, and what was observed. Put exhaustive command/output detail in external logs when needed; keep current direction in this file.
 - Prefer deleting unsupported branches over keeping dormant flags. If an experiment is not active, preserve it in git history and docs, not in the public path.
 - Add tests for any policy default that encodes a design decision, especially backbone-facing side grouping and uniform-rank reporting.
+- Keep experiment reports linguistically faithful. “Source eval” means an evaluation stream, not training data. Bad labels can make a correct run look like it answered the wrong question.
 
 ## Near-term design cuts
 
 The next work should improve the algorithm under our feet:
 
-1. **Tracking smoothness diagnostics.** Instrument basis movement and projected-gradient residual so Grassmann smoothing can be reasoned about as adaptation-area control, not just speed.
-2. **Medium SYNTH adaptation run with retention/source validation.** Use the current defaults and a real source corpus to see curve shape and preservation behavior. The target-only Aurora question has enough evidence; the product question is whether that movement preserves useful source behavior.
-3. **Realistic-token Aurora amortization.** Run 32k+ tokens/optimizer step without `--log-norms` unless diagnostics are the point. Measure tokens/sec, peak CUDA, and whether no-gradient-accumulation is practical. The packed 256-token smoke shows cycle knobs matter at tiny shapes, but it does not answer the amortized product question.
-4. **Qwen3.5 fast-path throughput follow-up.** The memory check says `batch=1, seq=1024` fits with random basis init, but `batch=4, seq=1024` is still a near-edge fit/OOM depending on GPU occupancy. The next question is whether batch 3 is the practical ceiling on this card under the faithful CCE/no-mask route.
+1. **Refine the faithful `bs8 + checkpointing` LR/update-scale knee.** The broad 1k sweep across `1e-5` to `1e-3` says `1e-4` is the balanced point, `3e-4` is target-best with extra source cost, and `1e-3` is past the knee. Stay in the `1e-4–3e-4` neighborhood unless a longer run changes the tradeoff.
+2. **Keep update sanity visible on every scale run.** Log raw grad norm, update norm, and update/param at cadence. The old `~0.35` update norm was not intrinsically disqualifying, but the faithful lane achieved better target/source tradeoff at lower update norms around `0.04–0.07`.
+3. **Use Qwen3.5-2B-Base only as a calibration probe unless explicitly promoted.** OOM-safe CCE probes at `batch=1`, short sequence length are enough to answer whether LFM is uniquely high-gradient on the same text. Do not turn Qwen into the main benchmark lane by accident.
+4. **If `bs16`-equivalent signal is needed, use grad accumulation or real memory cuts.** Checkpointing got `batch_size=8`, but the card remains effectively full; do not assume another batch-size rung exists.
+5. **Throughput can wait, but remains a product lead.** Realistic-token Aurora amortization remains useful; it is just not the next cut unless the user explicitly reopens throughput. Current uncertainty is update-scale/source tradeoff under the faithful lane, not launch overhead.
 
 ## Next session contract
 
-Start from the 1k Aurora result and the side evaluation. Residual-facing side beats AUTO decisively, uniform rank 64 is the harness policy, CCE is the default loss path, and Aurora's per-step overhead amortizes with token count. The unknown has narrowed to retention/source behavior and basis smoothing.
+Start from the faithful-format 1k comparison and LR sweep, not from throughput. Residual-facing side, uniform rank 64, stable `eigh` basis init, CCE, faithful right-padded SYNTH batches, and Aurora remain the quality/diagnostic harness mainline. EOS-packed no-mask remains a throughput lane. The active unknown is now the exact source-tolerable point in the `1e-4–3e-4` LR neighborhood, not whether frequent refresh or packed batching fixes the issue.
 
-Default harness model is `LiquidAI/LFM2.5-350M-Base`; `LiquidAI/LFM2.5-1.2B-Base` remains a continuity/reference baseline. Use the 1.2B only by naming it explicitly when preserving comparison continuity matters. Do not let cache convenience choose the model.
+Default harness model is `LiquidAI/LFM2.5-350M-Base`; stay there until the user explicitly authorizes going up. `LiquidAI/LFM2.5-1.2B-Base` remains a continuity/reference baseline. `Qwen/Qwen3.5-2B-Base` is a calibration model for gradient-scale/model-specific behavior, but use OOM-safe probes and do not let it become the main benchmark by cache convenience.
 
 Minimum useful next session:
 
-1. Add minimal per-step basis-motion instrumentation so Grassmann smoothing can be tuned by refresh cadence rather than belief.
-2. Use the retention/source validation output with a real source corpus, not SYNTH-as-retention.
-3. Measure one realistic-token run using defaults unless deliberately testing one axis; on the local 12GB card, use random basis init if exact SVD cold-start OOMs again.
-4. If pursuing Qwen3.5, solve the `causal-conv1d` toolchain first; `flash-linear-attention` alone does not clear the target ceiling.
-5. Do not spend on AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or rank-allocation horse races.
+1. Run a narrower or longer `LiquidAI/LFM2.5-350M-Base` faithful `bs8 + activation_checkpointing` LR/update-scale check around `1e-4–3e-4`, with source eval and wandb cadence sensors.
+2. Keep default `basis_refresh_interval=100` unless a targeted tracking metric proves refresh cadence is the bottleneck.
+3. If more token mass is needed, choose grad accumulation or a memory-cut experiment explicitly; do not pretend `batch_size=16` is free on this card.
+4. If comparing Qwen, keep it to OOM-safe CCE gradient calibration unless the user explicitly asks for a training run.
+5. Do not spend on throughput, AdamW, topology proof, ECC, projected-gradient hooks, HeavyBall-vs-Aurora reruns, two-sided revival, schedule/budget archaeology, or rank-allocation horse races unless the user changes the question.
 
 Falsifier: if Aurora's target advantage disappears when source/retention is measured, or if side-rank wins are noise at longer horizons, revisit the direction map and allocation.
 

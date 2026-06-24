@@ -19,7 +19,7 @@ class ProjectionSide(StrEnum):
 class ProjectorInitMethod(StrEnum):
     """How an unfitted projector initializes its basis."""
 
-    SVD = "svd"
+    EIGH = "eigh"
     RANDOM = "random"
 
 
@@ -38,7 +38,7 @@ class SubspaceProjector:
 
     rank: int = 32
     side: ProjectionSide | str = ProjectionSide.AUTO
-    init_method: ProjectorInitMethod | str = ProjectorInitMethod.SVD
+    init_method: ProjectorInitMethod | str = ProjectorInitMethod.EIGH
     basis: Tensor | None = None
     resolved_side: ProjectionSide | None = field(default=None, init=False)
 
@@ -63,20 +63,34 @@ class SubspaceProjector:
         return min(self.rank, matrix.shape[0], matrix.shape[1])
 
     @torch.no_grad()
-    def fit_svd(self, matrix: Tensor) -> Tensor:
-        """Initialize or refresh the basis from an exact SVD of ``matrix``."""
+    def fit_eigh(self, matrix: Tensor) -> Tensor:
+        """Initialize or refresh the basis from a stable side-Gram eigendecomposition."""
 
         self._check_matrix(matrix)
         side = self.effective_side(matrix)
         rank = self.effective_rank(matrix)
 
-        svd_input = self._svd_input(matrix)
-        u, _s, vh = torch.linalg.svd(svd_input, full_matrices=False)
+        work = self._spectral_input(matrix)
+        norm = work.norm()
+        if norm == 0:
+            return self.fit_random(matrix)
+        work = work / norm.clamp_min(1e-12)
+
+        gram = work.mT @ work if side is ProjectionSide.RIGHT else work @ work.mT
+        gram = 0.5 * (gram + gram.mT)
+
+        try:
+            _eigenvalues, eigenvectors = torch.linalg.eigh(gram)
+        except RuntimeError:
+            eye = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+            trace = gram.diagonal().sum()
+            jitter = 1e-6 * (trace / max(1, gram.shape[0])).clamp_min(1e-12)
+            _eigenvalues, eigenvectors = torch.linalg.eigh(gram + jitter * eye)
 
         if side is ProjectionSide.RIGHT:
-            basis = vh[:rank, :]
+            basis = eigenvectors[:, -rank:].mT
         elif side is ProjectionSide.LEFT:
-            basis = u[:, :rank]
+            basis = eigenvectors[:, -rank:]
         else:  # pragma: no cover - effective_side never returns AUTO
             raise AssertionError(f"unexpected effective side: {side}")
 
@@ -109,15 +123,15 @@ class SubspaceProjector:
 
     @torch.no_grad()
     def fit(self, matrix: Tensor) -> Tensor:
-        if self.init_method is ProjectorInitMethod.SVD:
-            return self.fit_svd(matrix)
+        if self.init_method is ProjectorInitMethod.EIGH:
+            return self.fit_eigh(matrix)
         if self.init_method is ProjectorInitMethod.RANDOM:
             return self.fit_random(matrix)
         raise AssertionError(f"unexpected init method: {self.init_method}")
 
     @torch.no_grad()
     def project(self, matrix: Tensor) -> Tensor:
-        """Project ``matrix`` into the current basis, fitting by SVD if needed."""
+        """Project ``matrix`` into the current basis, fitting if needed."""
 
         basis = self._basis_for(matrix)
         if self.effective_side(matrix) is ProjectionSide.RIGHT:
@@ -162,7 +176,7 @@ class SubspaceProjector:
             raise ValueError(f"step_size must be positive, got {step_size}")
         basis = self._basis_for(matrix)
         side = self._basis_side()
-        work_matrix = self._svd_input(matrix)
+        work_matrix = self._spectral_input(matrix)
         work_basis = basis.float() if basis.dtype in (torch.float16, torch.bfloat16) else basis
 
         if side is ProjectionSide.RIGHT:
@@ -230,9 +244,11 @@ class SubspaceProjector:
             raise ValueError(f"matrix dimensions must be non-empty, got shape {tuple(matrix.shape)}")
 
     @staticmethod
-    def _svd_input(matrix: Tensor) -> Tensor:
+    def _spectral_input(matrix: Tensor) -> Tensor:
         if matrix.dtype in (torch.float16, torch.bfloat16):
-            return matrix.float()
+            matrix = matrix.float()
+        if not torch.isfinite(matrix).all():
+            raise RuntimeError("cannot fit a projection basis from non-finite matrix values")
         return matrix
 
     @staticmethod

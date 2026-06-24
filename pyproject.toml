@@ -10,6 +10,8 @@ dependencies = [
     "heavyball",
     "transformers>=5.12.0",
     "pyarrow>=24.0.0",
+    "huggingface-hub>=1.19.0",
+    "wandb>=0.23.0",
     "cut-cross-entropy>=25.1.1",
     "flash-linear-attention>=0.5.0",
     "causal-conv1d>=1.6.2.post1",

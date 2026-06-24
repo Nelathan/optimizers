@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 from torch import Tensor
@@ -53,7 +53,7 @@ class SumoTrack(Optimizer):
         weight_decay: float = 0.0,
         rank: int = 32,
         side: ProjectionSide | str = ProjectionSide.AUTO,
-        basis_init: str = "svd",
+        basis_init: str = "eigh",
         grassmann_step_size: float = 0.01,
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
@@ -107,6 +107,7 @@ class SumoTrack(Optimizer):
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
+        self.diagnostics_leverage_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
 
     @torch.no_grad()
@@ -143,12 +144,12 @@ class SumoTrack(Optimizer):
 
         return loss
 
-    def _new_diagnostics(self) -> dict[str, float] | None:
+    def _new_diagnostics(self) -> dict[str, Any] | None:
         if not self.diagnostics_enabled:
             return None
         return {
-            "matrix_update_norm_sq": 0.0,
-            "fallback_update_norm_sq": 0.0,
+            "matrix_update_norm_sq": None,
+            "fallback_update_norm_sq": None,
             "matrix_params": 0,
             "fallback_params": 0,
             "projected_leverage_cv_sum": 0.0,
@@ -157,12 +158,20 @@ class SumoTrack(Optimizer):
             "projected_leverage_tensors": 0,
         }
 
-    def _finalize_diagnostics(self, diagnostics: dict[str, float] | None) -> dict[str, float]:
+    def _finalize_diagnostics(self, diagnostics: dict[str, Any] | None) -> dict[str, float]:
         if diagnostics is None:
             return {}
-        diagnostics["matrix_update_norm"] = diagnostics["matrix_update_norm_sq"] ** 0.5
-        diagnostics["fallback_update_norm"] = diagnostics["fallback_update_norm_sq"] ** 0.5
-        diagnostics["update_norm"] = (diagnostics["matrix_update_norm_sq"] + diagnostics["fallback_update_norm_sq"]) ** 0.5
+        matrix_norm_sq = diagnostics["matrix_update_norm_sq"]
+        fallback_norm_sq = diagnostics["fallback_update_norm_sq"]
+        if matrix_norm_sq is None and fallback_norm_sq is None:
+            matrix_norm_sq = fallback_norm_sq = torch.tensor(0.0)
+        elif matrix_norm_sq is None:
+            matrix_norm_sq = fallback_norm_sq.new_zeros(())
+        elif fallback_norm_sq is None:
+            fallback_norm_sq = matrix_norm_sq.new_zeros(())
+        diagnostics["matrix_update_norm"] = float(matrix_norm_sq.sqrt().detach().cpu())
+        diagnostics["fallback_update_norm"] = float(fallback_norm_sq.sqrt().detach().cpu())
+        diagnostics["update_norm"] = float((matrix_norm_sq + fallback_norm_sq).sqrt().detach().cpu())
         count = diagnostics["projected_leverage_tensors"]
         diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
@@ -229,17 +238,19 @@ class SumoTrack(Optimizer):
 
     def _apply_matrix_update(self, entry: MatrixUpdate, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
         if diagnostics is not None:
-            leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
-            diagnostics["projected_leverage_cv_sum"] += leverage_cv
-            diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
-            diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
-            diagnostics["projected_leverage_tensors"] += 1
+            if self.diagnostics_leverage_enabled:
+                leverage_cv, min_ratio, max_ratio = self._large_axis_leverage_stats(update_hat)
+                diagnostics["projected_leverage_cv_sum"] += leverage_cv
+                diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
+                diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
+                diagnostics["projected_leverage_tensors"] += 1
         update = entry.projector.project_back(update_hat).to(dtype=entry.param.dtype)
 
         if group["weight_decay"]:
             entry.param.mul_(1.0 - group["lr"] * group["weight_decay"])
         if diagnostics is not None:
-            diagnostics["matrix_update_norm_sq"] += float((update.float().norm() * group["lr"]).square().detach().cpu())
+            update_norm_sq = (update.float().norm() * group["lr"]).square().detach()
+            diagnostics["matrix_update_norm_sq"] = update_norm_sq if diagnostics["matrix_update_norm_sq"] is None else diagnostics["matrix_update_norm_sq"] + update_norm_sq
             diagnostics["matrix_params"] += entry.param.numel()
         entry.param.add_(update, alpha=-group["lr"])
 
@@ -271,8 +282,10 @@ class SumoTrack(Optimizer):
             False,
         )
         if diagnostics is not None:
+            assert before is not None
             delta = p.detach().float() - before.float()
-            diagnostics["fallback_update_norm_sq"] += float(delta.norm().square().detach().cpu())
+            update_norm_sq = delta.norm().square().detach()
+            diagnostics["fallback_update_norm_sq"] = update_norm_sq if diagnostics["fallback_update_norm_sq"] is None else diagnostics["fallback_update_norm_sq"] + update_norm_sq
             diagnostics["fallback_params"] += p.numel()
 
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict) -> None:
