@@ -71,35 +71,11 @@ def mean_scalar(values: list[float | int | torch.Tensor]) -> float:
     return sum(finite) / len(finite) if finite else float("nan")
 
 
-def final_wandb_metrics(prefix: str, result: dict[str, float | int | str]) -> dict[str, float | int]:
-    keys = (
-        "initial_val_loss",
-        "final_val_loss",
-        "initial_retention_val_loss",
-        "final_retention_val_loss",
-        "retention_val_loss_delta",
-        "last_measured_train_loss",
-        "mean_logged_grad_norm",
-        "mean_logged_param_norm",
-        "mean_logged_update_norm",
-        "mean_logged_update_to_param_ratio",
-        "measured_tokens_per_second",
-        "measured_step_seconds",
-        "peak_cuda_bytes",
-        "peak_cuda_reserved_bytes",
-    )
-    return {f"{prefix}/final_{key}": value for key in keys if isinstance((value := result.get(key)), (int, float))}
-
-
-def optimizer_projected_leverage_stats(optimizer: torch.optim.Optimizer) -> tuple[float, float, float]:
+def optimizer_basis_rotation(optimizer: torch.optim.Optimizer) -> float:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
-        return float("nan"), float("nan"), float("nan")
-    return (
-        float(diagnostics.get("mean_projected_leverage_cv", float("nan"))),
-        float(diagnostics.get("mean_projected_leverage_min_ratio", float("nan"))),
-        float(diagnostics.get("mean_projected_leverage_max_ratio", float("nan"))),
-    )
+        return float("nan")
+    return float(diagnostics.get("mean_basis_rotation_chordal", float("nan")))
 
 
 def parquet_table_to_texts(table) -> list[str]:
@@ -441,12 +417,14 @@ def train_step(
     start_index: int,
     grad_accum_steps: int,
     collect_norms: bool,
-    collect_leverage: bool,
+    collect_basis: bool,
 ) -> dict[str, float | torch.Tensor]:
     if hasattr(optimizer, "diagnostics_enabled"):
-        optimizer.diagnostics_enabled = collect_norms
+        optimizer.diagnostics_enabled = collect_norms or collect_basis
     if hasattr(optimizer, "diagnostics_leverage_enabled"):
-        optimizer.diagnostics_leverage_enabled = collect_leverage
+        optimizer.diagnostics_leverage_enabled = False
+    if hasattr(optimizer, "diagnostics_basis_enabled"):
+        optimizer.diagnostics_basis_enabled = collect_basis
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
@@ -458,7 +436,7 @@ def train_step(
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
-    leverage_cv, leverage_min_ratio, leverage_max_ratio = optimizer_projected_leverage_stats(optimizer) if collect_leverage else (float("nan"), float("nan"), float("nan"))
+    basis_rotation_chordal = optimizer_basis_rotation(optimizer) if collect_basis else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
     return {
@@ -467,9 +445,7 @@ def train_step(
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
-        "projected_leverage_cv": leverage_cv,
-        "projected_leverage_min_ratio": leverage_min_ratio,
-        "projected_leverage_max_ratio": leverage_max_ratio,
+        "basis_rotation_chordal": basis_rotation_chordal,
     }
 
 
@@ -521,6 +497,7 @@ def run_optimizer(
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
             consume_grad=not args.keep_grads_after_step,
+            compile_tensor_kernels=args.torch_compile,
         )
     elif optimizer_name in {"adamw", "torch_adamw"}:
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
@@ -554,6 +531,7 @@ def run_optimizer(
         should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
         should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
         collect_norms = should_log_train
+        collect_basis = should_log_train
         step_result = train_step(
             model,
             optimizer,
@@ -562,7 +540,7 @@ def run_optimizer(
             batch_index,
             args.grad_accum_steps,
             collect_norms,
-            args.log_norms and should_log_train,
+            collect_basis,
         )
         measured_steps.append(step_result)
         loss_window.append(step_result["loss"])
@@ -574,16 +552,8 @@ def run_optimizer(
                 f"{optimizer_name}/grad_norm": scalar(step_result["grad_norm"]),
                 f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
                 f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
+                f"{optimizer_name}/basis_rotation_chordal": scalar(step_result["basis_rotation_chordal"]),
             }
-            if args.log_norms:
-                train_metrics.update(
-                    {
-                        f"{optimizer_name}/param_norm": scalar(step_result["param_norm"]),
-                        f"{optimizer_name}/projected_leverage_cv": scalar(step_result["projected_leverage_cv"]),
-                        f"{optimizer_name}/projected_leverage_min_ratio": scalar(step_result["projected_leverage_min_ratio"]),
-                        f"{optimizer_name}/projected_leverage_max_ratio": scalar(step_result["projected_leverage_max_ratio"]),
-                    }
-                )
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -613,9 +583,7 @@ def run_optimizer(
     measured_param_norms = [step["param_norm"] for step in measured_steps]
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
-    measured_leverage_cvs = [step["projected_leverage_cv"] for step in measured_steps]
-    measured_leverage_min_ratios = [step["projected_leverage_min_ratio"] for step in measured_steps]
-    measured_leverage_max_ratios = [step["projected_leverage_max_ratio"] for step in measured_steps]
+    measured_basis_rotation_chordal = [step["basis_rotation_chordal"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
@@ -655,9 +623,7 @@ def run_optimizer(
         "mean_logged_param_norm": mean_scalar(measured_param_norms),
         "mean_logged_update_norm": mean_scalar(measured_update_norms),
         "mean_logged_update_to_param_ratio": mean_scalar(measured_update_to_param_ratios),
-        "mean_logged_projected_leverage_cv": mean_scalar(measured_leverage_cvs),
-        "mean_logged_projected_leverage_min_ratio": mean_scalar(measured_leverage_min_ratios),
-        "mean_logged_projected_leverage_max_ratio": mean_scalar(measured_leverage_max_ratios),
+        "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
         "peak_cuda_bytes": peak,
@@ -697,8 +663,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
-    parser.add_argument("--torch-compile", action="store_true", help="compile the model forward/backward with torch.compile")
-    parser.add_argument("--attn-implementation", default="", help="optional Transformers attention implementation, e.g. flash_attention_2, sdpa, eager")
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="compile the model forward/backward and SumoTrack tensor kernels with torch.compile; the Python optimizer step remains eager",
+    )
+    parser.add_argument("--attn-implementation", default="sdpa", help="Transformers attention implementation; local default is sdpa until real flash kernels are available")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
     parser.add_argument("--eval-every", type=int, default=0, help="periodically log target/source validation loss every N measured steps; 0 disables")
@@ -706,7 +676,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="sumotrack")
     parser.add_argument("--wandb-log-every", type=int, default=20, help="log train loss and core grad/update norms every N measured steps")
-    parser.add_argument("--log-norms", action="store_true", help="also log heavier norm/geometry diagnostics at wandb-log cadence")
     return parser
 
 
@@ -743,6 +712,8 @@ def main() -> None:
     if not 1 <= args.polar_ns_steps <= 5:
         raise ValueError("polar_ns_steps must be in [1, 5]")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     model_name = args.model
 
     total_train_steps = args.warmup_steps + args.measure_steps
@@ -773,7 +744,7 @@ def main() -> None:
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce "
-        f"skip_validation={args.skip_validation} eval_every={args.eval_every} log_norms={args.log_norms} "
+        f"skip_validation={args.skip_validation} eval_every={args.eval_every} "
         f"wandb_run={args.wandb_run or 'none'} wandb_entity={args.wandb_entity} consume_grad={not args.keep_grads_after_step}"
     )
 
@@ -789,7 +760,6 @@ def main() -> None:
                 optimizer_name = "sumotrack"
             result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, retention_texts, device, wandb_run=wandb_run)
             prefix = optimizer_name
-            wandb_log(wandb_run, final_wandb_metrics(prefix, result), step=args.measure_steps)
             for key, value in result.items():
                 if key == "optimizer":
                     continue

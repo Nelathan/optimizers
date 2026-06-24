@@ -2,6 +2,63 @@
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
+## 2026-06-24: Compile and basis-rotation telemetry cleanup
+
+Question: can we use `torch.compile` without compiling Python optimizer bookkeeping, and is basis refresh telemetry worth keeping in routine wandb runs?
+
+Compile result: compiling the whole `optimizer.step()` failed before measured training because Dynamo specialized on `Parameter` object identity through the fallback path and HeavyBall fused Adam internals. The viable cut is targeted compile: compile the model forward/backward and SumoTrack's pure tensor orthogonalization kernel, while leaving Python optimizer state/bookkeeping eager. A 2-step smoke and a 100-step smoke both passed with `--torch-compile`, SDPA, faithful SYNTH batches, activation checkpointing, and LR `2e-4`; no quality claim is attached to those smokes.
+
+Basis telemetry result: the 250-step and accidental uncompiled 1k telemetry runs both showed the same shape. Basis-capture before/after refresh was essentially flat (`~+3e-4`), so capture did not explain the run and is not useful routine telemetry. Chordal basis rotation is the remaining useful sensor: it is cheap enough to keep because it runs only at cadence/refresh and computes an SVD on the rank×rank basis overlap, not on model-sized matrices. In the 1k run, mean chordal rotation was lower than the 250-step probe (`~0.148` vs `~0.176`), so there is no current evidence that basis motion is exploding or that more frequent refresh is needed.
+
+Wandb cleanup decision: routine runs now log only `target_val_loss`, `source_val_loss`, `train_loss`, `grad_norm`, `update_norm`, `update_to_param_ratio`, and `basis_rotation_chordal`. Basis capture, top-1 rotation, leverage, param norm, memory summaries, and all `final_*` wandb summaries were dropped. Memory/state/final-loss numbers remain in terminal output and result records, not graph clutter.
+
+Refresh compile decision: do not compile the whole refresh path. It includes state lookup, basis replacement, moment transport, `eigh`/QR/Grassmann logic, shape/side branches, and diagnostics, and it only runs every refresh interval. If profiling later shows refresh is material, split a pure tensor refresh primitive and compile that; do not point Dynamo at the full refresh machinery.
+
+## 2026-06-24: Faithful SYNTH grad accumulation check at 2e-4
+
+Question: at the same total supervised-token budget, does `grad_accum=2` improve quality by reducing update noise, or does fewer optimizer updates lose target/source quality?
+
+Setup matched the `2e-4`, `bs8 + activation_checkpointing`, `pp=2/ns=5`, SDPA, faithful SYNTH baseline except `grad_accum_steps=2`, `measure_steps=500`, and `eval_every=50`. The `eval_every=50` choice aligned validation by token budget but made the wandb step-axis visually non-comparable to the 1000-step baseline; future same-token comparisons should keep `eval_every=100` for wandb consistency and compare token budget explicitly.
+
+Run: https://wandb.ai/pink-marker/sumotrack/runs/eahca2ey
+
+| run | optimizer steps | supervised tokens/update | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `grad_accum=1` baseline | 1000 | 6399 | `2.300731 → 1.776949` | `2.899437 → 3.010900` | `1.816579` | `9.482308` | `0.056273` | `0.000227` |
+| `grad_accum=2` | 500 | 12798 | `2.300731 → 1.795405` | `2.899438 → 3.018159` | `1.725927` | `6.868297` | `0.057202` | `0.000231` |
+
+Interpretation: ignore throughput here. At fixed total token budget and LR, `grad_accum=2` lost on quality: worse target and slightly worse source, with essentially matched update scale. It did reduce raw grad norm, but that did not translate into a better target/source curve. Do not promote gradient accumulation as a quality fix from this result.
+
+## 2026-06-24: Faithful SYNTH Aurora/NS cycle sweep at 2e-4
+
+Question: at the useful LR knee, how much Aurora / Newton-Schulz work is enough? Low tokens/step makes optimizer compute worth watching, but the target is not perfect polar math; it is loss quality per memory-constrained step.
+
+Shared setup:
+
+- Model: `LiquidAI/LFM2.5-350M-Base`.
+- Source sensor: first parquet shard from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (`data/train-00000-of-00100.parquet`).
+- Faithful SYNTH right-padded no-mask batches, CCE, broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, `basis_refresh_interval=100`, `batch_size=8`, `seq_len=1024`, activation checkpointing, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`, `sumotrack_lr=2e-4`.
+- Local attention contract: `attn_implementation=sdpa`. An earlier attempted run without pinning the local SDPA contract OOMed before training and is not optimizer evidence.
+- Actual supervised tokens/update: `6399`; sequence tokens/update: `8192`; optimizer state bytes: `48,486,400`; peak allocated CUDA: `9,878,730,240`.
+
+Runs:
+
+| Aurora pp | NS steps | wandb | target val loss | source val loss | last train loss | mean update norm | update/param | step sec |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 5 | https://wandb.ai/pink-marker/sumotrack/runs/8yn89vj9 | `2.300731 → 1.776949` (`-0.523782`) | `2.899437 → 3.010900` (`+0.111462`) | `1.816579` | `0.056273` | `0.000227` | `0.663540` |
+| 1 | 1 | https://wandb.ai/pink-marker/sumotrack/runs/6vlwt7ef | `2.300731 → 1.826631` (`-0.474100`) | `2.899438 → 3.018623` (`+0.119185`) | `1.868589` | `0.052900` | `0.000214` | `0.651163` |
+| 1 | 2 | https://wandb.ai/pink-marker/sumotrack/runs/tldgmkm9 | `2.300731 → 1.789151` (`-0.511580`) | `2.899438 → 3.000318` (`+0.100880`) | `1.829834` | `0.056128` | `0.000227` | `0.618963` |
+| 1 | 3 | https://wandb.ai/pink-marker/sumotrack/runs/lkptzi0s | `2.300731 → 1.802733` (`-0.497998`) | `2.899438 → 3.015043` (`+0.115605`) | `1.843152` | `0.054630` | `0.000221` | `0.475700` |
+| 1 | 5 | https://wandb.ai/pink-marker/sumotrack/runs/24m68537 | `2.300731 → 1.779830` (`-0.520901`) | `2.899438 → 3.009695` (`+0.110257`) | `1.821850` | `0.056691` | `0.000229` | `0.431666` |
+
+Interpretation:
+
+- `2e-4` itself lands in the useful LR knee: better target than `1e-4`, slightly less source cost than `3e-4`, and much less source cost than `1e-3`.
+- `pp=1, ns=1` is visibly too cheap: worse target and no source benefit.
+- `pp=1, ns=2` is the interesting cheap candidate: target is close to default, source is slightly better, update scale is matched.
+- `pp=1, ns=5` essentially matches the default `pp=2, ns=5` curve in this run, suggesting the second Aurora precondition pass is not obviously earning its keep at this scale.
+- Step-time ordering in this single sequential sweep is noisy enough that it should not be overfit, but all useful `pp=1` candidates avoided a quality collapse. The next default-candidate comparison should focus on `pp=1, ns=2` versus `pp=1, ns=5` and current `pp=2, ns=5` under the same LR/source contract, not expand the grid.
+
 ## 2026-06-24: Faithful SYNTH LR knee sweep
 
 Question: under the faithful `bs8 + activation_checkpointing` diagnostic lane, where is the useful SumoTrack LR/update-scale knee? SumoTrack already applies Muon-style scaling, so do not assume it needs Muon's larger raw LR priors.
@@ -55,7 +112,7 @@ Shared setup:
 - Model: `LiquidAI/LFM2.5-350M-Base`.
 - Source sensor: first parquet shard from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (`data/train-00000-of-00100.parquet`).
 - Harness defaults unless named: broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, Aurora, CCE, faithful SYNTH right-padded no-mask batches, `seq_len=1024`, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`, wandb log cadence 20.
-- Core wandb sensors were cleaned to cadence-log train loss, raw grad norm, update norm, and update/param. Heavier projected-leverage diagnostics now require `--log-norms` explicitly. Final wandb summaries are curated rather than dumping every numeric config field.
+- Historical note: this section predates the later telemetry cleanup. Current routine wandb sensors are only target/source validation loss, train loss, raw grad norm, update norm, update/param, and basis rotation chordal. Leverage and basis-capture graphs are not routine harness telemetry.
 - `peak_cuda_bytes` is PyTorch peak allocated tensor memory, not driver-visible reserved VRAM. The harness now also records `peak_cuda_reserved_bytes` for future runs because checkpointed runs can still leave the card nearly full even when allocated peak is below total VRAM.
 
 Runs:
@@ -96,7 +153,6 @@ uv run python experiments/llm_synth_smoke.py \
   --warmup-steps 0 \
   --measure-steps 1 \
   --batching synth_right_padded_no_mask \
-  --log-norms \
   --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
 ```
 

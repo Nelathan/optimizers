@@ -43,6 +43,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.aurora_pp_iterations, 2)
         self.assertEqual(args.polar_ns_steps, 5)
         self.assertEqual(args.basis_init, "eigh")
+        self.assertEqual(args.attn_implementation, "sdpa")
         self.assertFalse(args.activation_checkpointing)
         self.assertFalse(args.torch_compile)
         self.assertFalse(args.skip_validation)
@@ -58,6 +59,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertNotIn("--retention-val-texts", option_strings)
         self.assertNotIn("--print-shape-summary", option_strings)
         self.assertNotIn("--log-grad-norm", option_strings)
+        self.assertNotIn("--log-norms", option_strings)
 
     def test_packed_text_limit_scales_with_requested_tokens(self):
         self.assertEqual(packed_text_limit(blocks=1, batch_size=1, seq_len=128), 16)

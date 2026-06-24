@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -69,6 +70,28 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 1)
         self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 3)
         self.assertEqual(tuple(opt.state[weight]["projected_exp_avg"].shape), (8, 2))
+
+    def test_compile_tensor_kernels_targets_orthogonalization_only(self):
+        compiled_calls = []
+
+        def fake_compile(fn):
+            compiled_calls.append(fn)
+            return fn
+
+        with mock.patch("torch.compile", side_effect=fake_compile):
+            weight = torch.nn.Parameter(torch.randn(8, 5))
+            bias = torch.nn.Parameter(torch.randn(5))
+            opt = SumoTrack([weight, bias], lr=0.01, rank=2, compile_tensor_kernels=True)
+
+        self.assertEqual(compiled_calls, [SumoTrack._orthogonalize_aurora_muon_tensor])
+        self.assertIsNotNone(opt._compiled_orthogonalize_update)
+
+        weight.grad = torch.randn_like(weight)
+        bias.grad = torch.randn_like(bias)
+        opt.step()
+
+        self.assertEqual(tuple(opt.state[weight]["projected_exp_avg"].shape), (8, 2))
+        self.assertIn("exp_avg", opt.state[bias])
 
     def test_matrix_state_keeps_projected_moment_only(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
@@ -309,6 +332,25 @@ class SumoTrackTest(unittest.TestCase):
         self.assertIn("mean_projected_leverage_min_ratio", opt.last_step_diagnostics)
         self.assertIn("mean_projected_leverage_max_ratio", opt.last_step_diagnostics)
         self.assertLess(opt.last_step_diagnostics["mean_projected_leverage_cv"], 0.1)
+
+    def test_basis_refresh_diagnostics_measure_rotation(self):
+        torch.manual_seed(6)
+        weight = torch.nn.Parameter(torch.randn(16, 8))
+        opt = SumoTrack([weight], lr=0.01, rank=4, basis_refresh_interval=1)
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        opt.diagnostics_enabled = True
+        opt.diagnostics_basis_enabled = True
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        diagnostics = opt.last_step_diagnostics
+        self.assertEqual(diagnostics["basis_refresh_tensors"], 1.0)
+        self.assertGreaterEqual(diagnostics["mean_basis_rotation_chordal"], 0.0)
+        self.assertNotIn("mean_basis_capture_before", diagnostics)
+        self.assertNotIn("mean_basis_rotation_top1_sin", diagnostics)
 
     def test_grassmann_refresh_transports_projected_moment(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))

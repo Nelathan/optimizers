@@ -59,6 +59,7 @@ class SumoTrack(Optimizer):
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
         consume_grad: bool = True,
+        compile_tensor_kernels: bool = False,
         ecc: str | None = None,
         param_ecc: str | None = None,
     ) -> None:
@@ -103,12 +104,15 @@ class SumoTrack(Optimizer):
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
             consume_grad=consume_grad,
+            compile_tensor_kernels=compile_tensor_kernels,
             basis_refresh_step=0,
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
         self.diagnostics_leverage_enabled = False
+        self.diagnostics_basis_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
+        self._compiled_orthogonalize_update = torch.compile(SumoTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -131,7 +135,7 @@ class SumoTrack(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
-                    matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids))
+                    matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids, diagnostics))
                     if group["consume_grad"]:
                         p.grad = None
                 else:
@@ -156,6 +160,8 @@ class SumoTrack(Optimizer):
             "projected_leverage_min_ratio_sum": 0.0,
             "projected_leverage_max_ratio_sum": 0.0,
             "projected_leverage_tensors": 0,
+            "basis_rotation_chordal_sum": 0.0,
+            "basis_refresh_tensors": 0,
         }
 
     def _finalize_diagnostics(self, diagnostics: dict[str, Any] | None) -> dict[str, float]:
@@ -176,6 +182,9 @@ class SumoTrack(Optimizer):
         diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count if count else float("nan")
+        basis_count = diagnostics["basis_refresh_tensors"]
+        diagnostics["mean_basis_rotation_chordal"] = diagnostics["basis_rotation_chordal_sum"] / basis_count if basis_count else float("nan")
+        diagnostics["basis_refresh_tensors"] = float(basis_count)
         return diagnostics
 
     def _refresh_param_ids(self, group: dict, matrix_params: list[Tensor]) -> set[int]:
@@ -187,13 +196,13 @@ class SumoTrack(Optimizer):
             return {id(param) for param in matrix_params}
         return set()
 
-    def _prepare_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool) -> MatrixUpdate:
+    def _prepare_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool, diagnostics: dict | None) -> MatrixUpdate:
         state = self.state[p]
         state["step"] = state.get("step", 0) + 1
 
         projector = self._projector_from_state(p, group, state)
         if not projector.is_initialized or refresh_basis:
-            self._refresh_projector(projector, grad, group, state)
+            self._refresh_projector(projector, grad, group, state, diagnostics)
 
         projected_grad = projector.project(grad)
         projected_exp_avg = state.get("projected_exp_avg")
@@ -223,7 +232,7 @@ class SumoTrack(Optimizer):
         for bucket_entries in buckets.values():
             if len(bucket_entries) == 1:
                 update_hats = [
-                    self._orthogonalize_update(
+                    self._orthogonalize_update_runtime(
                         bucket_entries[0].projected_exp_avg,
                         group,
                         bucket_entries[0].original_shape,
@@ -231,7 +240,7 @@ class SumoTrack(Optimizer):
                 ]
             else:
                 stacked = torch.stack([entry.projected_exp_avg for entry in bucket_entries])
-                stacked_update_hats = self._orthogonalize_update(stacked, group, bucket_entries[0].original_shape)
+                stacked_update_hats = self._orthogonalize_update_runtime(stacked, group, bucket_entries[0].original_shape)
                 update_hats = list(stacked_update_hats.unbind(0))
             for entry, update_hat in zip(bucket_entries, update_hats, strict=True):
                 self._apply_matrix_update(entry, update_hat, group, diagnostics)
@@ -288,7 +297,7 @@ class SumoTrack(Optimizer):
             diagnostics["fallback_update_norm_sq"] = update_norm_sq if diagnostics["fallback_update_norm_sq"] is None else diagnostics["fallback_update_norm_sq"] + update_norm_sq
             diagnostics["fallback_params"] += p.numel()
 
-    def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict) -> None:
+    def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None) -> None:
         old_projected_exp_avg = state.get("projected_exp_avg")
         old_projector = None
         if projector.is_initialized and old_projected_exp_avg is not None:
@@ -300,6 +309,10 @@ class SumoTrack(Optimizer):
             projector.fit(grad)
         else:
             projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+
+        if old_projector is not None and diagnostics is not None and self.diagnostics_basis_enabled:
+            chordal = self._basis_rotation_chordal(old_projector, projector)
+            self._accumulate_basis_diagnostics(diagnostics, chordal)
 
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
@@ -314,8 +327,59 @@ class SumoTrack(Optimizer):
                 state.pop("projected_exp_avg", None)
 
     @staticmethod
+    def _basis_columns(projector: SubspaceProjector) -> Tensor:
+        if projector.basis is None:
+            raise RuntimeError("basis is not initialized")
+        side = projector.resolved_side if projector.resolved_side is not None else projector.side
+        return projector.basis.mT.float() if side is ProjectionSide.RIGHT else projector.basis.float()
+
+    @staticmethod
+    def _basis_rotation_chordal(old_projector: SubspaceProjector, new_projector: SubspaceProjector) -> float:
+        old_columns = SumoTrack._basis_columns(old_projector)
+        new_columns = SumoTrack._basis_columns(new_projector)
+        singular_values = torch.linalg.svdvals(old_columns.mT @ new_columns).clamp(0.0, 1.0)
+        chordal = (1.0 - singular_values.square()).sum().sqrt()
+        return float(chordal.detach().cpu())
+
+    @staticmethod
+    def _accumulate_basis_diagnostics(diagnostics: dict, chordal: float) -> None:
+        diagnostics["basis_rotation_chordal_sum"] += chordal
+        diagnostics["basis_refresh_tensors"] += 1
+
+    @staticmethod
     def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
         return SumoTrack._orthogonalize_aurora(update, group, original_shape)
+
+    def _orthogonalize_update_runtime(self, update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
+        if self._compiled_orthogonalize_update is None:
+            return self._orthogonalize_update(update, group, original_shape)
+        if original_shape is None or len(original_shape) < 2:
+            raise ValueError("compiled SumoTrack orthogonalization requires the original parameter shape")
+        rows = int(original_shape[0])
+        cols = int(math.prod(original_shape[1:]))
+        return self._compiled_orthogonalize_update(
+            update,
+            rows,
+            cols,
+            int(group.get("aurora_pp_iterations", AURORA_PP_ITERATIONS)),
+            int(group.get("polar_ns_steps", len(NEWTON_SCHULZ_COEFFICIENTS))),
+        )
+
+    @staticmethod
+    def _orthogonalize_aurora_muon_tensor(
+        update: Tensor,
+        original_rows: int,
+        original_cols: int,
+        aurora_pp_iterations: int,
+        polar_ns_steps: int,
+    ) -> Tensor:
+        aurora_update = SumoTrack._aurora_leverage_uniform_polar(
+            update,
+            pp_iterations=aurora_pp_iterations,
+            pp_beta=AURORA_PP_BETA,
+            polar_ns_steps=polar_ns_steps,
+        )
+        return aurora_update * math.sqrt(max(1.0, original_rows / original_cols))
 
     @staticmethod
     def _orthogonalize_aurora(update: Tensor, _group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
