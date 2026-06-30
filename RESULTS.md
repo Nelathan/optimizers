@@ -2,6 +2,8 @@
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
+This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract is in `PLAN.md`; durable facts distilled from these runs are in `INSIGHTS.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
+
 ## 2026-06-24: Compile and basis-rotation telemetry cleanup
 
 Question: can we use `torch.compile` without compiling Python optimizer bookkeeping, and is basis refresh telemetry worth keeping in routine wandb runs?
