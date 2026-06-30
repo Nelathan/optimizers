@@ -113,6 +113,44 @@ class SumoTrack(Optimizer):
         self.diagnostics_basis_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
         self._compiled_orthogonalize_update = torch.compile(SumoTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
+        self._queued_projected_grads: dict[Tensor, Tensor] = {}
+
+    @torch.no_grad()
+    def queue_projected_grad(self, param: Tensor, projected_grad: Tensor) -> None:
+        """Queue an already-projected matrix gradient for the next ``step``.
+
+        This is the explicit ingress for custom projected-activation backward
+        paths. The queued tensor must already live in SumoTrack's current basis;
+        basis initialization and refresh still require a full matrix gradient.
+        """
+
+        if not self._owns_param(param):
+            raise ValueError("cannot queue a projected gradient for a parameter not owned by this optimizer")
+        if param.ndim != 2:
+            raise ValueError(f"projected gradients are only supported for 2D matrix parameters, got shape {tuple(param.shape)}")
+        if projected_grad.ndim != 2:
+            raise ValueError(f"projected gradient must be 2D, got shape {tuple(projected_grad.shape)}")
+        if projected_grad.is_sparse:
+            raise RuntimeError("SumoTrack does not support sparse projected gradients")
+
+        projected_grad = projected_grad.detach()
+        existing = self._queued_projected_grads.get(param)
+        if existing is None:
+            self._queued_projected_grads[param] = projected_grad
+        else:
+            existing.add_(projected_grad)
+
+    def clear_projected_grads(self) -> None:
+        """Clear queued projected gradients without touching ``Parameter.grad``."""
+
+        self._queued_projected_grads.clear()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        super().zero_grad(set_to_none=set_to_none)
+        self.clear_projected_grads()
+
+    def _owns_param(self, param: Tensor) -> bool:
+        return any(param is candidate for group in self.param_groups for candidate in group["params"])
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -124,21 +162,25 @@ class SumoTrack(Optimizer):
         diagnostics = self._new_diagnostics()
 
         for group in self.param_groups:
-            matrix_params = [p for p in group["params"] if p.grad is not None and p.ndim == 2]
+            matrix_params = [p for p in group["params"] if p.ndim == 2 and (p.grad is not None or p in self._queued_projected_grads)]
             refresh_ids = self._refresh_param_ids(group, matrix_params)
             matrix_updates = []
 
             for p in group["params"]:
-                if p.grad is None:
+                has_queued_projected_grad = p in self._queued_projected_grads
+                if p.grad is None and not has_queued_projected_grad:
                     continue
                 grad = p.grad
-                if grad.is_sparse:
+                if grad is not None and grad.is_sparse:
                     raise RuntimeError("SumoTrack does not support sparse gradients")
                 if p.ndim == 2:
                     matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids, diagnostics))
                     if group["consume_grad"]:
                         p.grad = None
                 else:
+                    if has_queued_projected_grad:
+                        raise RuntimeError("queued projected gradients are only supported for 2D matrix parameters")
+                    assert grad is not None
                     self._step_fallback_param(p, grad, group, diagnostics)
                     if group["consume_grad"]:
                         p.grad = None
@@ -196,15 +238,34 @@ class SumoTrack(Optimizer):
             return {id(param) for param in matrix_params}
         return set()
 
-    def _prepare_matrix_update(self, p: Tensor, grad: Tensor, group: dict, refresh_basis: bool, diagnostics: dict | None) -> MatrixUpdate:
+    def _prepare_matrix_update(self, p: Tensor, grad: Tensor | None, group: dict, refresh_basis: bool, diagnostics: dict | None) -> MatrixUpdate:
+        queued_projected_grad = self._queued_projected_grads.pop(p, None)
+        if grad is not None and queued_projected_grad is not None:
+            raise RuntimeError("a matrix parameter cannot have both a full grad and a queued projected grad")
+
         state = self.state[p]
-        state["step"] = state.get("step", 0) + 1
-
         projector = self._projector_from_state(p, group, state)
-        if not projector.is_initialized or refresh_basis:
-            self._refresh_projector(projector, grad, group, state, diagnostics)
+        if queued_projected_grad is not None:
+            if not projector.is_initialized:
+                raise RuntimeError("queued projected gradients require an initialized SumoTrack basis; run a full-gradient step first")
+            if refresh_basis:
+                raise RuntimeError("queued projected gradients cannot refresh a SumoTrack basis; provide a full matrix gradient on refresh steps")
+            expected_shape = self._expected_projected_grad_shape(p, projector)
+            if tuple(queued_projected_grad.shape) != expected_shape:
+                raise ValueError(
+                    f"queued projected gradient shape {tuple(queued_projected_grad.shape)} does not match expected {expected_shape}"
+                )
+            if queued_projected_grad.device != p.device:
+                raise ValueError(f"queued projected gradient device {queued_projected_grad.device} does not match parameter device {p.device}")
+            projected_grad = queued_projected_grad
+        else:
+            if grad is None:
+                raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+            if not projector.is_initialized or refresh_basis:
+                self._refresh_projector(projector, grad, group, state, diagnostics)
+            projected_grad = projector.project(grad)
 
-        projected_grad = projector.project(grad)
+        state["step"] = state.get("step", 0) + 1
         projected_exp_avg = state.get("projected_exp_avg")
         if projected_exp_avg is None:
             projected_exp_avg = torch.zeros_like(projected_grad)
@@ -325,6 +386,17 @@ class SumoTrack(Optimizer):
             projected_shape = tuple(projector.project(grad).shape)
             if tuple(old_projected_exp_avg.shape) != projected_shape:
                 state.pop("projected_exp_avg", None)
+
+    @staticmethod
+    def _expected_projected_grad_shape(p: Tensor, projector: SubspaceProjector) -> tuple[int, int]:
+        if projector.basis is None:
+            raise RuntimeError("basis is not initialized")
+        side = projector.resolved_side if projector.resolved_side is not None else projector.side
+        if side is ProjectionSide.AUTO:
+            side = projector.effective_side(p)
+        if side is ProjectionSide.RIGHT:
+            return (p.shape[0], projector.basis.shape[0])
+        return (projector.basis.shape[1], p.shape[1])
 
     @staticmethod
     def _basis_columns(projector: SubspaceProjector) -> Tensor:

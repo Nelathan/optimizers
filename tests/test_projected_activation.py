@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sumotrack import SumoTrack
 from sumotrack.projected_activation import ProjectedActivationGradientSink, projected_activation_gated_mlp, projected_activation_linear
 
 
@@ -64,6 +65,39 @@ class ProjectedActivationTest(unittest.TestCase):
 
         self.assertIsNone(projected.weight.grad)
         self.assertTrue(torch.allclose(sink.projected_grads["shared"], reference.weight.grad @ basis.mT, atol=1e-12))
+
+    def test_linear_projected_grad_queues_into_sumotrack_optimizer(self):
+        torch.manual_seed(25)
+        batch, in_features, out_features, rank = 5, 7, 4, 3
+        warm_x = torch.randn(batch, in_features, dtype=torch.float64)
+        warm_target = torch.randn(batch, out_features, dtype=torch.float64)
+        x = torch.randn(batch, in_features, dtype=torch.float64)
+        target = torch.randn(batch, out_features, dtype=torch.float64)
+        reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
+        projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
+        projected.load_state_dict(reference.state_dict())
+        reference_opt = SumoTrack([reference.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100)
+        projected_opt = SumoTrack([projected.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100)
+
+        (reference(warm_x) - warm_target).square().mean().backward()
+        (projected(warm_x) - warm_target).square().mean().backward()
+        reference_opt.step()
+        projected_opt.step()
+
+        sink = ProjectedActivationGradientSink()
+        basis = projected_opt.state[projected.weight]["basis"]
+        reference_loss = (reference(x) - target).square().mean()
+        projected_loss = (projected_activation_linear(x, projected.weight, basis, sink, projected.weight) - target).square().mean()
+
+        reference_loss.backward()
+        projected_loss.backward()
+        projected_opt.queue_projected_grad(projected.weight, sink.projected_grads[projected.weight])
+        reference_opt.step()
+        projected_opt.step()
+
+        self.assertIsNone(projected.weight.grad)
+        self.assertTrue(torch.allclose(projected.weight, reference.weight, atol=1e-12))
+        self.assertTrue(torch.allclose(projected_opt.state[projected.weight]["projected_exp_avg"], reference_opt.state[reference.weight]["projected_exp_avg"], atol=1e-12))
 
     def test_gated_mlp_projected_grads_match_full_activation_facing_projection(self):
         torch.manual_seed(22)
@@ -185,6 +219,7 @@ class _TinyFusedProjectedGatedMlp(torch.nn.Module):
             self.gate.weight,
             self.up.weight,
             self.down.weight,
+            self.q_hidden,
             self.q_hidden,
             self.q_intermediate,
             self.sink,

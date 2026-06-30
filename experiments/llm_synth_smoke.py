@@ -4,7 +4,7 @@ import argparse
 import gc
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sumotrack import SumoTrack, optimizer_state_bytes_by_category
+from sumotrack.projected_activation import OptimizerProjectedGradientSink, projected_activation_gated_mlp
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
@@ -22,6 +23,7 @@ DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_2
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing"]
+ProjectedActivationBackend = Literal["off", "lfm-mlp"]
 BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
@@ -276,15 +278,17 @@ def build_sumotrack_param_groups(
     named_params: list[tuple[str, torch.nn.Parameter]],
     rank: int,
     projection_side_policy: ProjectionSidePolicy,
+    activation_projected_param_ids: set[int] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     if rank <= 0:
         raise ValueError(f"rank must be positive, got {rank}")
     policy_stats = {"effective_rank_min": 0, "effective_rank_max": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
 
     grouped: dict[str, list[torch.nn.Parameter]] = {}
+    activation_projected_param_ids = activation_projected_param_ids or set()
     for name, param in named_params:
         role = transformer_matrix_role(name, param)
-        side = storage_side_for_residual_axis(role, projection_side_policy)
+        side = "right" if id(param) in activation_projected_param_ids and param.ndim == 2 else storage_side_for_residual_axis(role, projection_side_policy)
         grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
             effective_rank = min(rank, *param.shape)
@@ -293,6 +297,104 @@ def build_sumotrack_param_groups(
             policy_stats[f"side_policy_{side}_tensors"] += 1
 
     return [{"params": params, "rank": rank, "side": side} for side, params in grouped.items()], policy_stats
+
+
+def lfm_mlp_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
+    modules = []
+    for _name, module in model.named_modules():
+        w1 = getattr(module, "w1", None)
+        w2 = getattr(module, "w2", None)
+        w3 = getattr(module, "w3", None)
+        if all(isinstance(linear, torch.nn.Linear) for linear in (w1, w2, w3)):
+            modules.append(module)
+    return modules
+
+
+def projected_activation_param_ids(model: torch.nn.Module, backend: ProjectedActivationBackend) -> set[int]:
+    if backend == "off":
+        return set()
+    if backend != "lfm-mlp":  # pragma: no cover - argparse constrains this
+        raise ValueError(f"unknown projected activation backend: {backend}")
+    ids: set[int] = set()
+    for module in lfm_mlp_modules(model):
+        ids.add(id(module.w1.weight))
+        ids.add(id(module.w2.weight))
+        ids.add(id(module.w3.weight))
+    return ids
+
+
+def install_projected_activation_backend(model: torch.nn.Module, optimizer: SumoTrack, backend: ProjectedActivationBackend) -> int:
+    if backend == "off":
+        return 0
+    if backend != "lfm-mlp":  # pragma: no cover - argparse constrains this
+        raise ValueError(f"unknown projected activation backend: {backend}")
+    sink = OptimizerProjectedGradientSink(optimizer)
+    installed = 0
+    for module in lfm_mlp_modules(model):
+        original_forward = module.forward
+        module.forward = _make_projected_activation_lfm_mlp_forward(module, optimizer, sink, original_forward)  # type: ignore[method-assign]
+        installed += 1
+    if installed == 0:
+        raise RuntimeError("projected activation backend lfm-mlp did not find any LFM MLP modules with w1/w2/w3 Linear children")
+    return installed
+
+
+def _make_projected_activation_lfm_mlp_forward(
+    module: torch.nn.Module,
+    optimizer: SumoTrack,
+    sink: OptimizerProjectedGradientSink,
+    fallback_forward: Callable[[torch.Tensor], torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        bases = _projected_activation_lfm_mlp_bases(module, optimizer)
+        if bases is None:
+            return fallback_forward(x)
+        gate_basis, up_basis, down_basis = bases
+        return projected_activation_gated_mlp(
+            x,
+            module.w1.weight,
+            module.w3.weight,
+            module.w2.weight,
+            gate_basis,
+            up_basis,
+            down_basis,
+            sink,
+            module.w1.weight,
+            module.w3.weight,
+            module.w2.weight,
+        )
+
+    return forward
+
+
+def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: SumoTrack) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    params = (module.w1.weight, module.w3.weight, module.w2.weight)
+    bases = []
+    for param in params:
+        group = _optimizer_group_for_param(optimizer, param)
+        if group is None or _sumotrack_group_refresh_due(group):
+            return None
+        state = optimizer.state.get(param, {})
+        basis = state.get("basis")
+        if basis is None or not state.get("projection_side_is_right", False):
+            return None
+        if basis.ndim != 2 or basis.shape[1] != param.shape[1]:
+            return None
+        bases.append(basis)
+    return bases[0], bases[1], bases[2]
+
+
+def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn.Parameter) -> dict | None:
+    for group in optimizer.param_groups:
+        if any(param is candidate for candidate in group["params"]):
+            return group
+    return None
+
+
+def _sumotrack_group_refresh_due(group: dict) -> bool:
+    step = group.get("basis_refresh_step", 0)
+    interval = group.get("basis_refresh_interval", 0)
+    return interval > 0 and step > 0 and step % interval == 0
 
 
 def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, min_batches: int):
@@ -569,10 +671,12 @@ def run_optimizer(
     model, tokenizer = load_model_and_tokenizer(model_name, device, args.activation_checkpointing, args.attn_implementation)
     trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
     trainable = [param for _name, param in trainable_named]
+    activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend)
     sumotrack_param_groups, policy_stats = build_sumotrack_param_groups(
         trainable_named,
         args.rank,
         args.projection_side_policy,
+        activation_projected_param_ids,
     )
     train_batch_count = (args.warmup_steps + args.measure_steps) * args.grad_accum_steps
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_batch_count, args.batching, "synth")
@@ -598,8 +702,12 @@ def run_optimizer(
             consume_grad=not args.keep_grads_after_step,
             compile_tensor_kernels=args.torch_compile,
         )
+        projected_activation_modules = install_projected_activation_backend(model, optimizer, args.projected_activation_backend)
     elif optimizer_name in {"adamw", "torch_adamw"}:
+        if args.projected_activation_backend != "off":
+            raise RuntimeError("projected activation backend requires the sumotrack optimizer")
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
+        projected_activation_modules = 0
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
 
@@ -691,6 +799,8 @@ def run_optimizer(
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "sumotrack" else "n/a",
+        "projected_activation_backend": args.projected_activation_backend if optimizer_name == "sumotrack" else "n/a",
+        "projected_activation_modules": projected_activation_modules if optimizer_name == "sumotrack" else 0,
         "rank": args.rank if optimizer_name == "sumotrack" else 0,
         "effective_rank_min": policy_stats["effective_rank_min"] if optimizer_name == "sumotrack" else 0,
         "effective_rank_max": policy_stats["effective_rank_max"] if optimizer_name == "sumotrack" else 0,
@@ -760,6 +870,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batching", choices=("synth_right_padded_no_mask", "eos_packed_no_mask"), default="synth_right_padded_no_mask", help="batch construction policy; default is faithful SYNTH diagnostics; choose eos_packed_no_mask explicitly for throughput")
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing"), default="residual-facing")
+    parser.add_argument(
+        "--projected-activation-backend",
+        choices=("off", "lfm-mlp"),
+        default="off",
+        help="experimental SumoTrack-only activation-projected backward backend; lfm-mlp wraps LFM w1/w3/w2 MLPs after basis warmup",
+    )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
     parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)

@@ -4,7 +4,9 @@ import unittest
 
 import torch
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, packed_text_limit, select_trainable_params
+from sumotrack import SumoTrack
+
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, select_trainable_params
 from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -26,6 +28,17 @@ class TinyTopology(torch.nn.Module):
         self.lm_head = torch.nn.Linear(4, 8, bias=False)
 
 
+class TinyLfmMlp(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w1 = torch.nn.Linear(4, 6, bias=False, dtype=torch.float64)
+        self.w3 = torch.nn.Linear(4, 6, bias=False, dtype=torch.float64)
+        self.w2 = torch.nn.Linear(6, 4, bias=False, dtype=torch.float64)
+
+    def forward(self, x):
+        return self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
+
+
 class LlmHarnessParamScopeTest(unittest.TestCase):
     def test_cli_defaults_encode_current_baseline(self):
         args = build_parser().parse_args([])
@@ -37,6 +50,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.batching, "synth_right_padded_no_mask")
         self.assertEqual(args.rank, 64)
         self.assertEqual(args.projection_side_policy, "residual-facing")
+        self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
         self.assertEqual(args.wandb_log_every, 20)
@@ -117,6 +131,61 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(group_by_param[id(q)]["side"], "right")
         self.assertEqual(stats["side_policy_right_tensors"], 2)
         self.assertEqual(stats["side_policy_left_tensors"], 1)
+
+    def test_projected_activation_param_group_override_uses_activation_axis(self):
+        gate = torch.nn.Parameter(torch.randn(16, 4))
+        down = torch.nn.Parameter(torch.randn(4, 16))
+        named = [
+            ("model.layers.0.feed_forward.w1.weight", gate),
+            ("model.layers.0.feed_forward.w2.weight", down),
+        ]
+
+        groups, stats = build_sumotrack_param_groups(
+            named,
+            rank=4,
+            projection_side_policy="residual-facing",
+            activation_projected_param_ids={id(gate), id(down)},
+        )
+        group_by_param = {id(param): group for group in groups for param in group["params"]}
+
+        self.assertEqual(group_by_param[id(gate)]["side"], "right")
+        self.assertEqual(group_by_param[id(down)]["side"], "right")
+        self.assertEqual(stats["side_policy_right_tensors"], 2)
+        self.assertEqual(stats["side_policy_left_tensors"], 0)
+
+    def test_lfm_projected_activation_backend_falls_back_until_basis_ready_then_queues(self):
+        model = torch.nn.Module()
+        model.feed_forward = TinyLfmMlp()
+        named = list(model.named_parameters())
+        activation_projected_ids = projected_activation_param_ids(model, "lfm-mlp")
+        groups, _stats = build_sumotrack_param_groups(
+            named,
+            rank=2,
+            projection_side_policy="residual-facing",
+            activation_projected_param_ids=activation_projected_ids,
+        )
+        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+
+        installed = install_projected_activation_backend(model, opt, "lfm-mlp")
+
+        self.assertEqual(installed, 1)
+        x = torch.randn(3, 5, 4, dtype=torch.float64)
+        loss = model.feed_forward(x).square().mean()
+        loss.backward()
+        self.assertIsNotNone(model.feed_forward.w1.weight.grad)
+        self.assertIsNotNone(model.feed_forward.w2.weight.grad)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+        loss = model.feed_forward(x).square().mean()
+        loss.backward()
+
+        self.assertIsNone(model.feed_forward.w1.weight.grad)
+        self.assertIsNone(model.feed_forward.w3.weight.grad)
+        self.assertIsNone(model.feed_forward.w2.weight.grad)
+        self.assertEqual(set(opt._queued_projected_grads), {model.feed_forward.w1.weight, model.feed_forward.w3.weight, model.feed_forward.w2.weight})
+        opt.step()
+        self.assertEqual(opt._queued_projected_grads, {})
 
     def test_uniform_rank_clamps_to_matrix_dimension(self):
         first = torch.nn.Parameter(torch.randn(16, 4))

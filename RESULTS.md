@@ -4,6 +4,51 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
+## 2026-06-30: Projected-activation LFM MLP backend moves peak VRAM
+
+Question: after parameter hooks failed to reduce real peak memory, can a lower-level custom autograd path for LFM MLPs compute activation-facing projected weight gradients before full `dW` exists, while still feeding SumoTrack's projected-moment/Aurora update path?
+
+Implementation tested:
+
+- Added a transient SumoTrack projected-gradient queue: `queue_projected_grad(param, projected_grad)`. Queued grads are not `Parameter.grad`, are not serialized optimizer state, are cleared by `zero_grad()`, and are rejected before basis initialization or on refresh steps because basis init/refresh still needs full matrix gradients.
+- Added custom projected-activation Linear and fused SwiGLU/LFM MLP autograd paths. They run the full-rank forward, compute exact input gradients, emit projected weight gradients into a side-channel, and leave captured weight `.grad` as `None` on projected steps.
+- Added an opt-in harness backend: `--projected-activation-backend lfm-mlp`. It finds LFM-style MLP modules with `w1`, `w3`, and `w2` Linear children, forces those weights to storage-right/activation-facing bases, and monkeypatches the MLP forward. It falls back to the original full-gradient forward until bases are initialized and on refresh-due steps.
+- Corrected the fused MLP to use separate gate/up input bases, because real SumoTrack tracks one basis per weight.
+
+Validation before LFM smoke:
+
+- Tiny projected-gradient queue tests prove equality against the ordinary full-gradient SumoTrack step after a warm basis initialization, and loud failure before basis init / on refresh.
+- Tiny projected-activation tests prove projected grads equal `project(full_gradient)` for Linear and fused gated MLP, while input grads match ordinary autograd.
+- Tiny harness test proves the LFM wrapper falls back before basis init and then queues projected grads once bases are ready.
+- Full unit suite passed: `63 tests OK`.
+
+LFM setup for smokes: `LiquidAI/LFM2.5-350M-Base`, bf16 on CUDA, SDPA, broad no embeddings, rank 64, `basis_init=eigh`, `basis_refresh_interval=100`, CCE, faithful right-padded no-mask SYNTH batches, validation/sample disabled. One warmup step initializes bases; the harness resets CUDA peak stats after warmup, so reported peaks are measured-window peaks only.
+
+Runs:
+
+| run | backend | steps | shape | peak allocated CUDA | tokens/s | step sec | notes |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| tiny compare | `off` | 1 | `bs1 × seq512` | `1,376,094,720` | `8,884` | `0.0576` | ordinary MLP backward |
+| tiny compare | `lfm-mlp` | 1 | `bs1 × seq512` | `1,185,155,584` | `7,348` | `0.0697` | installed 16 projected MLP modules; `~191 MB` lower peak, slower single-step throughput |
+| steady projected | `lfm-mlp` | 10 | `bs4 × seq1024` | `3,994,636,800` | `21,417` | `0.1913` | avoids refresh fallback in measured window |
+| survival with refresh | `lfm-mlp` | 200 | `bs4 × seq1024` | `5,256,375,808` | `20,990` | `0.1951` | crossed `basis_refresh_interval=100`; refresh fallback raised peak |
+
+The 200-step run also reported: actual sequence tokens/update `4096`, supervised tokens/update `3340`, elapsed `39.027s`, peak reserved CUDA `6,090,129,408`, last measured train loss `2.313989`, mean grad norm `9.494127`, mean update norm `0.348584`, update/param `0.001407`, mean basis rotation chordal `0.169644`.
+
+Interpretation:
+
+- This is the first real-model evidence that the lower-level projected backward path moves peak memory. The win comes from not saving/materializing full activation-facing weight-gradient state in the MLP steady path, not merely deleting retained `.grad` after the fact.
+- The effect scales with tokens per step because removed saved activations scale with `[batch × seq, feature]`, while replacements scale with `[batch × seq, rank]`.
+- The `bs4 × seq1024` 10-step peak (`~3.99 GB`) versus 200-step peak (`~5.26 GB`) shows refresh fallback is now the visible high-water mark. Warmup does not explain this because peak stats are reset after warmup.
+- Attention is still untouched, the backend is eager/uncompiled, and refresh is still burst/full-gradient. These are the next memory/performance levers before treating the projected backend as a quality benchmark path.
+- Throughput cost is real in the one-step `bs1 × seq512` compare (`~17%` slower), but the `bs4 × seq1024` survival run still achieved `~21k tokens/s`. Treat speed numbers as smoke signals, not final optimized performance.
+
+Next leads:
+
+- Add projected-activation paths for attention q/k/v/o or their Linear surfaces.
+- Stagger full-gradient refresh with a simple layer schedule so refresh does not dominate measured peak.
+- Only then test compile/checkpointing combinations and quality curves.
+
 ## 2026-06-30: Backward-hook projected gradients did not reduce LFM peak VRAM
 
 Question: can parameter backward hooks project matrix gradients during backward so full `.grad` buffers do not persist, reducing SumoTrack peak VRAM without changing the optimizer update?

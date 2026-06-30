@@ -60,6 +60,64 @@ class SumoTrackTest(unittest.TestCase):
 
         self.assertIsNotNone(weight.grad)
 
+    def test_queued_projected_grad_matches_full_gradient_step(self):
+        torch.manual_seed(24)
+        base = torch.randn(7, 5, dtype=torch.float64)
+        warm_grad = torch.randn_like(base)
+        step_grad = torch.randn_like(base)
+        full_weight = torch.nn.Parameter(base.clone())
+        queued_weight = torch.nn.Parameter(base.clone())
+        full_opt = SumoTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100)
+        queued_opt = SumoTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100)
+
+        full_weight.grad = warm_grad.clone()
+        queued_weight.grad = warm_grad.clone()
+        full_opt.step()
+        queued_opt.step()
+
+        full_weight.grad = step_grad.clone()
+        projector = full_opt._projector_from_state(full_weight, full_opt.param_groups[0], full_opt.state[full_weight])
+        full_projected_grad = projector.project(step_grad)
+        queued_opt.queue_projected_grad(queued_weight, full_projected_grad.clone())
+
+        full_opt.step()
+        queued_opt.step()
+
+        self.assertIsNone(queued_weight.grad)
+        self.assertTrue(torch.allclose(queued_weight, full_weight, atol=1e-12))
+        self.assertTrue(torch.allclose(queued_opt.state[queued_weight]["projected_exp_avg"], full_opt.state[full_weight]["projected_exp_avg"], atol=1e-12))
+        self.assertEqual(queued_opt._queued_projected_grads, {})
+
+    def test_queued_projected_grad_requires_initialized_basis(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, side="right")
+
+        opt.queue_projected_grad(weight, torch.randn(6, 2))
+
+        with self.assertRaisesRegex(RuntimeError, "initialized"):
+            opt.step()
+
+    def test_queued_projected_grad_rejects_refresh_step_without_full_grad(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, side="right", basis_refresh_interval=1)
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
+
+        opt.queue_projected_grad(weight, projector.project(torch.randn_like(weight)))
+
+        with self.assertRaisesRegex(RuntimeError, "refresh"):
+            opt.step()
+
+    def test_zero_grad_clears_queued_projected_grads(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, side="right")
+        opt.queue_projected_grad(weight, torch.randn(6, 2))
+
+        opt.zero_grad()
+
+        self.assertEqual(opt._queued_projected_grads, {})
+
     def test_aurora_cycle_counts_are_configurable(self):
         weight = torch.nn.Parameter(torch.randn(8, 5))
         opt = SumoTrack([weight], lr=0.01, rank=2, aurora_pp_iterations=1, polar_ns_steps=3)

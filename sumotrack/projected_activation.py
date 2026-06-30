@@ -30,6 +30,19 @@ class ProjectedActivationGradientSink:
         self.projected_grads.clear()
 
 
+class OptimizerProjectedGradientSink:
+    """Send projected gradients directly into an optimizer queue."""
+
+    def __init__(self, optimizer: Any) -> None:
+        self.optimizer = optimizer
+
+    def add_(self, key: Any, projected_grad: Tensor) -> None:
+        self.optimizer.queue_projected_grad(key, projected_grad)
+
+
+ProjectedGradientSink = ProjectedActivationGradientSink | OptimizerProjectedGradientSink | MutableMapping[Any, Tensor]
+
+
 class _ProjectedActivationLinear(Function):
     @staticmethod
     def forward(
@@ -38,7 +51,7 @@ class _ProjectedActivationLinear(Function):
         weight: Tensor,
         bias: Tensor | None,
         basis: Tensor,
-        sink: ProjectedActivationGradientSink | MutableMapping[Any, Tensor],
+        sink: ProjectedGradientSink,
         key: Any,
     ) -> Tensor:
         if input.shape[-1] != weight.shape[1]:
@@ -77,7 +90,7 @@ def projected_activation_linear(
     input: Tensor,
     weight: Tensor,
     basis: Tensor,
-    sink: ProjectedActivationGradientSink | MutableMapping[Any, Tensor],
+    sink: ProjectedGradientSink,
     key: Any,
     bias: Tensor | None = None,
 ) -> Tensor:
@@ -101,9 +114,10 @@ class _ProjectedActivationGatedMlp(Function):
         gate_weight: Tensor,
         up_weight: Tensor,
         down_weight: Tensor,
-        input_basis: Tensor,
+        gate_input_basis: Tensor,
+        up_input_basis: Tensor,
         hidden_basis: Tensor,
-        sink: ProjectedActivationGradientSink | MutableMapping[Any, Tensor],
+        sink: ProjectedGradientSink,
         gate_key: Any,
         up_key: Any,
         down_key: Any,
@@ -114,8 +128,10 @@ class _ProjectedActivationGatedMlp(Function):
             raise ValueError(f"gate and up weights must have the same shape, got {tuple(gate_weight.shape)} and {tuple(up_weight.shape)}")
         if down_weight.shape[1] != gate_weight.shape[0]:
             raise ValueError("down weight must consume the gated intermediate dimension")
-        if input_basis.ndim != 2 or input_basis.shape[1] != input.shape[-1]:
-            raise ValueError(f"input basis must have shape [rank, hidden], got {tuple(input_basis.shape)}")
+        if gate_input_basis.ndim != 2 or gate_input_basis.shape[1] != input.shape[-1]:
+            raise ValueError(f"gate input basis must have shape [rank, hidden], got {tuple(gate_input_basis.shape)}")
+        if up_input_basis.ndim != 2 or up_input_basis.shape[1] != input.shape[-1]:
+            raise ValueError(f"up input basis must have shape [rank, hidden], got {tuple(up_input_basis.shape)}")
         if hidden_basis.ndim != 2 or hidden_basis.shape[1] != gate_weight.shape[0]:
             raise ValueError(f"hidden basis must have shape [rank, intermediate], got {tuple(hidden_basis.shape)}")
 
@@ -125,17 +141,18 @@ class _ProjectedActivationGatedMlp(Function):
         hidden = torch.nn.functional.silu(gate_pre) * up
         output = hidden @ down_weight.mT
 
-        projected_input = flat_input @ input_basis.mT
+        projected_gate_input = flat_input @ gate_input_basis.mT
+        projected_up_input = flat_input @ up_input_basis.mT
         projected_hidden = hidden.reshape(-1, hidden.shape[-1]) @ hidden_basis.mT
-        ctx.save_for_backward(projected_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight)
+        ctx.save_for_backward(projected_gate_input, projected_up_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight)
         ctx.input_shape = tuple(input.shape)
         ctx.sink = sink
         ctx.keys = (gate_key, up_key, down_key)
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None, None, None, None, None, None, None]:
-        projected_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight = ctx.saved_tensors
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None, None, None, None, None, None, None, None]:
+        projected_gate_input, projected_up_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight = ctx.saved_tensors
         gate_key, up_key, down_key = ctx.keys
         grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
 
@@ -145,7 +162,7 @@ class _ProjectedActivationGatedMlp(Function):
         silu_gate = torch.nn.functional.silu(gate_pre)
         grad_up = grad_hidden * silu_gate
         grad_up_flat = grad_up.reshape(-1, grad_up.shape[-1])
-        up_projected_grad = grad_up_flat.mT @ projected_input
+        up_projected_grad = grad_up_flat.mT @ projected_up_input
         grad_input_flat = grad_up_flat @ up_weight
         del silu_gate, grad_up, grad_up_flat
 
@@ -153,7 +170,7 @@ class _ProjectedActivationGatedMlp(Function):
         silu_grad = sigmoid_gate * (1.0 + gate_pre * (1.0 - sigmoid_gate))
         grad_hidden.mul_(up).mul_(silu_grad)
         grad_gate_flat = grad_hidden.reshape(-1, grad_hidden.shape[-1])
-        gate_projected_grad = grad_gate_flat.mT @ projected_input
+        gate_projected_grad = grad_gate_flat.mT @ projected_gate_input
         grad_input_flat.add_(grad_gate_flat @ gate_weight)
         del sigmoid_gate, silu_grad, grad_gate_flat
 
@@ -162,7 +179,7 @@ class _ProjectedActivationGatedMlp(Function):
         _sink_add(ctx.sink, down_key, down_projected_grad)
 
         grad_input = grad_input_flat.reshape(ctx.input_shape)
-        return grad_input, None, None, None, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None, None, None, None
 
 
 def projected_activation_gated_mlp(
@@ -170,9 +187,10 @@ def projected_activation_gated_mlp(
     gate_weight: Tensor,
     up_weight: Tensor,
     down_weight: Tensor,
-    input_basis: Tensor,
+    gate_input_basis: Tensor,
+    up_input_basis: Tensor,
     hidden_basis: Tensor,
-    sink: ProjectedActivationGradientSink | MutableMapping[Any, Tensor],
+    sink: ProjectedGradientSink,
     gate_key: Any,
     up_key: Any,
     down_key: Any,
@@ -189,7 +207,8 @@ def projected_activation_gated_mlp(
         gate_weight,
         up_weight,
         down_weight,
-        input_basis,
+        gate_input_basis,
+        up_input_basis,
         hidden_basis,
         sink,
         gate_key,
@@ -198,8 +217,8 @@ def projected_activation_gated_mlp(
     )
 
 
-def _sink_add(sink: ProjectedActivationGradientSink | MutableMapping[Any, Tensor], key: Any, projected_grad: Tensor) -> None:
-    if isinstance(sink, ProjectedActivationGradientSink):
+def _sink_add(sink: ProjectedGradientSink, key: Any, projected_grad: Tensor) -> None:
+    if isinstance(sink, (ProjectedActivationGradientSink, OptimizerProjectedGradientSink)):
         sink.add_(key, projected_grad)
         return
     existing = sink.get(key)

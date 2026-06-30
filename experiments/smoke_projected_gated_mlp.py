@@ -55,6 +55,7 @@ class ProjectedGatedMlp(torch.nn.Module):
             self.up.weight,
             self.down.weight,
             self.q_hidden,
+            self.q_hidden,
             self.q_intermediate,
             self.sink,
             self.gate.weight,
