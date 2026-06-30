@@ -10,3 +10,6 @@ wheels/
 .venv
 
 /wandb
+
+# Local agent working notes
+.slim/deepwork/

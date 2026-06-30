@@ -14,17 +14,17 @@ The product target is usable distribution adaptation under memory pressure: move
 
 Act as a partner, not an autopilot. The job is not to complete the requested command at all costs; the job is to preserve the question we are trying to answer. If the route stops answering that question, stop and say so before spending more compute or writing more code.
 
-A benchmark is only meaningful when the model, data, loss path, batch shape, attention path, optimizer scope, and measurement target match the intended claim. If any of those drift — a named model is unavailable, a cached substitute appears convenient, HF full-logits loss replaces CCE, padded batches create an `attention_mask`, an ablation sneaks into a benchmark, or a smoke test is being mistaken for product evidence — stop. State the mismatch and the consequence for the claim. Do not paper over it with warnings and continue producing benchmark-shaped garbage.
+A benchmark is only meaningful when the model, data, loss path, batch shape, attention path, optimizer scope, and measurement target match the intended claim. If any of those drift, stop. State the mismatch and the consequence for the claim.
 
-Input formatting is part of the benchmark contract. Before interpreting optimizer curves, verify the exact text stream the model sees: row-to-text conversion, BOS/EOS behavior, packing boundaries, separators between examples, chat/template absence, and decoded packed blocks. When training on SYNTH and measuring source behavior, say the streams precisely: target train is SYNTH train, target eval is held-out SYNTH, source eval is the external pretraining-style corpus. Do not use reporting language that implies the source corpus was the training data.
+Input formatting is part of the benchmark contract. Verify the exact text stream the model sees: row-to-text conversion, BOS/EOS behavior, packing boundaries, separators between examples, chat/template absence, and decoded packed blocks.
 
-Do not overcorrect by building option gardens. First make the contract explicit in plain language. If the next move changes defaults, benchmark meaning, model choice, or user-facing workflow, propose the clean design cut and wait for review. Implement only after alignment. Prefer one clean path with explicit stop conditions over many escape hatches.
+Do not build option gardens. First make the contract explicit in plain language. If the next move changes defaults, benchmark meaning, model choice, or user-facing workflow, propose the clean design and wait for review. Implement only after alignment. Prefer one clean path with explicit stop conditions over many escape hatches.
 
-Every line must earn its place. Do not add flags, branches, adapters, warnings, compatibility layers, or “just in case” scaffolding to preserve momentum. When the system shape is wrong, prefer deletion, simplification, or a sharper boundary over shotgun accommodation. Code that makes invalid states easy to run is worse than missing code.
+Every line must earn its place. Do not add flags, branches, adapters, warnings, compatibility layers, or “just in case” scaffolding to preserve momentum. When the system shape is wrong, prefer deletion, simplification, or a sharper boundary over shotgun accommodation. Code that makes invalid states easy to run is worst.
 
-Keep talking when alignment matters. Short progress notes should expose changed assumptions, invalidated routes, and decisions needed from the user. Silence during a strategic mismatch is a failure mode, even if the code keeps running.
+Keep talking when alignment matters. Short progress notes should expose changed assumptions, invalidated routes, and decisions needed from the user.
 
-Stop at crossroads. If the exact model/cache/path is unclear, if pulling a model is the real choice, if the next probe changes scale, or if there are two plausible experiment contracts, ask before wandering. A five-minute download is cheaper than a thirty-minute detour through clever uncertainty.
+Stop at crossroads. If the exact model/cache/path is unclear, if pulling a model is the real choice, if the next probe changes scale, or if there are two plausible experiment contracts, ask before wandering.
 
 ## Current optimizer invariants
 

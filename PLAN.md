@@ -67,25 +67,13 @@ Treat the 350M faithful SYNTH setup as a regression/continuity harness now, not 
 - **Two-sided square-core projection did not beat one-sided rectangular updates.** Leave it in git history unless retention evidence specifically calls it back.
 - **Cheap Aurora/NS cycles are not free.** `pp=1/ns=1` was too weak. Default remains `pp=2/ns=5` for quality continuity.
 - **Qwen3.5-2B did not solve the local 12GB ceiling.** Activations/temporaries dominated after the fast short-conv path was available.
+- **Parameter backward hooks do not solve peak VRAM.** Hook-time projection can clear retained full matrix `.grad` buffers and keep only tiny projected gradients, but PyTorch still materializes full weight gradients before parameter hooks run. On LFM-350M this removed `~548 MiB` of retained bf16 matrix grads yet barely moved peak at the faithful `bs4/bs8` shapes because activations/backward/loss temporaries dominate.
 
 ## Active leads
 
-1. **Scale transfer.** Test whether the established default survives a meaningful scale step while preserving the memory advantage, starting with `LiquidAI/LFM2.5-1.2B-Base` when memory-safe. Change one scale axis at a time.
-2. **Projected-gradient/backward hook path.** Can we project gradients as they appear during backward so full gradients do not need to remain stored? This needs tiny-model equivalence tests against `project(full_gradient)` before touching the main optimizer path, and it must preserve same-shape Aurora batching and basis-refresh semantics.
-3. **HeavyBall-native final shape.** SumoTrack does **not** currently use HeavyBall ECC/param-ECC. The next engineering task is migrating the final fast implementation into `../HeavyBall` for compiled transforms, ECC/param-ECC, clipping, chainable optimizer machinery, and API compatibility. This repo remains the accessible experiment/testbed lane.
-4. **Performance cleanup after the shape is fixed.** There may still be speedup in better batching, fewer synchronizations, less CPU/GPU memory shuttle, and tighter orthogonalization buckets. Measure first; do not optimize by vibes.
-5. **Matched-memory comparators.** Compare against alternatives users would actually run under the same memory pressure: LoRA/Unsloth-style adapters, GaLore/SubTrack-like low-rank-gradient routes, and AdamW only as a quality anchor where it fits.
-6. **Clean product-shaped data.** SYNTH proved low-noise mechanics. The next target distribution should be product-shaped but clean enough that loss means optimizer/data-fit behavior rather than data-quality archaeology.
-
-## Stop conditions
-
-Stop and rethink if:
-
-- SumoTrack cannot exploit higher tokens/step or larger model scope than serious alternatives on the target GPU,
-- orthogonalized one-sided updates improve target loss but cause unacceptable retention collapse,
-- uniform rank clearly spends most state on low-leverage tensors,
-- Grassmann tracking is too sluggish to adapt or too fast to smooth,
-- rectangular orthogonalization quality becomes the bottleneck,
-- the code starts serving old gates instead of the product thesis.
-
-The product is not a checklist of optimizer features. The product is a usable path to high-capacity distribution adaptation under consumer-GPU constraints.
+- **Lower-level projected backward path.** Parameter hooks proved the memory boundary: they can reduce retained grads but not the transient full-gradient peak. A real peak-VRAM win needs a custom/projected linear backward that computes `dW @ Qᵀ` or `Qᵀ @ dW` directly, before full weight gradients are materialized, while preserving basis-refresh semantics and tiny-model equivalence to `project(full_gradient)`.
+- **Performance cleanup after the shape is fixed.** There may still be speedup in better batching, fewer synchronizations, less CPU/GPU memory shuttle, and tighter orthogonalization buckets. Measure first; do not optimize by vibes.
+- **Scale transfer.** Test whether the established default survives a meaningful scale step while preserving the memory advantage, starting with `LiquidAI/LFM2.5-1.2B-Base` when memory-safe. Change one scale axis at a time.
+- **Clean product-shaped data.** SYNTH proved low-noise mechanics. The next target distribution should be product-shaped but clean enough that loss means optimizer/data-fit behavior rather than data-quality archaeology.
+- **HeavyBall-native final shape.** SumoTrack does **not** currently use HeavyBall ECC/param-ECC. The next engineering task is migrating the final fast implementation into `../HeavyBall` for compiled transforms, ECC/param-ECC, clipping, chainable optimizer machinery, and API compatibility. This repo remains the accessible experiment/testbed lane.
+- **Matched-memory comparators.** Compare against alternatives users would actually run under the same memory pressure: LoRA/Unsloth-style adapters, GaLore/SubTrack-like low-rank-gradient routes, and AdamW only as a quality anchor where it fits.

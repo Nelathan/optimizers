@@ -4,6 +4,26 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
+## 2026-06-30: Backward-hook projected gradients did not reduce LFM peak VRAM
+
+Question: can parameter backward hooks project matrix gradients during backward so full `.grad` buffers do not persist, reducing SumoTrack peak VRAM without changing the optimizer update?
+
+Implementation tested: an experimental hook path projected 2D parameter gradients into the existing SumoTrack basis, stored them as `state[p]["projected_grad"]`, zeroed the full hook gradient in-place, and cleared `p.grad` after leaf accumulation. Tiny linear equivalence tests passed for left and right projection sides against `project(full_gradient)`, and refresh/uninitialized steps correctly fell back to full gradients because basis updates still need the full matrix gradient.
+
+LFM setup: `LiquidAI/LFM2.5-350M-Base`, bf16, SDPA, broad no embeddings, residual-facing projection, rank 64. A warm basis-forming step used the ordinary full-gradient path; the next backward compared ordinary full gradients against hook-projected gradients.
+
+Key measurements:
+
+| shape | checkpointing | full peak allocated | hook peak allocated | retained matrix `.grad` removed | retained `projected_grad` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `bs4 × seq1024` | yes | `5,277,805,568` | `5,276,756,992` | `574,619,648` | `35,913,728` |
+| `bs1 × seq1024` | yes | `2,591,537,664` | `2,586,294,784` | `574,619,648` | `35,913,728` |
+| `bs1 × seq512` | no | `1,373,988,864` | `1,344,858,112` | `574,619,648` | `35,913,728` |
+
+Backward timeline artifacts for the clearest small probe live under `/tmp/opencode/lfm_backward_vram/` (`csv`, `png`, `svg`, summary JSON). The full-gradient path accumulated retained matrix grads as backward walked from later to earlier layers. The hook path had the desired falling allocated-memory shape after the last layer, because activations were released and only projected gradients accumulated. Its peak still occurred at the first late-layer gradient event (`model.layers.15.feed_forward.w2.weight`) before the hook could remove the transient full weight gradient.
+
+Interpretation: this is critical negative progress. Parameter hooks are one rung too high in PyTorch autograd to solve peak VRAM: they can eliminate retained full `.grad` storage after accumulation, but the full weight gradient has already been materialized. At faithful LFM batch shapes, peak memory is dominated by model + activations/backward/loss/CUDA temporaries; the removed `~548 MiB` bf16 matrix-grad pile barely affects the high-water mark. The next viable memory lead is lower-level projected linear backward that computes the projected weight-gradient directly before full `dW` exists, not more parameter-hook plumbing.
+
 ## 2026-06-30: Faithful SYNTH rank sweep with qualitative samples
 
 Question: after rank 64 became the boring default, does increasing or decreasing uniform projected rank change the target/source tradeoff and qualitative target-format adoption on the faithful SYNTH lane?
