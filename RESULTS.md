@@ -2,7 +2,66 @@
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
-This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract is in `PLAN.md`; durable facts distilled from these runs are in `INSIGHTS.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
+This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
+
+## 2026-06-30: Faithful SYNTH rank sweep with qualitative samples
+
+Question: after rank 64 became the boring default, does increasing or decreasing uniform projected rank change the target/source tradeoff and qualitative target-format adoption on the faithful SYNTH lane?
+
+Harness change: final validation can now print one qualitative target-eval sample. Sampling defaults are `temperature=0.6`, `top_k=20`, `top_p=0.95`, no `min_p`, and max prompt+generated length `4096`. This path is guarded for dirty HF target formats; non-SYNTH HF target samples require an explicit override and were not printed for Sugar Quill.
+
+Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask SYNTH batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `sumotrack_lr=2e-4`, `basis_refresh_interval=100`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`. Training prints target/source eval every 100 measured steps, so each run exposes whether progress is smooth or stalled.
+
+Runs:
+
+| rank | wandb | target val loss | source val loss | state bytes | peak allocated CUDA | step sec | tok/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | https://wandb.ai/pink-marker/sumotrack/runs/ddshpeov | `2.300731 → 1.828967` | `2.899438 → 3.027462` | `12,507,136` | `9,840,612,864` | `0.418382` | `19,580` |
+| 32 | https://wandb.ai/pink-marker/sumotrack/runs/n68iwyi2 | `2.300731 → 1.804122` | `2.899438 → 3.019680` | `24,500,224` | `9,852,605,952` | `0.417277` | `19,632` |
+| 64 | https://wandb.ai/pink-marker/sumotrack/runs/kkmk57jz | `2.300731 → 1.778049` | `2.899438 → 3.014893` | `48,486,400` | `9,876,592,128` | `0.424949` | `19,278` |
+| 128 | https://wandb.ai/pink-marker/sumotrack/runs/milti2cv | `2.300731 → 1.750586` | `2.899438 → 3.010585` | `96,458,752` | `9,924,564,480` | `0.435693` | `18,802` |
+| 256 | https://wandb.ai/pink-marker/sumotrack/runs/cxy82wsx | `2.300731 → 1.722463` | `2.899438 → 3.012350` | `192,403,456` | `10,020,509,184` | `0.467022` | `17,541` |
+
+Interpretation:
+
+- Higher rank improves target loss monotonically across this sweep. The improvement is not subtle: rank 256 beats rank 64 by `~0.056` target loss at 1k steps.
+- Source loss is worst at low rank and roughly flat/better from rank 64 upward. Honorable mention: higher rank did not buy target movement by obviously paying more source loss on this source sensor.
+- Optimizer state scales linearly with rank as expected, but peak CUDA is dominated by model activations/temporaries; rank 16→256 changed peak allocated by only `~180 MB` while optimizer state changed by `~180 MB`.
+- Step time is nearly flat through rank 64, modestly worse at rank 128, and visibly worse at rank 256. Compute was not the deciding question here, but the cost curve is now visible.
+- Qualitative samples show target-format adoption even at rank 16 on a tiny model. Lower ranks adopt the reasoning/answer shape but are more repetitive and less grounded; higher ranks look somewhat more fluent, though all samples still contain technical confabulation. Treat samples as texture, not evidence stronger than eval curves.
+- Current read: uniform rank 64 remains a good boring default for byte budget, but rank is a real quality lever. If the product budget allows it, rank 128/256 deserve attention before inventing more geometry knobs.
+
+## 2026-06-30: First-basis accumulation and Sugar Quill head-to-head
+
+Question: does initializing the first `eigh` bases from a `4×` accumulated first gradient estimate improve the known faithful-lane curve, and does the current default behave similarly on `Nelathan/synthetic-sugar-quill`?
+
+Safety/format contract for Sugar Quill: row contents were not read, printed, decoded, or logged. A schema-only parquet check found one shard, 9,619 rows, columns `id`, `text`, `profile`, `model`. The harness formats target rows as `profile\n\n---\n\ntext`, masks `profile + divider`, and trains only on `text`, analogous to masking the SYNTH question/divider.
+
+Harness changes used for this run:
+
+- Added `--target-hf-dataset`, `--target-format profile_text`, and `--target-val-offset` for HF target datasets.
+- Temporarily added `--first-step-grad-accum-steps` to affect only the first optimizer step / basis-forming gradient estimate, not normal training-time gradient accumulation. After these near-null results, that flag was removed rather than kept as an undead knob.
+- Cleared CUDA cache after initial validation before training. The first `bs8`/`4×` attempt OOMed before useful training when desktop/browser VRAM pressure was present; retry with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` completed.
+
+Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `sumotrack_lr=2e-4`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`.
+
+Runs:
+
+| target | first-step accum | refresh | wandb | supervised tokens/update | target val loss | source val loss | mean basis rotation | mean update/param |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| SYNTH | 1 | 100 | previous baseline `8yn89vj9` | 6399 | `2.300731 → 1.776949` | `2.899437 → 3.010900` | n/a in old table | `0.000227` |
+| SYNTH | 4 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/goiyjzg9 | 6399 | `2.300731 → 1.775587` | `2.899438 → 3.012776` | `0.149512` | `0.000213` |
+| SYNTH | 4 | 20 | https://wandb.ai/pink-marker/sumotrack/runs/5w6v7125 | 6399 | `2.300731 → 1.774600` | `2.899438 → 3.011622` | `0.123417` | `0.000225` |
+| Sugar Quill | 1 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/74ymlx78 | 5656 | `3.277249 → 3.183513` | `2.899438 → 2.940904` | `0.148967` | `0.000224` |
+| Sugar Quill | 4 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/onduo46m | 5656 | `3.277249 → 3.182505` | `2.899438 → 2.942369` | `0.151005` | `0.000221` |
+
+Interpretation:
+
+- `4×` first-basis accumulation is a near-null on the known SYNTH lane at 1k steps: target/source are essentially baseline. It did not reveal an obvious first-basis quality win.
+- Refresh interval `20` with `4×` first-basis slightly lowered logged mean chordal rotation and landed a hair better on target/source, but the effect is too small to reopen the refresh axis.
+- Sugar Quill is not SYNTH-like under this setup: target loss moved much less (`~0.094–0.095` vs `~0.525`) and source loss rose much less (`~0.041–0.043` vs `~0.111–0.113`) at matched update scale. Treat this as dataset/contact evidence, not as a clean optimizer win/loss.
+- `4×` first-basis accumulation is again a near-null on Sugar Quill.
+- Current read: the basis-initialization/refesh knob is not the next high-value lever for the 350M faithful lane. The interesting question is why Sugar Quill has much weaker target movement at the same optimizer scale: data difficulty/format/contact, not optimizer geometry by default.
 
 ## 2026-06-24: Compile and basis-rotation telemetry cleanup
 

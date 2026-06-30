@@ -1,9 +1,7 @@
 # AGENTS.md
 
-This file is the operating contract for agents working in this repo. It is not the plan, lab notebook, or task ledger.
-
-- Current direction and future leads live in `PLAN.md`.
-- Durable empirical facts live in `INSIGHTS.md`.
+This file is the operating contract for agents working in this repo.
+- Current direction and future leads and empirical facts live in `PLAN.md`.
 - Brief experiment records live in `RESULTS.md`: why the run existed, what was tested, what moved, and what was observed.
 
 ## Repo purpose
@@ -86,8 +84,8 @@ Avoid these traps:
 - repeating broad topology smokes after accounting already works,
 - polishing LR brackets before geometry is right,
 - treating AdamW as the opponent rather than a quality anchor,
-- adding HeavyBall-native/ECC plumbing before the algorithm earns it,
-- implementing projected-gradient hooks before ordinary-gradient SumoTrack is proven,
+- adding HeavyBall-native/ECC plumbing outside the migration path named in `PLAN.md`,
+- implementing projected-gradient hooks without tiny-model equivalence tests against ordinary full-gradient projection,
 - expanding harness ceremony without a sharper algorithm question.
 
 If the user names a specific model, dataset, path, or script, treat that as the target contract. If it is unavailable in the current environment, say so plainly, verify the assumption if possible, and ask what to do next. Do not silently substitute a nearby cached or convenient alternative.

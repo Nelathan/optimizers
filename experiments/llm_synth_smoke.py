@@ -23,7 +23,9 @@ DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_2
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing"]
 BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
+DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
+PROFILE_TEXT_DIVIDER = "\n\n---\n\n"
 
 
 @torch.no_grad()
@@ -78,11 +80,31 @@ def optimizer_basis_rotation(optimizer: torch.optim.Optimizer) -> float:
     return float(diagnostics.get("mean_basis_rotation_chordal", float("nan")))
 
 
-def parquet_table_to_texts(table) -> list[str]:
+def parquet_table_to_texts(table, dataset_format: DatasetFormat = "auto") -> list[str]:
     names = set(table.column_names)
-    if "text" in names:
+    if dataset_format == "auto":
+        if {"query", "synthetic_reasoning", "synthetic_answer"}.issubset(names):
+            dataset_format = "synth"
+        elif {"profile", "text"}.issubset(names):
+            dataset_format = "profile_text"
+        elif "text" in names:
+            dataset_format = "text"
+
+    if dataset_format == "text" and "text" in names:
         return [text for text in table.column("text").to_pylist() if text]
-    if {"query", "synthetic_reasoning", "synthetic_answer"}.issubset(names):
+    if dataset_format == "profile_text" and {"profile", "text"}.issubset(names):
+        rows = zip(table.column("profile").to_pylist(), table.column("text").to_pylist())
+        texts = []
+        for profile, text in rows:
+            if text:
+                profile_text = str(profile).strip() if profile else ""
+                body = str(text).strip()
+                if profile_text and body:
+                    texts.append(f"{profile_text}{PROFILE_TEXT_DIVIDER}{body}")
+                elif body:
+                    texts.append(body)
+        return texts
+    if dataset_format == "synth" and {"query", "synthetic_reasoning", "synthetic_answer"}.issubset(names):
         rows = zip(
             table.column("query").to_pylist(),
             table.column("synthetic_reasoning").to_pylist(),
@@ -94,16 +116,21 @@ def parquet_table_to_texts(table) -> list[str]:
             if parts:
                 texts.append("\n\n".join(parts))
         return texts
-    raise ValueError(f"Unsupported parquet schema, expected text or SYNTH columns, got: {table.column_names}")
+    raise ValueError(f"Unsupported parquet schema/format, format={dataset_format}, columns={table.column_names}")
 
 
-def parquet_texts(parquet_path: Path, limit: int) -> list[str]:
+def parquet_texts(parquet_path: Path, limit: int, dataset_format: DatasetFormat = "auto", offset: int = 0) -> list[str]:
     pf = pq.ParquetFile(parquet_path)
     texts = []
+    seen = 0
     for row_group in range(pf.num_row_groups):
-        texts.extend(parquet_table_to_texts(pf.read_row_group(row_group)))
-        if len(texts) >= limit:
-            return texts[:limit]
+        for text in parquet_table_to_texts(pf.read_row_group(row_group), dataset_format):
+            if seen < offset:
+                seen += 1
+                continue
+            texts.append(text)
+            if len(texts) >= limit:
+                return texts
     return texts
 
 
@@ -112,10 +139,10 @@ def synth_texts(data_dir: Path, split: str, limit: int) -> list[str]:
     if not shards:
         raise FileNotFoundError(f"No SYNTH parquet shards found in {data_dir}")
     shard = shards[-1] if split == "val" else shards[0]
-    return parquet_texts(shard, limit)
+    return parquet_texts(shard, limit, "synth")
 
 
-def hf_first_parquet_texts(repo_id: str, limit: int) -> tuple[list[str], str]:
+def hf_first_parquet_texts(repo_id: str, limit: int, dataset_format: DatasetFormat = "auto", offset: int = 0) -> tuple[list[str], str]:
     from huggingface_hub import hf_hub_download, list_repo_files
 
     parquets = sorted(path for path in list_repo_files(repo_id, repo_type="dataset") if path.endswith(".parquet"))
@@ -123,7 +150,7 @@ def hf_first_parquet_texts(repo_id: str, limit: int) -> tuple[list[str], str]:
         raise FileNotFoundError(f"No parquet files found in Hugging Face dataset {repo_id}")
     first_parquet = parquets[0]
     local_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=first_parquet)
-    return parquet_texts(Path(local_path), limit), first_parquet
+    return parquet_texts(Path(local_path), limit, dataset_format, offset), first_parquet
 
 
 def packed_text_limit(blocks: int, batch_size: int, seq_len: int) -> int:
@@ -291,12 +318,83 @@ def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch
 def synth_masked_examples(texts: list[str]) -> list[tuple[str, str]]:
     examples = []
     for text in texts:
-        query, separator, body = text.partition("\n\n")
-        if not separator or not query.strip() or not body.strip():
+        prefix, body = masked_prefix_and_body(text)
+        if prefix is None or body is None:
             continue
-        prefix = f"{query}{SYNTH_DIVIDER}"
         examples.append((f"{prefix}{body}", prefix))
     return examples
+
+
+def masked_prefix_and_body(text: str) -> tuple[str | None, str | None]:
+    if PROFILE_TEXT_DIVIDER in text:
+        query, separator, body = text.partition(PROFILE_TEXT_DIVIDER)
+        divider = PROFILE_TEXT_DIVIDER
+    elif SYNTH_DIVIDER in text:
+        query, separator, body = text.partition(SYNTH_DIVIDER)
+        divider = SYNTH_DIVIDER
+    else:
+        query, separator, body = text.partition("\n\n")
+        divider = SYNTH_DIVIDER
+    if not separator or not query.strip() or not body.strip():
+        return None, None
+    return f"{query}{divider}", body
+
+
+@torch.no_grad()
+def print_final_eval_sample(model, tokenizer, val_texts: list[str], args) -> None:
+    if not args.final_sample:
+        return
+    if args.target_hf_dataset and args.target_format != "synth" and not args.allow_dirty_final_sample:
+        print("final_sample_skipped=target_hf_dataset_requires_explicit_allow_dirty_final_sample")
+        return
+    if not val_texts:
+        print("final_sample_skipped=no_val_texts")
+        return
+
+    prompt = None
+    for offset in range(len(val_texts)):
+        candidate_prompt, _body = masked_prefix_and_body(val_texts[(args.final_sample_row + offset) % len(val_texts)])
+        if candidate_prompt:
+            prompt = candidate_prompt
+            break
+    if prompt is None:
+        print("final_sample_skipped=no_masked_eval_prompt")
+        return
+
+    generator = getattr(model, "_orig_mod", model)
+    was_training = generator.training
+    generator.eval()
+    try:
+        prompt_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        if tokenizer.bos_token_id is not None:
+            bos = torch.tensor([[tokenizer.bos_token_id]], dtype=prompt_ids.dtype)
+            prompt_ids = torch.cat([bos, prompt_ids], dim=1)
+        if prompt_ids.shape[1] >= args.final_sample_max_seq_len:
+            prompt_ids = prompt_ids[:, : args.final_sample_max_seq_len - 1]
+        prompt_ids = prompt_ids.to(next(generator.parameters()).device)
+        max_new_tokens = max(1, args.final_sample_max_seq_len - int(prompt_ids.shape[1]))
+        output_ids = generator.generate(
+            input_ids=prompt_ids,
+            do_sample=True,
+            temperature=args.final_sample_temperature,
+            top_k=args.final_sample_top_k,
+            top_p=args.final_sample_top_p,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+        )[0]
+        prompt_text = tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+        completion_text = tokenizer.decode(output_ids[prompt_ids.shape[1] :], skip_special_tokens=True)
+        print("final_sample_prompt_begin")
+        print(prompt_text)
+        print("final_sample_prompt_end")
+        print("final_sample_completion_begin")
+        print(completion_text)
+        print("final_sample_completion_end")
+    finally:
+        if was_training:
+            generator.train()
 
 
 def full_lm_examples(texts: list[str]) -> list[tuple[str, str]]:
@@ -476,7 +574,8 @@ def run_optimizer(
         args.rank,
         args.projection_side_policy,
     )
-    train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, args.warmup_steps + args.measure_steps, args.batching, "synth")
+    train_batch_count = (args.warmup_steps + args.measure_steps) * args.grad_accum_steps
+    train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_batch_count, args.batching, "synth")
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
@@ -506,6 +605,8 @@ def run_optimizer(
 
     initial_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     wandb_log(
         wandb_run,
         {
@@ -576,6 +677,8 @@ def run_optimizer(
     measured_elapsed = time.perf_counter() - start_time
     final_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
+    if not args.skip_validation:
+        print_final_eval_sample(model, tokenizer, val_texts, args)
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
@@ -640,6 +743,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Short pretrained-LLM SYNTH smoke for SumoTrack")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"HF model name; default = {DEFAULT_MODEL}")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
+    parser.add_argument("--target-hf-dataset", default="", help="optional Hugging Face target dataset; first parquet shard only")
+    parser.add_argument("--target-format", choices=("auto", "synth", "profile_text", "text"), default="auto", help="target dataset row formatter; profile_text masks profile+divider and trains only on text")
+    parser.add_argument("--target-val-offset", type=int, default=9000, help="row offset for validation when --target-hf-dataset is used")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--retention-hf-dataset", default="", help=f"optional Hugging Face source/retention dataset; first parquet shard only, e.g. {DEFAULT_SOURCE_HF_DATASET}")
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
@@ -672,6 +778,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
     parser.add_argument("--eval-every", type=int, default=0, help="periodically log target/source validation loss every N measured steps; 0 disables")
+    parser.add_argument("--no-final-sample", dest="final_sample", action="store_false", help="disable final qualitative generation from a target eval prompt")
+    parser.set_defaults(final_sample=True)
+    parser.add_argument("--final-sample-row", type=int, default=0, help="target eval row index used for final qualitative generation")
+    parser.add_argument("--final-sample-max-seq-len", type=int, default=4096, help="maximum prompt+generated token length for final qualitative generation")
+    parser.add_argument("--final-sample-temperature", type=float, default=0.6)
+    parser.add_argument("--final-sample-top-k", type=int, default=20)
+    parser.add_argument("--final-sample-top-p", type=float, default=0.95)
+    parser.add_argument("--allow-dirty-final-sample", action="store_true", help="allow printing target-HF samples for non-SYNTH formats; never enable for dirty/NSFW datasets")
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="sumotrack")
@@ -699,6 +813,16 @@ def main() -> None:
         raise ValueError("retention_val_blocks must be positive")
     if args.eval_every < 0:
         raise ValueError("eval_every must be non-negative")
+    if args.final_sample_row < 0:
+        raise ValueError("final_sample_row must be non-negative")
+    if args.final_sample_max_seq_len <= 1:
+        raise ValueError("final_sample_max_seq_len must be greater than 1")
+    if args.final_sample_temperature <= 0:
+        raise ValueError("final_sample_temperature must be positive")
+    if args.final_sample_top_k <= 0:
+        raise ValueError("final_sample_top_k must be positive")
+    if not 0 < args.final_sample_top_p <= 1:
+        raise ValueError("final_sample_top_p must be in (0, 1]")
     if args.wandb_log_every < 0:
         raise ValueError("wandb_log_every must be non-negative")
     if args.retention_data_dir and args.retention_hf_dataset:
@@ -719,8 +843,25 @@ def main() -> None:
     total_train_steps = args.warmup_steps + args.measure_steps
     train_blocks = max(total_train_steps * args.grad_accum_steps, 1)
     val_blocks = args.val_blocks
-    train_texts = synth_texts(Path(args.data_dir), "train", limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len))
-    val_texts = synth_texts(Path(args.data_dir), "val", limit=packed_text_limit(val_blocks, args.batch_size, args.seq_len))
+    target_source = args.data_dir
+    if args.target_hf_dataset:
+        train_texts, target_train_parquet = hf_first_parquet_texts(
+            args.target_hf_dataset,
+            limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len),
+            dataset_format=args.target_format,
+        )
+        val_texts, target_val_parquet = hf_first_parquet_texts(
+            args.target_hf_dataset,
+            limit=packed_text_limit(val_blocks, args.batch_size, args.seq_len),
+            dataset_format=args.target_format,
+            offset=args.target_val_offset,
+        )
+        target_source = f"{args.target_hf_dataset}:{target_train_parquet}:format={args.target_format}:val_offset={args.target_val_offset}"
+        if target_train_parquet != target_val_parquet:
+            target_source += f":val_parquet={target_val_parquet}"
+    else:
+        train_texts = synth_texts(Path(args.data_dir), "train", limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len))
+        val_texts = synth_texts(Path(args.data_dir), "val", limit=packed_text_limit(val_blocks, args.batch_size, args.seq_len))
     retention_texts = None
     retention_source = "none"
     if args.retention_data_dir:
@@ -733,7 +874,7 @@ def main() -> None:
         retention_source = f"{args.retention_hf_dataset}:{first_parquet}"
     print(f"device={device}")
     print(f"model={model_name}")
-    print(f"data_dir={args.data_dir}")
+    print(f"target_source={target_source}")
     print(f"retention_source={retention_source}")
     print(f"train_texts={len(train_texts)} val_texts={len(val_texts)} retention_texts={len(retention_texts) if retention_texts else 0}")
     print(
@@ -745,6 +886,8 @@ def main() -> None:
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce "
         f"skip_validation={args.skip_validation} eval_every={args.eval_every} "
+        f"final_sample={args.final_sample} final_sample_max_seq_len={args.final_sample_max_seq_len} "
+        f"final_sample_temperature={args.final_sample_temperature} final_sample_top_k={args.final_sample_top_k} final_sample_top_p={args.final_sample_top_p} "
         f"wandb_run={args.wandb_run or 'none'} wandb_entity={args.wandb_entity} consume_grad={not args.keep_grads_after_step}"
     )
 

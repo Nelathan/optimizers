@@ -4,7 +4,7 @@ Status: historical design sketch.
 
 This document is preserved as optimizer-idea archaeology. It is not the active direction of this repo, and it should not be read as a current implementation contract, benchmark plan, or product thesis.
 
-The active optimizer line is **SumoTrack**. Current direction lives in `../PLAN.md`, durable facts live in `../INSIGHTS.md`, and experiment records live in `../RESULTS.md`.
+The active optimizer line is **SumoTrack**. Current direction and durable facts live in `../PLAN.md`, and experiment records live in `../RESULTS.md`.
 
 ## Historical idea
 

@@ -6,8 +6,7 @@ SumoTrack's product target is distribution adaptation under memory pressure: mov
 
 ## Documentation
 
-- `PLAN.md` — current direction, active invariants, and next cuts.
-- `INSIGHTS.md` — durable empirical facts and local terrain.
+- `PLAN.md` — current direction, active invariants, next cuts, and durable empirical facts.
 - `RESULTS.md` — brief experiment records: question, setup, run links, metrics, interpretation.
 - `AGENTS.md` — operating contract for agents working in this repo.
 - `whiteflow/README.md` and `muonfactor/README.md` — historical optimizer sketches, not active specs.

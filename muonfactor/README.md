@@ -4,7 +4,7 @@ Status: historical design sketch.
 
 This document is preserved for reference. It is not the active optimizer direction, not a current benchmark contract, and not a specification for `SumoTrack`.
 
-The active optimizer line is **SumoTrack**. Current direction lives in `../PLAN.md`, durable facts live in `../INSIGHTS.md`, and experiment records live in `../RESULTS.md`.
+The active optimizer line is **SumoTrack**. Current direction and durable facts live in `../PLAN.md`, and experiment records live in `../RESULTS.md`.
 
 ## Historical idea
 
