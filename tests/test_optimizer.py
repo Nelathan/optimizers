@@ -109,6 +109,19 @@ class SumoTrackTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "refresh"):
             opt.step()
 
+    def test_basis_refresh_offsets_stagger_due_params_after_first_interval(self):
+        first = torch.nn.Parameter(torch.randn(6, 4))
+        second = torch.nn.Parameter(torch.randn(6, 4))
+        group = {"params": [first, second], "basis_refresh_offsets": {id(first): 0, id(second): 1}}
+        opt = SumoTrack([group], lr=0.01, rank=2, side="right", basis_refresh_interval=3)
+        matrix_params = [first, second]
+
+        self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), set())
+        self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), set())
+        self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), set())
+        self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), {id(first)})
+        self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), {id(second)})
+
     def test_zero_grad_clears_queued_projected_grads(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
         opt = SumoTrack([weight], lr=0.01, rank=2, side="right")

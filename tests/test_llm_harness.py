@@ -51,6 +51,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.rank, 64)
         self.assertEqual(args.projection_side_policy, "residual-facing")
         self.assertEqual(args.projected_activation_backend, "off")
+        self.assertEqual(args.basis_refresh_schedule, "burst")
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
         self.assertEqual(args.wandb_log_every, 20)
@@ -153,6 +154,25 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(stats["side_policy_right_tensors"], 2)
         self.assertEqual(stats["side_policy_left_tensors"], 0)
 
+    def test_layer_staggered_refresh_schedule_adds_layer_offsets_without_changing_sides(self):
+        first = torch.nn.Parameter(torch.randn(16, 4))
+        second = torch.nn.Parameter(torch.randn(16, 4))
+        named = [
+            ("model.layers.2.feed_forward.w1.weight", first),
+            ("model.layers.5.feed_forward.w3.weight", second),
+        ]
+
+        groups, _stats = build_sumotrack_param_groups(
+            named,
+            rank=4,
+            projection_side_policy="residual-facing",
+            basis_refresh_schedule="layer-staggered",
+        )
+        group = groups[0]
+
+        self.assertEqual(group["side"], "right")
+        self.assertEqual(group["basis_refresh_offsets"], {id(first): 2, id(second): 5})
+
     def test_lfm_projected_activation_backend_falls_back_until_basis_ready_then_queues(self):
         model = torch.nn.Module()
         model.feed_forward = TinyLfmMlp()
@@ -185,6 +205,34 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertIsNone(model.feed_forward.w2.weight.grad)
         self.assertEqual(set(opt._queued_projected_grads), {model.feed_forward.w1.weight, model.feed_forward.w3.weight, model.feed_forward.w2.weight})
         opt.step()
+        self.assertEqual(opt._queued_projected_grads, {})
+
+    def test_lfm_projected_activation_backend_falls_back_on_refresh_due_layer(self):
+        model = torch.nn.Module()
+        model.feed_forward = TinyLfmMlp()
+        named = list(model.named_parameters())
+        activation_projected_ids = projected_activation_param_ids(model, "lfm-mlp")
+        groups, _stats = build_sumotrack_param_groups(
+            named,
+            rank=2,
+            projection_side_policy="residual-facing",
+            activation_projected_param_ids=activation_projected_ids,
+        )
+        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        install_projected_activation_backend(model, opt, "lfm-mlp")
+        x = torch.randn(3, 5, 4, dtype=torch.float64)
+
+        model.feed_forward(x).square().mean().backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        for group in opt.param_groups:
+            group["basis_refresh_step"] = 100
+
+        model.feed_forward(x).square().mean().backward()
+
+        self.assertIsNotNone(model.feed_forward.w1.weight.grad)
+        self.assertIsNotNone(model.feed_forward.w3.weight.grad)
+        self.assertIsNotNone(model.feed_forward.w2.weight.grad)
         self.assertEqual(opt._queued_projected_grads, {})
 
     def test_uniform_rank_clamps_to_matrix_dimension(self):

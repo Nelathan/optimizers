@@ -234,8 +234,20 @@ class SumoTrack(Optimizer):
             return set()
         step = group["basis_refresh_step"]
         group["basis_refresh_step"] = step + 1
-        if step > 0 and step % group["basis_refresh_interval"] == 0:
-            return {id(param) for param in matrix_params}
+        interval = group["basis_refresh_interval"]
+        refresh_offsets = group.get("basis_refresh_offsets")
+        if step > 0:
+            if refresh_offsets is None:
+                if step % interval != 0:
+                    return set()
+                return {id(param) for param in matrix_params}
+            if step < interval:
+                return set()
+            return {
+                id(param)
+                for param in matrix_params
+                if (step - refresh_offsets.get(id(param), 0)) % interval == 0
+            }
         return set()
 
     def _prepare_matrix_update(self, p: Tensor, grad: Tensor | None, group: dict, refresh_basis: bool, diagnostics: dict | None) -> MatrixUpdate:

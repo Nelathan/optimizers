@@ -24,6 +24,7 @@ DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_2
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing"]
 ProjectedActivationBackend = Literal["off", "lfm-mlp"]
+BasisRefreshSchedule = Literal["burst", "layer-staggered"]
 BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
@@ -279,24 +280,49 @@ def build_sumotrack_param_groups(
     rank: int,
     projection_side_policy: ProjectionSidePolicy,
     activation_projected_param_ids: set[int] | None = None,
+    basis_refresh_schedule: BasisRefreshSchedule = "burst",
 ) -> tuple[list[dict], dict[str, int]]:
     if rank <= 0:
         raise ValueError(f"rank must be positive, got {rank}")
+    if basis_refresh_schedule not in {"burst", "layer-staggered"}:  # pragma: no cover - argparse constrains this
+        raise ValueError(f"unknown basis refresh schedule: {basis_refresh_schedule}")
     policy_stats = {"effective_rank_min": 0, "effective_rank_max": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
 
     grouped: dict[str, list[torch.nn.Parameter]] = {}
+    refresh_offsets_by_side: dict[str, dict[int, int]] = {}
     activation_projected_param_ids = activation_projected_param_ids or set()
     for name, param in named_params:
         role = transformer_matrix_role(name, param)
         side = "right" if id(param) in activation_projected_param_ids and param.ndim == 2 else storage_side_for_residual_axis(role, projection_side_policy)
         grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
+            if basis_refresh_schedule == "layer-staggered":
+                refresh_offsets_by_side.setdefault(side, {})[id(param)] = transformer_layer_index(name)
             effective_rank = min(rank, *param.shape)
             policy_stats["effective_rank_min"] = effective_rank if not policy_stats["effective_rank_min"] else min(policy_stats["effective_rank_min"], effective_rank)
             policy_stats["effective_rank_max"] = max(policy_stats["effective_rank_max"], effective_rank)
             policy_stats[f"side_policy_{side}_tensors"] += 1
 
-    return [{"params": params, "rank": rank, "side": side} for side, params in grouped.items()], policy_stats
+    groups = []
+    for side, params in grouped.items():
+        group = {"params": params, "rank": rank, "side": side}
+        if basis_refresh_schedule == "layer-staggered" and refresh_offsets_by_side.get(side):
+            group["basis_refresh_offsets"] = refresh_offsets_by_side[side]
+        groups.append(group)
+    return groups, policy_stats
+
+
+def transformer_layer_index(name: str) -> int:
+    parts = name.split(".")
+    for layer_token in ("layers", "h", "blocks"):
+        if layer_token in parts:
+            index = parts.index(layer_token) + 1
+            if index < len(parts):
+                try:
+                    return int(parts[index])
+                except ValueError:
+                    return 0
+    return 0
 
 
 def lfm_mlp_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
@@ -372,7 +398,7 @@ def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: Sumo
     bases = []
     for param in params:
         group = _optimizer_group_for_param(optimizer, param)
-        if group is None or _sumotrack_group_refresh_due(group):
+        if group is None or _sumotrack_param_refresh_due(group, param):
             return None
         state = optimizer.state.get(param, {})
         basis = state.get("basis")
@@ -391,10 +417,17 @@ def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn
     return None
 
 
-def _sumotrack_group_refresh_due(group: dict) -> bool:
+def _sumotrack_param_refresh_due(group: dict, param: torch.nn.Parameter) -> bool:
     step = group.get("basis_refresh_step", 0)
     interval = group.get("basis_refresh_interval", 0)
-    return interval > 0 and step > 0 and step % interval == 0
+    if interval <= 0 or step <= 0:
+        return False
+    offsets = group.get("basis_refresh_offsets")
+    if offsets is None:
+        return step % interval == 0
+    if step < interval:
+        return False
+    return (step - offsets.get(id(param), 0)) % interval == 0
 
 
 def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, min_batches: int):
@@ -677,6 +710,7 @@ def run_optimizer(
         args.rank,
         args.projection_side_policy,
         activation_projected_param_ids,
+        args.basis_refresh_schedule,
     )
     train_batch_count = (args.warmup_steps + args.measure_steps) * args.grad_accum_steps
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_batch_count, args.batching, "synth")
@@ -809,6 +843,7 @@ def run_optimizer(
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
         "basis_init": args.basis_init if optimizer_name == "sumotrack" else "n/a",
         "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "sumotrack" else 0,
+        "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "sumotrack" else "n/a",
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "sumotrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "sumotrack" else 0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "sumotrack" else False,
@@ -882,6 +917,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
+    parser.add_argument(
+        "--basis-refresh-schedule",
+        choices=("burst", "layer-staggered"),
+        default="burst",
+        help="basis refresh timing; burst preserves the default all-due refresh, layer-staggered offsets refresh by transformer layer index",
+    )
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
@@ -997,7 +1038,7 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
-        f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} "
+        f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce "
