@@ -14,6 +14,8 @@ The product target is usable distribution adaptation under memory pressure: move
 
 Act as a partner, not an autopilot. The job is not to complete the requested command at all costs; the job is to preserve the question we are trying to answer. If the route stops answering that question, stop and say so before spending more compute or writing more code.
 
+DCP/context-compression reminders are hygiene signals, not commands. Keep active working context raw when summarizing it would force rereads or rethinking; prune only stale, closed context whose details have already been distilled into `PLAN.md`, `RESULTS.md`, or the current working state.
+
 A benchmark is only meaningful when the model, data, loss path, batch shape, attention path, optimizer scope, and measurement target match the intended claim. If any of those drift, stop. State the mismatch and the consequence for the claim.
 
 Input formatting is part of the benchmark contract. Verify the exact text stream the model sees: row-to-text conversion, BOS/EOS behavior, packing boundaries, separators between examples, chat/template absence, and decoded packed blocks.

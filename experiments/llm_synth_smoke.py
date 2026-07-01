@@ -15,15 +15,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sumotrack import SumoTrack, optimizer_state_bytes_by_category
-from sumotrack.projected_activation import OptimizerProjectedGradientSink, projected_activation_gated_mlp
+from sumotrack.projected_activation import OptimizerProjectedGradientSink, projected_activation_gated_mlp, projected_activation_linear
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
 DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled"
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
-ProjectionSidePolicy = Literal["auto", "residual-facing"]
-ProjectedActivationBackend = Literal["off", "lfm-mlp"]
+ProjectionSidePolicy = Literal["auto", "residual-facing", "right"]
+ProjectedActivationBackend = Literal["off", "lfm"]
 BasisRefreshSchedule = Literal["burst", "layer-staggered"]
 BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
@@ -268,6 +268,8 @@ def storage_side_for_residual_axis(role: str, policy: ProjectionSidePolicy) -> s
 
     if policy == "auto":
         return "auto"
+    if policy == "right":
+        return "right"
     if role in {"mlp_up_gate", "attention_qkv"}:
         return "right"
     if role in {"mlp_down", "attention_out"}:
@@ -336,23 +338,41 @@ def lfm_mlp_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
     return modules
 
 
+def lfm_projected_linear_modules(model: torch.nn.Module) -> list[torch.nn.Linear]:
+    linears: list[torch.nn.Linear] = []
+    for _name, module in model.named_modules():
+        attention_linears = tuple(getattr(module, name, None) for name in ("q_proj", "k_proj", "v_proj", "out_proj"))
+        if all(isinstance(linear, torch.nn.Linear) for linear in attention_linears):
+            linears.extend(attention_linears)
+            continue
+
+        in_proj = getattr(module, "in_proj", None)
+        out_proj = getattr(module, "out_proj", None)
+        conv = getattr(module, "conv", None)
+        if isinstance(in_proj, torch.nn.Linear) and isinstance(out_proj, torch.nn.Linear) and isinstance(conv, torch.nn.Conv1d):
+            linears.extend((in_proj, out_proj))
+    return linears
+
+
 def projected_activation_param_ids(model: torch.nn.Module, backend: ProjectedActivationBackend) -> set[int]:
     if backend == "off":
         return set()
-    if backend != "lfm-mlp":  # pragma: no cover - argparse constrains this
+    if backend != "lfm":  # pragma: no cover - argparse constrains this
         raise ValueError(f"unknown projected activation backend: {backend}")
     ids: set[int] = set()
     for module in lfm_mlp_modules(model):
         ids.add(id(module.w1.weight))
         ids.add(id(module.w2.weight))
         ids.add(id(module.w3.weight))
+    for linear in lfm_projected_linear_modules(model):
+        ids.add(id(linear.weight))
     return ids
 
 
 def install_projected_activation_backend(model: torch.nn.Module, optimizer: SumoTrack, backend: ProjectedActivationBackend) -> int:
     if backend == "off":
         return 0
-    if backend != "lfm-mlp":  # pragma: no cover - argparse constrains this
+    if backend != "lfm":  # pragma: no cover - argparse constrains this
         raise ValueError(f"unknown projected activation backend: {backend}")
     sink = OptimizerProjectedGradientSink(optimizer)
     installed = 0
@@ -360,9 +380,28 @@ def install_projected_activation_backend(model: torch.nn.Module, optimizer: Sumo
         original_forward = module.forward
         module.forward = _make_projected_activation_lfm_mlp_forward(module, optimizer, sink, original_forward)  # type: ignore[method-assign]
         installed += 1
+    for linear in lfm_projected_linear_modules(model):
+        original_forward = linear.forward
+        linear.forward = _make_projected_activation_linear_forward(linear, optimizer, sink, original_forward)  # type: ignore[method-assign]
+        installed += 1
     if installed == 0:
-        raise RuntimeError("projected activation backend lfm-mlp did not find any LFM MLP modules with w1/w2/w3 Linear children")
+        raise RuntimeError("projected activation backend lfm did not find any LFM MLP, attention, or short-conv projection modules")
     return installed
+
+
+def _make_projected_activation_linear_forward(
+    linear: torch.nn.Linear,
+    optimizer: SumoTrack,
+    sink: OptimizerProjectedGradientSink,
+    fallback_forward: Callable[[torch.Tensor], torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        basis = _projected_activation_linear_basis(linear, optimizer)
+        if basis is None:
+            return fallback_forward(x)
+        return projected_activation_linear(x, linear.weight, basis, sink, linear.weight, linear.bias)
+
+    return forward
 
 
 def _make_projected_activation_lfm_mlp_forward(
@@ -408,6 +447,19 @@ def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: Sumo
             return None
         bases.append(basis)
     return bases[0], bases[1], bases[2]
+
+
+def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: SumoTrack) -> torch.Tensor | None:
+    group = _optimizer_group_for_param(optimizer, linear.weight)
+    if group is None or _sumotrack_param_refresh_due(group, linear.weight):
+        return None
+    state = optimizer.state.get(linear.weight, {})
+    basis = state.get("basis")
+    if basis is None or not state.get("projection_side_is_right", False):
+        return None
+    if basis.ndim != 2 or basis.shape[1] != linear.weight.shape[1]:
+        return None
+    return basis
 
 
 def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn.Parameter) -> dict | None:
@@ -904,15 +956,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of source validation batches/blocks to build")
     parser.add_argument("--batching", choices=("synth_right_padded_no_mask", "eos_packed_no_mask"), default="synth_right_padded_no_mask", help="batch construction policy; default is faithful SYNTH diagnostics; choose eos_packed_no_mask explicitly for throughput")
     parser.add_argument("--rank", type=int, default=64)
-    parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing"), default="residual-facing")
+    parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing", "right"), default="residual-facing")
     parser.add_argument(
         "--projected-activation-backend",
-        choices=("off", "lfm-mlp"),
+        choices=("off", "lfm"),
         default="off",
-        help="experimental SumoTrack-only activation-projected backward backend; lfm-mlp wraps LFM w1/w3/w2 MLPs after basis warmup",
+        help="experimental SumoTrack-only activation-projected backward backend; lfm wraps LFM MLP and operator projection linears after basis warmup",
     )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
-    parser.add_argument("--sumotrack-lr", type=float, default=0.0025)
+    parser.add_argument("--sumotrack-lr", type=float, default=2e-4)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
