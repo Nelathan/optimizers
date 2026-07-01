@@ -26,6 +26,8 @@ Every line must earn its place. Do not add flags, branches, adapters, warnings, 
 
 Keep talking when alignment matters. Short progress notes should expose changed assumptions, invalidated routes, and decisions needed from the user.
 
+Use the todo tool only for larger phase chunks that cannot be held or completed in one coherent pass. Do not use it as a diary, status spinner, or substitute for thinking.
+
 Stop at crossroads. If the exact model/cache/path is unclear, if pulling a model is the real choice, if the next probe changes scale, or if there are two plausible experiment contracts, ask before wandering.
 
 ## Current optimizer invariants
