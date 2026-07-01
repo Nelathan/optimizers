@@ -157,6 +157,27 @@ class ProjectedActivationTest(unittest.TestCase):
         self.assertTrue(torch.allclose(projected.sink.projected_grads[projected.up.weight], reference.up.weight.grad @ q_hidden.mT, atol=1e-12))
         self.assertTrue(torch.allclose(projected.sink.projected_grads[projected.down.weight], reference.down.weight.grad @ q_intermediate.mT, atol=1e-12))
 
+    def test_fused_gated_mlp_does_not_save_full_gate_or_up_activations(self):
+        torch.manual_seed(26)
+        batch, hidden, intermediate, rank_hidden, rank_intermediate = 4, 6, 9, 3, 4
+        x = torch.randn(batch, hidden, dtype=torch.float64)
+        q_hidden = _orthonormal_rows(hidden, rank_hidden)
+        q_intermediate = _orthonormal_rows(intermediate, rank_intermediate)
+        projected = _TinyFusedProjectedGatedMlp(hidden, intermediate, q_hidden, q_intermediate, dtype=torch.float64)
+        saved_shapes = []
+
+        def pack(tensor):
+            saved_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            projected(x).square().mean().backward()
+
+        self.assertNotIn((batch, intermediate), saved_shapes)
+        self.assertIn((batch, hidden), saved_shapes)
+        self.assertIn((batch, rank_hidden), saved_shapes)
+        self.assertIn((batch, rank_intermediate), saved_shapes)
+
 
 class _TinyGatedMlp(torch.nn.Module):
     def __init__(self, hidden: int, intermediate: int, *, dtype: torch.dtype) -> None:

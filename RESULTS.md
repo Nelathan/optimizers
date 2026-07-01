@@ -15,6 +15,7 @@ Implementation tested:
 - Added an opt-in harness backend, now named `--projected-activation-backend lfm`. It finds LFM-style MLP modules with `w1`, `w3`, and `w2` Linear children, forces those weights to storage-right/activation-facing bases, and monkeypatches the MLP forward. It also wraps LFM standard-attention projection Linears (`q_proj`, `k_proj`, `v_proj`, `out_proj`) and short-conv operator projection Linears (`in_proj`, `out_proj`) with projected-activation Linear backward. FA/SDPA and causal-conv kernels remain untouched; only their Linear boundaries change backward behavior. The backend falls back to the original full-gradient forward until bases are initialized and on refresh-due params.
 - Corrected the fused MLP to use separate gate/up input bases, because real SumoTrack tracks one basis per weight.
 - Added opt-in `--basis-refresh-schedule layer-staggered` after the first survival run exposed burst refresh as the new peak. This keeps default burst behavior unchanged, but assigns transformer-layer phase offsets so only one layer's MLP fallback needs full gradients at a time.
+- Changed the fused projected MLP backward to stop saving full `gate_pre` and `up` activations from forward. It now saves projected activations plus the MLP input, recomputes the two gated Linear outputs in backward, and schedules the recompute so `up` is not materialized until the gate path needs it.
 
 Validation before LFM smoke:
 
@@ -22,7 +23,7 @@ Validation before LFM smoke:
 - Tiny projected-activation tests prove projected grads equal `project(full_gradient)` for Linear and fused gated MLP, while input grads match ordinary autograd.
 - Tiny harness tests prove the LFM wrapper falls back before basis init and then queues projected grads once bases are ready, for fused MLPs, standard-attention projection Linears, and short-conv projection Linears. The short-conv convolution kernel itself remains ordinary full-gradient/fallback.
 - Extended harness math tests now compare the installed LFM MLP, standard-attention Linear, and short-conv projection wrappers against a reference model's ordinary full weight gradients projected by each optimizer-stored right-side basis. These pass, so the wrapper arithmetic matches `full_grad @ Qᵀ`.
-- Full unit suite passed before the first LFM smoke: `63 tests OK`; after layer-staggered refresh support: `66 tests OK`; after extending `lfm` activation projection to attention/short-conv projection Linears: `68 tests OK`; after corrected-LR/default and wrapper-math tests: `69 tests OK`.
+- Full unit suite passed before the first LFM smoke: `63 tests OK`; after layer-staggered refresh support: `66 tests OK`; after extending `lfm` activation projection to attention/short-conv projection Linears: `68 tests OK`; after corrected-LR/default and wrapper-math tests: `69 tests OK`; after fused MLP recompute scheduling: `70 tests OK`.
 
 LFM setup for smokes: `LiquidAI/LFM2.5-350M-Base`, bf16 on CUDA, SDPA, broad no embeddings, rank 64, `basis_init=eigh`, `basis_refresh_interval=100`, CCE, faithful right-padded no-mask SYNTH batches, validation/sample disabled. One warmup step initializes bases; the harness resets CUDA peak stats after warmup, so reported peaks are measured-window peaks only.
 
@@ -38,16 +39,18 @@ Runs:
 | survival with staggered refresh | `lfm-mlp` | 200 | `bs4 × seq1024` | `4,089,507,328` | `21,015` | `0.1949` | `--basis-refresh-schedule layer-staggered`; crossed refresh boundary without the burst peak |
 | full LFM activation projection | `lfm` | 10 | `bs4 × seq1024` | `3,799,601,664` | `21,975` | `0.1864` | installed 60 projected modules: 16 MLPs, 24 standard-attention Linears, 20 short-conv Linears |
 | full LFM activation projection + staggered refresh | `lfm` | 200 | `bs4 × seq1024` | `3,910,200,832` | `21,839` | `0.1876` | crossed refresh boundary; FA/SDPA and causal-conv kernels still ordinary |
+| full LFM activation projection + MLP recompute | `lfm` | 10 | `bs4 × seq1024` | `2,754,171,392` | `19,906` | `0.2058` | no activation checkpointing; fused MLP no longer saves full `gate_pre`/`up` |
+| full LFM activation projection + MLP recompute + staggered refresh | `lfm` | 200 | `bs4 × seq1024` | `2,931,879,424` | `19,862` | `0.2062` | crossed refresh boundary; update norm `0.057830` |
 
-Quality controls after the memory smokes exposed a harness-contract trap. The old faithful rank-ablation lane explicitly used `--sumotrack-lr 2e-4`; the parser still defaulted to `0.0025`. Early full-`lfm` quality runs that omitted LR were therefore overdriven and are not evidence against activation projection. The harness default is now corrected to `2e-4`.
+Quality controls after the memory smokes exposed two harness-contract traps. First, the old faithful rank-ablation lane explicitly used `--sumotrack-lr 2e-4`; the parser still defaulted to `0.0025`. Early full-`lfm` quality runs that omitted LR were therefore overdriven and are not evidence against activation projection. The harness default is now corrected to `2e-4`. Second, activation checkpointing changes what the projected-activation run proves: checkpointed projected-activation runs were useful milestone checks for geometry and implementation sanity, but they still recompute full activations during backward before the projected path consumes them. They are not an alternative lane to keep; the target path stores small projected activations in the original forward and consumes those directly.
 
-At corrected LR on the faithful `bs8 × seq1024` checkpointed lane, the baseline still reproduces the old rank-ablation shape:
+At corrected LR on the `bs8 × seq1024` checkpointed continuity lane, the no-projection baseline still reproduces the old rank-ablation shape:
 
 | run | backend / policy | steps | target val loss | source val loss | last train loss | mean update norm | peak allocated CUDA | notes |
 | --- | --- | ---: | --- | --- | --- | ---: | ---: | --- |
 | old rank-64 baseline | `off`, residual-facing, burst, `2e-4` | 100 | `1.941913` | `2.966022` | n/a | n/a | n/a | historical run `kkmk57jz`; final 1k was `1.778049 / 3.014893` |
 | current corrected baseline | `off`, residual-facing, burst, `2e-4` | 100 | `1.932040` | `2.969326` | n/a | n/a | n/a | current code reproduces old early curve |
-| full activation projection | `lfm`, all wrapped weights right, layer-staggered, `2e-4` | 100 | `1.916492` | `2.984066` | `2.015846` | `0.061237` | `7,065,087,488` | installed 60 projected modules; activation checkpointing on |
+| full activation projection | `lfm`, all wrapped weights right, layer-staggered, `2e-4` | 100 | `1.916492` | `2.984066` | `2.015846` | `0.061237` | `7,065,087,488` | installed 60 projected modules; activation checkpointing on, so milestone geometry/sanity evidence only |
 | all-right geometry control | `off`, right side policy, burst, `2e-4` | 100 | `1.916419` | `2.985453` | `2.013008` | `0.060246` | `9,758,161,920` | no custom projected backward; same right-side geometry |
 
 The burst-refresh 200-step run also reported: actual sequence tokens/update `4096`, supervised tokens/update `3340`, elapsed `39.027s`, peak reserved CUDA `6,090,129,408`, last measured train loss `2.313989`, mean grad norm `9.494127`, mean update norm `0.348584`, update/param `0.001407`, mean basis rotation chordal `0.169644`.
@@ -58,7 +61,9 @@ The same-shape no-activation-projection baseline reported installed modules `0`,
 
 The full `lfm` activation-projection 10-step run reported installed modules `60`, side-policy right tensors `92`, state bytes `48,486,400`, actual sequence tokens/update `4096`, supervised tokens/update `3340`, elapsed `1.864s`, peak reserved CUDA `6,079,643,648`, and last measured train loss `1.977467`.
 
-The full `lfm` activation-projection 200-step staggered-refresh run reported installed modules `60`, elapsed `37.511s`, peak reserved CUDA `6,100,615,168`, last measured train loss `2.386802`, mean grad norm `5.926511`, mean update norm `0.353799`, update/param `0.001428`, and mean basis rotation chordal `0.409630`.
+The full `lfm` activation-projection 200-step staggered-refresh run before MLP recompute reported installed modules `60`, elapsed `37.511s`, peak reserved CUDA `6,100,615,168`, last measured train loss `2.386802`, mean grad norm `5.926511`, mean update norm `0.353799`, update/param `0.001428`, and mean basis rotation chordal `0.409630`.
+
+After MLP recompute scheduling, the full `lfm` no-checkpoint 200-step staggered-refresh run reported installed modules `60`, elapsed `41.244s`, peak reserved CUDA `5,620,367,360`, last measured train loss `1.969601`, mean grad norm `2.355345`, mean update norm `0.057830`, update/param `0.000234`, and mean basis rotation chordal `0.169311`.
 
 Interpretation:
 
@@ -67,17 +72,18 @@ Interpretation:
 - The `bs4 × seq1024` 10-step peak (`~3.99 GB`) versus burst-refresh 200-step peak (`~5.26 GB`) showed refresh fallback was the visible high-water mark. Warmup does not explain this because peak stats are reset after warmup. Layer-staggered refresh reduced the 200-step peak to `~4.09 GB`, so simple phase offsets are enough to preserve most of the projected-MLP memory win across this refresh boundary.
 - At the current same-shape `bs4 × seq1024` 10-step smoke, no activation projection peaked at `~5.24 GB`, MLP-only activation projection had previously peaked at `~3.99 GB`, and full `lfm` activation projection peaked at `~3.80 GB`. The full mode is a `~1.44 GB` cut from the no-activation-projection baseline before compile/checkpoint tricks.
 - Extending the same mode from MLP-only to LFM's standard-attention and short-conv projection Linears lowered the steady peak by another `~195 MB`, and lowered the 200-step staggered refresh peak from `~4.09 GB` to `~3.91 GB`. This is a smaller but real additional cut, and it did not require touching FA/SDPA or causal-conv kernels.
+- Removing saved full MLP `gate_pre`/`up` activations was the next large cut. The recompute-scheduled full `lfm` backend lowered the no-checkpoint 10-step peak from `~3.80 GB` to `~2.75 GB`, and the 200-step refresh-crossing peak from `~3.91 GB` to `~2.93 GB`. The synthetic gated-MLP smoke shows why scheduling matters: naive recompute can raise backward peak, but delaying `up` recompute until the gate path turns the high-token case into a peak win.
 - The smaller-than-hoped attention/short-conv increment is itself a useful boundary. The easy Linear projection surfaces are no longer the main peak driver after the MLP cut; remaining peak is likely dominated by attention/short-conv kernel backward state, CCE/loss and activation temporaries, and refresh/fallback slices rather than ordinary projection Linear `dW` storage alone. Chasing more memory from attention probably means crossing into kernel/recompute/checkpoint territory, not merely wrapping more Linears.
 - The speed signal is encouraging: full `lfm` activation projection was slightly faster than the same-shape no-projection smoke (`0.1864s` vs `0.1958s` per step) despite eager custom autograd. Treat that as a smoke signal that lower memory pressure can pay back Python overhead, not as a final throughput claim.
-- The corrected-LR 100-step quality controls separate implementation math from geometry. Full `lfm` activation projection and an ordinary no-projection all-right control were almost identical on target/source/train/update, while the residual-facing baseline preserved source slightly better and moved target slightly less. This says the custom projected backward is faithfully realizing all-right/activation-facing projection; the policy tradeoff is side geometry, not an obvious gradient-arithmetic bug.
+- The corrected-LR checkpointed 100-step quality controls separate implementation math from geometry, but not projected-activation storage from checkpoint recompute. Full `lfm` activation projection and an ordinary no-projection all-right control were almost identical on target/source/train/update, while the residual-facing baseline preserved source slightly better and moved target slightly less. This says the custom projected backward is faithfully realizing all-right/activation-facing projection; the policy tradeoff is side geometry, not an obvious gradient-arithmetic bug. Treat this as a passed milestone, not a branch to preserve.
 - The stale LR default was a serious control failure. At `0.0025`, update norms jumped to `~0.35` and source loss blew out; at the current best `2e-4`, update norms are back near `~0.05–0.06` and the old baseline reproduces. Future quality commands should either rely on the corrected default or state LR explicitly in the run name/record.
 - The backend is still eager/uncompiled, refresh still uses full gradients for the layer/params being refreshed, and the short-conv convolution kernel itself is not projected. These are implementation facts, not defects to hide.
 - Throughput cost is real in the one-step `bs1 × seq512` compare (`~17%` slower), but the `bs4 × seq1024` survival run still achieved `~21k tokens/s`. Treat speed numbers as smoke signals, not final optimized performance.
 
 Next leads:
 
-- Run longer corrected-LR target/source quality curves for residual-facing, all-right, MLP-only activation projection, and full `lfm` activation projection.
-- Check activation checkpointing and compile interactions after the quality path is coherent.
+- Build on the projected-activation path by removing large saved/recomputed intermediates, especially fused MLP `gate_pre`/`up`, so checkpointing-off projected activation can realize the intended forward-stored-small-activation memory advantage.
+- Use corrected-LR target/source curves only as regression sensors while cutting memory; do not maintain checkpointed projected activation as a product lane.
 - Decide whether layer-staggered refresh should become the default only after quality runs, not from memory smokes alone.
 
 ## 2026-06-30: Backward-hook projected gradients did not reduce LFM peak VRAM

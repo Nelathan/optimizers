@@ -144,7 +144,7 @@ class _ProjectedActivationGatedMlp(Function):
         projected_gate_input = flat_input @ gate_input_basis.mT
         projected_up_input = flat_input @ up_input_basis.mT
         projected_hidden = hidden.reshape(-1, hidden.shape[-1]) @ hidden_basis.mT
-        ctx.save_for_backward(projected_gate_input, projected_up_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight)
+        ctx.save_for_backward(projected_gate_input, projected_up_input, projected_hidden, input, gate_weight, up_weight, down_weight)
         ctx.input_shape = tuple(input.shape)
         ctx.sink = sink
         ctx.keys = (gate_key, up_key, down_key)
@@ -152,12 +152,13 @@ class _ProjectedActivationGatedMlp(Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None, None, None, None, None, None, None, None]:
-        projected_gate_input, projected_up_input, projected_hidden, gate_pre, up, gate_weight, up_weight, down_weight = ctx.saved_tensors
+        projected_gate_input, projected_up_input, projected_hidden, input, gate_weight, up_weight, down_weight = ctx.saved_tensors
         gate_key, up_key, down_key = ctx.keys
         grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
 
         down_projected_grad = grad_output_flat.mT @ projected_hidden
-        grad_hidden = (grad_output_flat @ down_weight).reshape_as(up)
+        gate_pre = input @ gate_weight.mT
+        grad_hidden = (grad_output_flat @ down_weight).reshape(gate_pre.shape)
 
         silu_gate = torch.nn.functional.silu(gate_pre)
         grad_up = grad_hidden * silu_gate
@@ -168,11 +169,15 @@ class _ProjectedActivationGatedMlp(Function):
 
         sigmoid_gate = torch.sigmoid(gate_pre)
         silu_grad = sigmoid_gate * (1.0 + gate_pre * (1.0 - sigmoid_gate))
-        grad_hidden.mul_(up).mul_(silu_grad)
+        grad_hidden.mul_(silu_grad)
+        del sigmoid_gate, silu_grad
+        up = input @ up_weight.mT
+        grad_hidden.mul_(up)
+        del up
         grad_gate_flat = grad_hidden.reshape(-1, grad_hidden.shape[-1])
         gate_projected_grad = grad_gate_flat.mT @ projected_gate_input
         grad_input_flat.add_(grad_gate_flat @ gate_weight)
-        del sigmoid_gate, silu_grad, grad_gate_flat
+        del gate_pre, grad_gate_flat
 
         _sink_add(ctx.sink, gate_key, gate_projected_grad)
         _sink_add(ctx.sink, up_key, up_projected_grad)
@@ -197,9 +202,9 @@ def projected_activation_gated_mlp(
 ) -> Tensor:
     """SwiGLU-style MLP with activation-facing projected weight grads.
 
-    The exact backward here saves full ``gate_pre`` and ``up`` because those are
-    required to differentiate the gate without recomputation. It deliberately
-    does not save full input or full hidden for weight-gradient formation.
+    The backward saves projected activations for weight-gradient formation and
+    recomputes the gated intermediates needed for the SwiGLU derivative. This
+    avoids storing full ``gate_pre`` and ``up`` from the forward pass.
     """
 
     return _ProjectedActivationGatedMlp.apply(
