@@ -4,7 +4,7 @@ This is the design and experiment record for SumoTrack's projected-activation ba
 
 The goal is not merely to save some VRAM. The goal is to replace the dominant full activation storage needed for matrix weight-gradient formation with small projected activations, then fold loss gradients onto those small tensors during backward while feeding SumoTrack's projected-moment/Aurora update path.
 
-Checkpointing remains an empirical tool and may still be part of a practical implementation for some blocks, but it is not the product story by itself. A checkpointed run can validate projected-gradient geometry; it does not prove that forward-stored projected activations have replaced full activation storage.
+Checkpointing remains an empirical tool and may still be part of a practical implementation for some blocks, but it is not the product story by itself. A checkpointed run can validate projected-gradient geometry and, when actually wired, can be the right substrate for avoiding depth-wise activation buildup. It does not by itself prove that every useful full activation has been replaced by a projected save.
 
 ## Design intent from the original pitch
 
@@ -37,8 +37,6 @@ The current root implementation is in:
 - `tests/test_projected_activation.py`
 - `tests/test_llm_harness.py`
 
-Current committed checkpoint: `4597b6c Recompute projected MLP intermediates`.
-
 What is now implemented:
 
 - explicit SumoTrack projected-gradient queue via `SumoTrack.queue_projected_grad(param, projected_grad)`;
@@ -51,6 +49,7 @@ What is now implemented:
   - short-conv operator projection Linears `in_proj`, `out_proj`;
 - layer-staggered refresh schedule to avoid burst refresh dominating measured peak;
 - diagnostic `--projection-side-policy right` to separate activation-facing geometry from projected-backward implementation.
+- harness-local LFM2 decoder-layer checkpoint repair, because the Transformers LFM2 model advertises gradient checkpointing but does not call `_gradient_checkpointing_func` in `Lfm2Model.forward()`.
 
 Default training remains no activation projection unless explicitly requested.
 
@@ -167,7 +166,34 @@ The 200-step corrected-LR checkpointed full `lfm` run was a milestone sanity tes
 - step 200: target `1.868035`, source `2.997959`;
 - mean update norm `0.054502`.
 
-Checkpointing is not forbidden. It may still be a practical substrate. But a checkpointed run proves geometry and implementation sanity; it does not prove the full forward-stored projected-activation memory path because full activations are recomputed during backward.
+Checkpointing is not forbidden. It is now a practical substrate again after the LFM2 repair: layer checkpointing stores boundary activations and recomputes internals, while projected activation still prevents full projection-weight `dW` materialization and keeps queued projected gradients small.
+
+## LFM2 checkpointing repair
+
+Transformers' LFM2 implementation sets `supports_gradient_checkpointing = True` and `Lfm2Model.gradient_checkpointing = False`, and `gradient_checkpointing_enable()` sets the flag plus `_gradient_checkpointing_func`. But `Lfm2Model.forward()` loops through decoder layers and calls them directly. The flag was lit; the engine was not connected.
+
+The harness now narrowly repairs this when `--activation-checkpointing` is requested:
+
+- only `Lfm2Model` is patched;
+- each decoder layer forward is wrapped with non-reentrant `torch.utils.checkpoint.checkpoint()`;
+- grad-enabled execution checkpoints the layer;
+- `torch.no_grad()` / eval-style execution calls the original layer directly;
+- no LFM model fork is maintained.
+
+One-forward/backward monitor, full `lfm`, `bs8 × seq1024`, one warm basis step then measured step:
+
+| mode | after forward+loss | final peak | queued projected grads | retained full grads |
+| --- | ---: | ---: | ---: | ---: |
+| no checkpoint | `4,370,416,640` | `4,731,528,192` | `28,573,696` | `128,512` |
+| stock HF checkpoint flag | `4,420,781,056` | `4,781,892,608` | `28,573,696` | `128,512` |
+| repaired decoder-layer checkpoint | `1,094,175,744` | `1,692,342,272` | `28,573,696` | `128,512` |
+
+Artifacts:
+
+- `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/repaired_checkpoint_timeline_table.md`
+- `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/repaired_checkpoint_memory_timeline.svg`
+
+Saved-tensor owner hooks are useful for no-checkpoint forensics, but they are not the authoritative checkpoint monitor because non-reentrant checkpointing itself relies on saved-tensor machinery. Use CUDA timeline/peak events for checkpoint memory claims.
 
 ## Attention and short-conv status
 
@@ -183,7 +209,7 @@ Standard attention still has nonlinear/kernel state around q/k norms, rotary, at
 
 If exact backward for a block requires recomputing full q/k/v/attention or conv internals, that approaches standard checkpointing. The question is not whether checkpointing is morally allowed; it is whether projected saves replace a real full activation storage hog rather than becoming redundant with recomputed full activations.
 
-## Latest monitor
+## Latest no-checkpoint monitor
 
 One-off monitor after commit `4597b6c`, full `lfm`, no checkpointing, `bs8 × seq1024`, one warm basis step then one measured forward/backward:
 
@@ -206,14 +232,14 @@ Interpretation still needs care. The monitor shows where the peak occurs in modu
 
 1. **Remaining peak owner.** Is the next dominant object MLP input save, attention/short-conv kernel state, CCE/loss state, refresh fallback, optimizer update temps, or allocator timing?
 2. **Attention/short-conv economics.** Do projected Linear boundary saves still buy enough to matter once MLP is fixed, or are kernel internals now the wall?
-3. **Checkpointing as substrate.** Normal checkpointing may remain best for some blocks if we store one layer/block boundary activation and recompute internals, while projected saves reduce weight-gradient materialization. But it should be adopted because measurement says it is best, not because it hides unfinished activation-storage work.
+3. **Checkpointing as substrate.** Repaired decoder-layer checkpointing is now empirically best for the current `bs8` memory shape. Next decide what projected activation buys on top of real checkpointing and whether any remaining full-activation saves are worth cutting without kernel work.
 4. **Quality without checkpointing.** Now that the no-checkpoint full `lfm` path fits much better, run corrected-LR target/source sensors on the product-shaped path.
 
 ## Next coherent cut
 
 Read the monitor before optimizing:
 
-1. classify the remaining peak owner more precisely, ideally with saved-tensor hooks or targeted module probes;
-2. if it is still MLP/projection-boundary state, continue projected-activation cleanup;
-3. if it is attention/short-conv internals, decide whether checkpointing that block is the practical substrate or whether the memory win is too small to justify deeper custom code;
+1. validate repaired checkpointing in ordinary harness runs, not only monitor scripts;
+2. rerun corrected-LR quality/throughput sensors on the repaired checkpoint substrate;
+3. measure the incremental value of projected activation versus ordinary right-side/no-projection under real checkpointing;
 4. avoid kernel-level/Triton work unless a measured bottleneck leaves no higher-level route.

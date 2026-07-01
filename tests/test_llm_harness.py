@@ -6,7 +6,7 @@ import torch
 
 from sumotrack import SumoTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, select_trainable_params
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params
 from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -63,6 +63,29 @@ class TinyLfmShortConv(torch.nn.Module):
         conv_in = (b * x_branch).transpose(-1, -2)
         conv_out = self.conv(conv_in).transpose(-1, -2)
         return self.out_proj(c * conv_out)
+
+
+class CountingCheckpointLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x.sin()
+
+
+class Lfm2Model(torch.nn.Module):
+    def __init__(self, layers: int = 2):
+        super().__init__()
+        self.gradient_checkpointing = True
+        self.layers = torch.nn.ModuleList([CountingCheckpointLayer() for _ in range(layers)])
+
+
+class TinyLfmForCausalLM(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = Lfm2Model()
 
 
 class LlmHarnessParamScopeTest(unittest.TestCase):
@@ -219,6 +242,30 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
 
         self.assertEqual(group["side"], "right")
         self.assertEqual(group["basis_refresh_offsets"], {id(first): 2, id(second): 5})
+
+    def test_lfm2_gradient_checkpointing_repair_wraps_decoder_layers(self):
+        model = TinyLfmForCausalLM()
+
+        wrapped = repair_lfm2_gradient_checkpointing(model)
+
+        self.assertEqual(wrapped, 2)
+        self.assertEqual(repair_lfm2_gradient_checkpointing(model), 0)
+        self.assertTrue(all(getattr(layer, "_sumotrack_checkpoint_wrapped", False) for layer in model.model.layers))
+
+        x = torch.randn(4, requires_grad=True)
+        y = model.model.layers[0](x).sum()
+        y.backward()
+
+        self.assertEqual(model.model.layers[0].calls, 2)
+
+    def test_lfm2_gradient_checkpointing_repair_uses_direct_forward_without_grad(self):
+        model = TinyLfmForCausalLM()
+        repair_lfm2_gradient_checkpointing(model)
+
+        with torch.no_grad():
+            model.model.layers[0](torch.randn(4))
+
+        self.assertEqual(model.model.layers[0].calls, 1)
 
     def test_lfm_projected_activation_backend_falls_back_until_basis_ready_then_queues(self):
         model = torch.nn.Module()

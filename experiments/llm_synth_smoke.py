@@ -4,12 +4,14 @@ import argparse
 import gc
 import sys
 import time
+import types
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow.parquet as pq
 import torch
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -179,8 +181,47 @@ def load_model_and_tokenizer(model_name: str, device: torch.device, activation_c
         if not hasattr(model, "gradient_checkpointing_enable"):
             raise RuntimeError(f"Model {model_name} does not expose gradient_checkpointing_enable()")
         model.gradient_checkpointing_enable()
+        repair_lfm2_gradient_checkpointing(model)
     model.to(device)
     return model, tokenizer
+
+
+def repair_lfm2_gradient_checkpointing(model: torch.nn.Module) -> int:
+    """Wrap LFM2 decoder layers when the HF checkpointing flag is not used.
+
+    The current Transformers LFM2 model advertises gradient checkpointing and
+    accepts `gradient_checkpointing_enable()`, but `Lfm2Model.forward()` calls
+    decoder layers directly instead of routing through `_gradient_checkpointing_func`.
+    Keep this repair narrow: only patch the LFM2 base model and only when its
+    checkpointing flag is enabled.
+    """
+
+    base_model = getattr(model, "model", model)
+    if base_model.__class__.__name__ != "Lfm2Model":
+        return 0
+    if not getattr(base_model, "gradient_checkpointing", False):
+        return 0
+    layers = getattr(base_model, "layers", None)
+    if layers is None:
+        return 0
+
+    wrapped = 0
+    for layer in layers:
+        if getattr(layer, "_sumotrack_checkpoint_wrapped", False):
+            continue
+        original_forward = layer.forward
+
+        def checkpointed_forward(self, *args, __original_forward=original_forward, **kwargs):
+            if torch.is_grad_enabled():
+                return checkpoint(__original_forward, *args, use_reentrant=False, **kwargs)
+            return __original_forward(*args, **kwargs)
+
+        layer.forward = types.MethodType(checkpointed_forward, layer)
+        layer._sumotrack_checkpoint_wrapped = True
+        wrapped += 1
+
+    base_model._sumotrack_checkpoint_wrapped_layers = wrapped
+    return wrapped
 
 
 def is_embedding_like_name(name: str) -> bool:
