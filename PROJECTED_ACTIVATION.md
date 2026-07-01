@@ -188,6 +188,17 @@ One-forward/backward monitor, full `lfm`, `bs8 × seq1024`, one warm basis step 
 | stock HF checkpoint flag | `4,420,781,056` | `4,781,892,608` | `28,573,696` | `128,512` |
 | repaired decoder-layer checkpoint | `1,094,175,744` | `1,692,342,272` | `28,573,696` | `128,512` |
 
+Corrected-LR 200-step quality sensor after the repair:
+
+- W&B run `51nsznhn`, `lfm-projected-repaired-checkpoint-r64-bs8-200`;
+- step 100 target/source: `1.916834 / 2.984027`;
+- step 200 target/source: `1.861770 / 3.004450`;
+- last train loss `1.849765`, mean update norm `0.059228`;
+- peak allocated `1,797,460,480`, peak reserved `2,472,542,208`;
+- step time `0.570883s`, tokens/s `14,349.7`.
+
+Interpretation: real checkpointing cuts memory hard and preserves the corrected-LR quality shape, but it costs throughput. That is the actual tradeoff to optimize, not the old fake checkpoint curve.
+
 Artifacts:
 
 - `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/repaired_checkpoint_timeline_table.md`
