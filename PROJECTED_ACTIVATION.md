@@ -199,6 +199,16 @@ Corrected-LR 200-step quality sensor after the repair:
 
 Interpretation: real checkpointing cuts memory hard and preserves the corrected-LR quality shape, but it costs throughput. That is the actual tradeoff to optimize, not the old fake checkpoint curve.
 
+Matched repaired-checkpoint controls clarify the incremental value of projected activation under real layer checkpointing:
+
+| run | target/source @ 200 | peak allocated | step sec | interpretation |
+| --- | --- | ---: | ---: | --- |
+| residual-facing `off` | `1.877504 / 2.991532` | `2,072,345,088` | `0.524733` | baseline geometry preserves source slightly better |
+| all-right `off` | `1.861207 / 3.005637` | `2,072,345,088` | `0.524142` | same geometry as activation projection, no custom projected backward |
+| full `lfm` projected activation | `1.861770 / 3.004450` | `1,797,460,480` | `0.570883` | same quality shape as all-right, `~275 MB` lower peak, slower eager wrappers |
+
+This is the current honest boundary: projected activation is faithful and still saves memory on top of real checkpointing, but the giant win was fixing checkpointing itself. The next decision is whether the extra `~275 MB` at `bs8×seq1024` and possible larger-shape headroom justify optimizing wrapper overhead, or whether the product path should lean on repaired checkpointing plus SumoTrack state savings first.
+
 Artifacts:
 
 - `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/repaired_checkpoint_timeline_table.md`
