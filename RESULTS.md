@@ -4,6 +4,31 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
+## 2026-07-01: Repaired-checkpoint token-mass and LR probes
+
+Question: after repairing LFM2 decoder-layer checkpointing, should the 350M faithful SYNTH lane simply use the largest fitting batch, and how should LR scale with the larger token mass?
+
+Setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded SYNTH batches, repaired activation checkpointing, residual-facing projection, no activation projection backend, burst refresh, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled`, `eval_every=100` for `bs32` 200-step runs and `eval_every=50` for `bs64` 100-step equal-token-budget probes.
+
+Runs:
+
+| run | batch/steps | LR | W&B | target val | source val | last train | update norm | peak allocated CUDA | tokens/s | step sec |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| residual-facing repaired checkpoint | `bs32 × 200` | `2e-4` | `rurbzxxn` | `1.842040` | `2.989561` | `1.860471` | `0.061735` | `4,866,372,608` | `14,583` | `2.2470` |
+| residual-facing repaired checkpoint | `bs32 × 200` | `4e-4` | `ju76nimt` | `1.770638` | `3.011879` | `1.792675` | `0.087490` | `4,866,372,608` | `14,578` | `2.2477` |
+| residual-facing repaired checkpoint | `bs32 × 200` | `6e-4` | `mpwaucxb` | `1.748466` | `3.034460` | `1.769057` | `0.113416` | `4,866,372,608` | `14,664` | `2.2345` |
+| residual-facing repaired checkpoint | `bs32 × 200` | `8e-4` | `iwqj0zb6` | `1.743787` | `3.062698` | `1.762256` | `0.138119` | `4,866,372,608` | `14,748` | `2.2218` |
+| residual-facing repaired checkpoint | `bs64 × 100` | `4e-4` | `hlhu8wa9` | `1.805528` | `3.009495` | `1.819209` | `0.092040` | `8,806,796,800` | `14,079` | `4.6549` |
+| residual-facing repaired checkpoint | `bs64 × 100` | `6e-4` | `fp0bt1le` | `1.766816` | `3.034950` | `1.784200` | `0.115371` | `8,806,796,800` | `14,070` | `4.6577` |
+| residual-facing repaired checkpoint compile smoke | `bs32 × 50` | `4e-4` | `zwq33b1a` | n/a | n/a | `1.854302` | `0.096162` | `4,780,321,280` | `15,281` | `2.1444` |
+
+Interpretation:
+
+- Repaired checkpointing made `bs32 × seq1024` a practical quality lane, not just a memory smoke. At `4e-4`, `bs32` reaches old-long-run target territory in 200 larger-token steps while keeping source near the old rank-64 1k lane. `6e-4` buys more target movement at visibly higher source cost; `8e-4` gives little extra target for more source degradation, so it looks beyond the useful knee.
+- `bs64` fits and has similar tokens/sec, but at the same token budget as `bs32 × 200`, it is worse on target. More tokens/update alone is not a free walltime win; the reduced optimizer-update count matters. `bs64` remains useful headroom, not the current default-candidate lane.
+- `torch.compile` works on the repaired-checkpoint residual-facing lane and gives a modest speed win (`~2.248s` to `~2.144s` at `bs32`, LR `4e-4`) with slightly lower peak. This is worthwhile polish, not a strategy-changing result.
+- These are 200-step/100-step sensors, not final quality curves. The next clean quality run should center on `bs32`, repaired checkpointing, residual-facing, LR `4e-4` versus `6e-4`, and run long enough to see whether source keeps drifting or stabilizes.
+
 ## 2026-06-30: Projected-activation LFM backend moves peak VRAM
 
 Question: after parameter hooks failed to reduce real peak memory, can lower-level custom autograd paths for LFM operator projection Linears compute activation-facing projected weight gradients before full `dW` exists, while still feeding SumoTrack's projected-moment/Aurora update path?
