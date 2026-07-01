@@ -209,6 +209,17 @@ Matched repaired-checkpoint controls clarify the incremental value of projected 
 
 This is the current honest boundary: projected activation is faithful and still saves memory on top of real checkpointing, but the giant win was fixing checkpointing itself. The next decision is whether the extra `~275 MB` at `bs8×seq1024` and possible larger-shape headroom justify optimizing wrapper overhead, or whether the product path should lean on repaired checkpointing plus SumoTrack state savings first.
 
+Boundary smokes with repaired checkpointing and full `lfm` projected activation at `seq1024`, validation skipped:
+
+| batch | tokens/update | peak allocated | peak reserved | step sec | tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | `16,384` | `2,609,973,760` | `2,990,538,752` | `1.1632` | `14,085` |
+| 32 | `32,768` | `4,439,957,504` | `5,087,690,752` | `2.3478` | `13,957` |
+| 64 | `65,536` | `8,099,395,072` | `9,386,852,352` | `4.7135` | `13,904` |
+| 80 | `81,920` | `9,928,586,752` | `10,710,155,264` | `5.9103` | `13,861` |
+
+This is a boundary map, not a default recommendation. It shows repaired checkpointing plus projected activation has moved the local LFM-350M memory regime dramatically; useful token mass and throughput/quality now need measurement rather than assumption.
+
 Artifacts:
 
 - `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/repaired_checkpoint_timeline_table.md`
