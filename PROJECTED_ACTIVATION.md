@@ -211,6 +211,8 @@ This is the current honest boundary: projected activation is faithful and still 
 
 Current answer: lean on repaired checkpointing plus SumoTrack state savings first. Keep projected activation as an opt-in branch for memory pressure and future performance work, not as the default quality lane. If revisited, the next work should be speed/perf cleanup and larger-shape memory evidence, not more proof of gradient arithmetic.
 
+One useful variant remains open: projected activation does not have to force all wrapped weights to activation-facing bases. We could keep the residual-facing side policy as the optimizer geometry, use projected-activation backward only when the current basis is already activation-facing, and otherwise form each full Linear `dW` transiently and immediately project it into the residual-facing basis without accumulating full `.grad` buffers across the model. That would preserve residual-facing convergence while still avoiding the retained full-gradient pile; it would not remove every transient full `dW` peak, but it may recover a meaningful part of the memory win without the all-right geometry tradeoff.
+
 Boundary smokes with repaired checkpointing and full `lfm` projected activation at `seq1024`, validation skipped:
 
 | batch | tokens/update | peak allocated | peak reserved | step sec | tokens/s |
