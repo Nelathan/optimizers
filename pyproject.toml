@@ -15,6 +15,7 @@ dependencies = [
     "cut-cross-entropy>=25.1.1",
     "flash-linear-attention>=0.5.0",
     "causal-conv1d>=1.6.2.post1",
+    "matplotlib>=3.11.0",
 ]
 
 [[tool.uv.index]]

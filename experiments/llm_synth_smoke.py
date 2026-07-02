@@ -5,7 +5,7 @@ import gc
 import sys
 import time
 import types
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -770,6 +770,7 @@ def train_step(
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
     projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
+    projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
     basis_rotation_chordal = optimizer_basis_rotation(optimizer) if collect_basis else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
@@ -780,6 +781,7 @@ def train_step(
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
         "projected_grad_max_norm": projected_grad_max_norm,
+        "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
         "basis_rotation_chordal": basis_rotation_chordal,
     }
 
@@ -787,6 +789,19 @@ def train_step(
 def wandb_log(wandb_run: Any | None, data: Mapping[str, float | int | str], step: int) -> None:
     if wandb_run is not None:
         wandb_run.log(data, step=step)
+
+
+def optimizer_base_lrs(optimizer: torch.optim.Optimizer) -> list[float]:
+    return [float(group["lr"]) for group in optimizer.param_groups]
+
+
+def apply_lr_warmup(optimizer: torch.optim.Optimizer, base_lrs: Sequence[float], optimizer_step: int, warmup_steps: int) -> float:
+    if warmup_steps <= 0:
+        return 1.0
+    scale = min(1.0, optimizer_step / warmup_steps)
+    for group, base_lr in zip(optimizer.param_groups, base_lrs, strict=True):
+        group["lr"] = base_lr * scale
+    return scale
 
 
 def run_optimizer(
@@ -836,6 +851,7 @@ def run_optimizer(
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
             projected_grad_clip_norm=args.projected_grad_clip_norm if args.projected_grad_clip_norm > 0 else None,
+            projected_grad_clip_ratio=args.projected_grad_clip_ratio if args.projected_grad_clip_ratio > 0 else None,
             consume_grad=not args.keep_grads_after_step,
             compile_tensor_kernels=args.torch_compile,
         )
@@ -847,6 +863,7 @@ def run_optimizer(
         projected_activation_modules = 0
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
+    base_lrs = optimizer_base_lrs(optimizer)
 
     initial_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
@@ -865,6 +882,7 @@ def run_optimizer(
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
+        apply_lr_warmup(optimizer, base_lrs, step + 1, args.lr_warmup_steps)
         train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, False, False)
 
     if device.type == "cuda":
@@ -874,6 +892,7 @@ def run_optimizer(
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
         global_step = step + 1
+        lr_scale = apply_lr_warmup(optimizer, base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
         should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
         should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
         collect_norms = should_log_train
@@ -899,7 +918,9 @@ def run_optimizer(
                 f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
                 f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
                 f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
+                f"{optimizer_name}/projected_grad_p90_to_moment_ratio": scalar(step_result["projected_grad_p90_to_moment_ratio"]),
                 f"{optimizer_name}/basis_rotation_chordal": scalar(step_result["basis_rotation_chordal"]),
+                f"{optimizer_name}/lr_scale": lr_scale,
             }
             wandb_log(
                 wandb_run,
@@ -933,6 +954,7 @@ def run_optimizer(
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
+    measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
     measured_basis_rotation_chordal = [step["basis_rotation_chordal"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
@@ -949,9 +971,11 @@ def run_optimizer(
         "basis_init": args.basis_init if optimizer_name == "sumotrack" else "n/a",
         "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "sumotrack" else 0,
         "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "sumotrack" else "n/a",
+        "lr_warmup_steps": args.lr_warmup_steps,
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "sumotrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "sumotrack" else 0,
         "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "sumotrack" else 0.0,
+        "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "sumotrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "sumotrack" else False,
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
@@ -978,6 +1002,7 @@ def run_optimizer(
         "mean_logged_update_norm": mean_scalar(measured_update_norms),
         "mean_logged_update_to_param_ratio": mean_scalar(measured_update_to_param_ratios),
         "mean_logged_projected_grad_max_norm": mean_scalar(measured_projected_grad_max_norms),
+        "mean_logged_projected_grad_p90_to_moment_ratio": mean_scalar(measured_projected_grad_p90_to_moment_ratios),
         "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
@@ -1021,6 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
     parser.add_argument("--sumotrack-lr", type=float, default=2e-4)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
+    parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
@@ -1033,6 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
     parser.add_argument("--projected-grad-clip-norm", type=float, default=2.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables")
+    parser.add_argument("--projected-grad-clip-ratio", type=float, default=6.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables")
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
     parser.add_argument(
         "--torch-compile",
@@ -1098,6 +1125,10 @@ def main() -> None:
         raise ValueError("basis_refresh_interval must be positive")
     if args.projected_grad_clip_norm < 0:
         raise ValueError("projected_grad_clip_norm must be non-negative")
+    if args.projected_grad_clip_ratio < 0:
+        raise ValueError("projected_grad_clip_ratio must be non-negative")
+    if args.lr_warmup_steps < 0:
+        raise ValueError("lr_warmup_steps must be non-negative")
     if args.aurora_pp_iterations <= 0:
         raise ValueError("aurora_pp_iterations must be positive")
     if not 1 <= args.polar_ns_steps <= 5:
@@ -1149,6 +1180,7 @@ def main() -> None:
         f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
+        f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce "

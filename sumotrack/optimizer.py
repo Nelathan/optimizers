@@ -59,6 +59,7 @@ class SumoTrack(Optimizer):
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
         projected_grad_clip_norm: float | None = None,
+        projected_grad_clip_ratio: float | None = None,
         consume_grad: bool = True,
         compile_tensor_kernels: bool = False,
         ecc: str | None = None,
@@ -92,6 +93,8 @@ class SumoTrack(Optimizer):
             raise ValueError(f"polar_ns_steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {polar_ns_steps}")
         if projected_grad_clip_norm is not None and projected_grad_clip_norm <= 0:
             raise ValueError(f"projected_grad_clip_norm must be positive when set, got {projected_grad_clip_norm}")
+        if projected_grad_clip_ratio is not None and projected_grad_clip_ratio <= 0:
+            raise ValueError(f"projected_grad_clip_ratio must be positive when set, got {projected_grad_clip_ratio}")
 
         defaults = dict(
             lr=lr,
@@ -107,6 +110,7 @@ class SumoTrack(Optimizer):
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
             projected_grad_clip_norm=projected_grad_clip_norm,
+            projected_grad_clip_ratio=projected_grad_clip_ratio,
             consume_grad=consume_grad,
             compile_tensor_kernels=compile_tensor_kernels,
             basis_refresh_step=0,
@@ -197,10 +201,14 @@ class SumoTrack(Optimizer):
     def _new_diagnostics(self) -> dict[str, Any] | None:
         if not self.diagnostics_enabled:
             return None
+        # Logging contract: collect device tensors during the optimizer step and
+        # move/reduce them to Python scalars only in `_finalize_diagnostics()`.
+        # Per-parameter `.cpu()`/`.item()` calls are silent synchronization traps.
         return {
             "matrix_update_norm_sq": None,
             "fallback_update_norm_sq": None,
-            "projected_grad_max_norm": 0.0,
+            "projected_grad_max_norm": None,
+            "projected_grad_ratio_values": [],
             "matrix_params": 0,
             "fallback_params": 0,
             "projected_leverage_cv_sum": 0.0,
@@ -225,10 +233,18 @@ class SumoTrack(Optimizer):
         diagnostics["matrix_update_norm"] = float(matrix_norm_sq.sqrt().detach().cpu())
         diagnostics["fallback_update_norm"] = float(fallback_norm_sq.sqrt().detach().cpu())
         diagnostics["update_norm"] = float((matrix_norm_sq + fallback_norm_sq).sqrt().detach().cpu())
+        projected_grad_max_norm = diagnostics["projected_grad_max_norm"]
+        diagnostics["projected_grad_max_norm"] = float(projected_grad_max_norm.detach().cpu()) if projected_grad_max_norm is not None else float("nan")
         count = diagnostics["projected_leverage_tensors"]
         diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count if count else float("nan")
+        ratio_values = diagnostics.pop("projected_grad_ratio_values")
+        if ratio_values:
+            ratio_tensor = torch.stack(ratio_values)
+            diagnostics["projected_grad_p90_to_moment_ratio"] = float(torch.quantile(ratio_tensor.float(), 0.9).detach().cpu())
+        else:
+            diagnostics["projected_grad_p90_to_moment_ratio"] = float("nan")
         basis_count = diagnostics["basis_refresh_tensors"]
         diagnostics["mean_basis_rotation_chordal"] = diagnostics["basis_rotation_chordal_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
@@ -284,15 +300,26 @@ class SumoTrack(Optimizer):
 
         projected_grad_norm = projected_grad.float().norm().detach()
         if diagnostics is not None:
-            diagnostics["projected_grad_max_norm"] = max(diagnostics["projected_grad_max_norm"], float(projected_grad_norm.cpu()))
+            current_max = diagnostics["projected_grad_max_norm"]
+            diagnostics["projected_grad_max_norm"] = projected_grad_norm if current_max is None else torch.maximum(current_max, projected_grad_norm)
+        projected_exp_avg = state.get("projected_exp_avg")
+        moment_norm = projected_exp_avg.float().norm().detach() if projected_exp_avg is not None else None
+        if moment_norm is not None and diagnostics is not None:
+            ratio = projected_grad_norm / moment_norm.clamp_min(1e-12)
+            diagnostics["projected_grad_ratio_values"].append(ratio.detach())
         clip_norm = group.get("projected_grad_clip_norm")
+        clip_ratio = group.get("projected_grad_clip_ratio")
+        allowed_norm = None
         if clip_norm is not None:
-            clip_scale = (projected_grad_norm.new_tensor(float(clip_norm)) / projected_grad_norm.clamp_min(1e-12)).clamp(max=1.0)
-            if float(clip_scale.cpu()) < 1.0:
-                projected_grad = projected_grad.mul(clip_scale.to(device=projected_grad.device, dtype=projected_grad.dtype))
+            allowed_norm = projected_grad_norm.new_tensor(float(clip_norm))
+        if clip_ratio is not None and moment_norm is not None:
+            ratio_allowed = moment_norm * float(clip_ratio)
+            allowed_norm = ratio_allowed if allowed_norm is None else torch.minimum(allowed_norm, ratio_allowed)
+        if allowed_norm is not None:
+            clip_scale = (allowed_norm / projected_grad_norm.clamp_min(1e-12)).clamp(max=1.0)
+            projected_grad = projected_grad.mul(clip_scale.to(device=projected_grad.device, dtype=projected_grad.dtype))
 
         state["step"] = state.get("step", 0) + 1
-        projected_exp_avg = state.get("projected_exp_avg")
         if projected_exp_avg is None:
             projected_exp_avg = torch.zeros_like(projected_grad)
         projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
