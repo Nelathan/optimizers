@@ -177,6 +177,8 @@ class SubspaceProjector:
         basis = self._basis_for(matrix)
         side = self._basis_side()
         work_matrix = self._spectral_input(matrix)
+        norm = work_matrix.norm()
+        work_matrix = work_matrix / norm.clamp_min(1e-12)
         work_basis = basis.float() if basis.dtype in (torch.float16, torch.bfloat16) else basis
 
         if side is ProjectionSide.RIGHT:

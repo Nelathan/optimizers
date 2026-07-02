@@ -17,6 +17,7 @@ Runs:
 | rank64 continuity | completed | `bs32 × 500` | `6e-4` | `puxtar7t` | `1.718164` | `3.049249` | `1.662592` | `0.077616` | `0.165429` | `48,486,400` | `5,023,837,184` | `14,596` |
 | rank256 high-token probe | interrupted after evals | `bs32 × 500` | `6e-4` | `qkfx3fa0` | `1.699121` | `3.102894` | n/a | n/a | visually smooth/high | n/a | n/a | n/a |
 | rank256 more-updates probe | completed | `bs16 × 1000` | `3e-4` | `bekcxmma` | `1.683542` | `3.076128` | `1.670848` | `0.094908` | `0.358136` | `192,403,456` | `3,225,152,512` | `14,237` |
+| rank256 Grassmann-normalized smoke | completed | `bs16 × 200` | `3e-4` | `5ovm33mp` | `1.748007` | `3.020345` | `1.800468` | `0.095183` | `0.423687` | `192,403,456` | `3,014,984,704` | `14,227` |
 
 Rank256 state accounting on this LFM-350M broad-no-embeddings scope:
 
@@ -29,7 +30,7 @@ Interpretation:
 - Rank256 is still clearly in the memory-saving regime. It is about `4×` rank64 state, but still only one third of one bf16 full moment for covered matrices.
 - The rank256 runs look like more usable signal passing through the optimizer, not like random instability. Train loss and grad norm were smooth; chordal basis motion was higher but smoother. Source loss rose because update energy/source movement rose, not because rank256 failed to converge.
 - `bs16 × 1000`, rank256, LR `3e-4` is the strongest target lane so far at comparable token budget/walltime, but source cost is visible. It should be treated as the current best default candidate shape, with LR/source balance still to refine.
-- The next algorithmic code question is Grassmann refresh hygiene. Basis init normalizes the gradient before forming the side Gram; Grassmann refresh currently forms its tangent from raw full-gradient scale. Normalize or scale-control the refresh input before doing more LR/beta/rank buffet.
+- Grassmann refresh hygiene is now implemented: refresh uses normalized spectral input before tangent formation, matching basis init's scale discipline. Unit tests verify left- and right-side update invariance to a `1000×` refresh-gradient scale change. The 200-step rank256 smoke after this change was essentially identical to the previous lane at step 200 (`1.748007 / 3.020345` vs `1.748073 / 3.022887`), so the fix removes a hidden scale coupling but is not an instant source-retention cure.
 
 ## 2026-07-01: Repaired-checkpoint token-mass and LR probes
 

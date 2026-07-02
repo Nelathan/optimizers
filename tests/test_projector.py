@@ -162,6 +162,40 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), tuple(old_basis.shape))
         self.assertLess(float(projector.orthonormality_error()), 1e-5)
 
+    def test_grassmann_update_is_invariant_to_gradient_scale_right_side(self):
+        torch.manual_seed(0)
+        init_grad = torch.randn(9, 5)
+        refresh_grad = torch.randn_like(init_grad)
+        first = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
+        second = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
+        first.fit_eigh(init_grad)
+        second.basis = first.basis.clone()
+        second.resolved_side = first.resolved_side
+
+        first.update_grassmann(refresh_grad, step_size=0.01)
+        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01)
+
+        first_projector = first.basis.mT @ first.basis
+        second_projector = second.basis.mT @ second.basis
+        self.assertTrue(torch.allclose(first_projector, second_projector, atol=1e-5, rtol=1e-5))
+
+    def test_grassmann_update_is_invariant_to_gradient_scale_left_side(self):
+        torch.manual_seed(1)
+        init_grad = torch.randn(5, 9)
+        refresh_grad = torch.randn_like(init_grad)
+        first = SubspaceProjector(rank=3, side=ProjectionSide.LEFT)
+        second = SubspaceProjector(rank=3, side=ProjectionSide.LEFT)
+        first.fit_eigh(init_grad)
+        second.basis = first.basis.clone()
+        second.resolved_side = first.resolved_side
+
+        first.update_grassmann(refresh_grad, step_size=0.01)
+        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01)
+
+        first_projector = first.basis @ first.basis.mT
+        second_projector = second.basis @ second.basis.mT
+        self.assertTrue(torch.allclose(first_projector, second_projector, atol=1e-5, rtol=1e-5))
+
 
 if __name__ == "__main__":
     unittest.main()
