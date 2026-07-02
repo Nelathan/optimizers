@@ -51,7 +51,7 @@ What is now implemented:
 - diagnostic `--projection-side-policy right` to separate activation-facing geometry from projected-backward implementation.
 - harness-local LFM2 decoder-layer checkpoint repair, because the Transformers LFM2 model advertises gradient checkpointing but does not call `_gradient_checkpointing_func` in `Lfm2Model.forward()`.
 
-Default training remains no activation projection unless explicitly requested.
+Default training remains no activation projection unless explicitly requested. As of the repaired-checkpoint runs, projected activation is best understood as a nearly-finished memory sidequest rather than the main optimizer-quality lane: it is mathematically faithful and saves memory, but under real layer checkpointing the incremental win was only about `~275–300 MB` at `bs8 × seq1024` and the eager wrapper path was slower. That overhead may still be fixable, and in theory avoiding full `dW` materialization should become faster once the path is less Python/custom-autograd heavy, but the current mainline is repaired checkpointing plus residual-facing SumoTrack.
 
 ## Core coordinate fact
 
@@ -208,6 +208,8 @@ Matched repaired-checkpoint controls clarify the incremental value of projected 
 | full `lfm` projected activation | `1.861770 / 3.004450` | `1,797,460,480` | `0.570883` | same quality shape as all-right, `~275 MB` lower peak, slower eager wrappers |
 
 This is the current honest boundary: projected activation is faithful and still saves memory on top of real checkpointing, but the giant win was fixing checkpointing itself. The next decision is whether the extra `~275 MB` at `bs8×seq1024` and possible larger-shape headroom justify optimizing wrapper overhead, or whether the product path should lean on repaired checkpointing plus SumoTrack state savings first.
+
+Current answer: lean on repaired checkpointing plus SumoTrack state savings first. Keep projected activation as an opt-in branch for memory pressure and future performance work, not as the default quality lane. If revisited, the next work should be speed/perf cleanup and larger-shape memory evidence, not more proof of gradient arithmetic.
 
 Boundary smokes with repaired checkpointing and full `lfm` projected activation at `seq1024`, validation skipped:
 

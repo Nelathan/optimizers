@@ -4,6 +4,33 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
+## 2026-07-02: Rank256 reopens the 350M default lane
+
+Question: after repaired checkpointing made larger token/update settings practical, is rank64 now the bottleneck, and does rank256 remain inside the useful memory budget?
+
+Setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, residual-facing, no activation projection backend, repaired activation checkpointing, burst refresh, stable `eigh`, Aurora `pp=2/ns=5`, SDPA, CCE, faithful right-padded SYNTH batches, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled`.
+
+Runs:
+
+| run | status | shape | LR | W&B | target val | source val | train loss | update norm | chordal | state bytes | peak CUDA | tokens/s |
+| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| rank64 continuity | completed | `bs32 × 500` | `6e-4` | `puxtar7t` | `1.718164` | `3.049249` | `1.662592` | `0.077616` | `0.165429` | `48,486,400` | `5,023,837,184` | `14,596` |
+| rank256 high-token probe | interrupted after evals | `bs32 × 500` | `6e-4` | `qkfx3fa0` | `1.699121` | `3.102894` | n/a | n/a | visually smooth/high | n/a | n/a | n/a |
+| rank256 more-updates probe | completed | `bs16 × 1000` | `3e-4` | `bekcxmma` | `1.683542` | `3.076128` | `1.670848` | `0.094908` | `0.358136` | `192,403,456` | `3,225,152,512` | `14,237` |
+
+Rank256 state accounting on this LFM-350M broad-no-embeddings scope:
+
+- matrix state bytes: `191,889,408`;
+- total optimizer state bytes including fallback: `192,403,456`;
+- compared with earlier measured selected trainable matrix param bytes `574,619,648`, rank256 matrix state is `0.334×` one full bf16 moment, `0.167×` two full bf16 moments, and `0.083×` two full fp32 Adam moments.
+
+Interpretation:
+
+- Rank256 is still clearly in the memory-saving regime. It is about `4×` rank64 state, but still only one third of one bf16 full moment for covered matrices.
+- The rank256 runs look like more usable signal passing through the optimizer, not like random instability. Train loss and grad norm were smooth; chordal basis motion was higher but smoother. Source loss rose because update energy/source movement rose, not because rank256 failed to converge.
+- `bs16 × 1000`, rank256, LR `3e-4` is the strongest target lane so far at comparable token budget/walltime, but source cost is visible. It should be treated as the current best default candidate shape, with LR/source balance still to refine.
+- The next algorithmic code question is Grassmann refresh hygiene. Basis init normalizes the gradient before forming the side Gram; Grassmann refresh currently forms its tangent from raw full-gradient scale. Normalize or scale-control the refresh input before doing more LR/beta/rank buffet.
+
 ## 2026-07-01: Repaired-checkpoint token-mass and LR probes
 
 Question: after repairing LFM2 decoder-layer checkpointing, should the 350M faithful SYNTH lane simply use the largest fitting batch, and how should LR scale with the larger token mass?
