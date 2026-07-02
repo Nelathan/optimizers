@@ -39,6 +39,24 @@ class SumoTrackTest(unittest.TestCase):
         self.assertGreater(opt.last_step_diagnostics["update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["fallback_update_norm"], 0.0)
+        self.assertGreater(opt.last_step_diagnostics["projected_grad_max_norm"], 0.0)
+
+    def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100)
+        opt.diagnostics_enabled = True
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
+        projected_grad = projector.project(torch.randn_like(weight))
+        projected_grad.mul_(10.0 / projected_grad.float().norm())
+
+        opt.queue_projected_grad(weight, projected_grad.clone())
+        opt.step()
+
+        self.assertAlmostEqual(opt.last_step_diagnostics["projected_grad_max_norm"], 10.0, places=4)
+        self.assertLessEqual(float(opt.state[weight]["projected_exp_avg"].float().norm()), 1.0001)
 
     def test_step_consumes_grads_after_projection_by_default(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))

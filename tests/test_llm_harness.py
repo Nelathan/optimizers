@@ -102,6 +102,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.sumotrack_lr, 2e-4)
         self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.basis_refresh_schedule, "burst")
+        self.assertEqual(args.projected_grad_clip_norm, 2.0)
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
         self.assertEqual(args.wandb_log_every, 20)

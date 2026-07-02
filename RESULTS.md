@@ -19,6 +19,8 @@ Runs:
 | rank256 more-updates probe | completed | `bs16 × 1000` | `3e-4` | `bekcxmma` | `1.683542` | `3.076128` | `1.670848` | `0.094908` | `0.358136` | `192,403,456` | `3,225,152,512` | `14,237` |
 | rank256 Grassmann-normalized smoke | completed | `bs16 × 200` | `3e-4` | `5ovm33mp` | `1.748007` | `3.020345` | `1.800468` | `0.095183` | `0.423687` | `192,403,456` | `3,014,984,704` | `14,227` |
 | rank256 fp32 projected-moment smoke | reverted | `bs16 × 200` | `3e-4` | `hy5ifaoz` | `1.748452` | `3.023449` | `1.802822` | `0.096516` | `0.423687` | `336,058,368` | `3,158,639,616` | `14,143` |
+| rank64 projected-clip stress | completed | `bs32 × 500` | `4e-4` | `u49zctar` | `1.728171` | `3.029791` | `1.673283` | `0.086390` | `0.162092` | `48,486,400` | `5,024,319,488` | `14,368` |
+| rank256 projected-clip default candidate | completed | `bs16 × 1000` | `3e-4` | `z0t7aylv` | `1.675010` | `3.059717` | `1.660258` | `0.094780` | `0.354577` | `192,403,456` | `3,226,123,264` | `13,730` |
 
 Rank256 state accounting on this LFM-350M broad-no-embeddings scope:
 
@@ -33,6 +35,7 @@ Interpretation:
 - `bs16 × 1000`, rank256, LR `3e-4` is the strongest target lane so far at comparable token budget/walltime, but source cost is visible. It should be treated as the current best default candidate shape, with LR/source balance still to refine.
 - Grassmann refresh hygiene is now implemented: refresh uses normalized spectral input before tangent formation, matching basis init's scale discipline. Unit tests verify left- and right-side update invariance to a `1000×` refresh-gradient scale change. The 200-step rank256 smoke after this change was essentially identical to the previous lane at step 200 (`1.748007 / 3.020345` vs `1.748073 / 3.022887`), so the fix removes a hidden scale coupling but is not an instant source-retention cure.
 - Fp32 projected moments did not move the bar in the 200-step sensor. The code migration was intentionally branchless and then reverted: `projected_exp_avg` fp32 raised total state by `~143.7 MB`, slightly worsened target/source against the bf16-moment normalized-refresh reference, and did not show a convergence or update-scale advantage. Keep projected moments bf16 unless a longer high-beta run produces a specific accumulator-precision failure.
+- Projected-gradient clipping belongs after projection and before the projected EMA. The diagnostic rank64 stress run without clipping (`17xa2n7q`) exposed a raw/projected gradient outlier at step 492: raw grad norm `773670.5`, pre-clip projected tensor max `109486.6`, no chordal event, then a poisoned moment/update tail. Per-matrix projected clipping at `1.0` removed the rank64 failure mode and improved the stressed lane's final target, but rank256 normal traffic had mean pre-clip max above `1`. The 1k `clip=2.0` rank256 run kept normal traffic breathing (`mean_logged_projected_grad_max_norm=1.088935`) while improving both target and source against the unclipped `bekcxmma` lane. This is now the default-candidate setting.
 
 ## 2026-07-01: Repaired-checkpoint token-mass and LR probes
 

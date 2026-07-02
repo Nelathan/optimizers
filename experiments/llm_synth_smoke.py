@@ -85,6 +85,13 @@ def optimizer_basis_rotation(optimizer: torch.optim.Optimizer) -> float:
     return float(diagnostics.get("mean_basis_rotation_chordal", float("nan")))
 
 
+def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float:
+    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
+    if not diagnostics:
+        return float("nan")
+    return float(diagnostics.get(key, float("nan")))
+
+
 def parquet_table_to_texts(table, dataset_format: DatasetFormat = "auto") -> list[str]:
     names = set(table.column_names)
     if dataset_format == "auto":
@@ -762,6 +769,7 @@ def train_step(
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
+    projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
     basis_rotation_chordal = optimizer_basis_rotation(optimizer) if collect_basis else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
@@ -771,6 +779,7 @@ def train_step(
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
+        "projected_grad_max_norm": projected_grad_max_norm,
         "basis_rotation_chordal": basis_rotation_chordal,
     }
 
@@ -826,6 +835,7 @@ def run_optimizer(
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
+            projected_grad_clip_norm=args.projected_grad_clip_norm if args.projected_grad_clip_norm > 0 else None,
             consume_grad=not args.keep_grads_after_step,
             compile_tensor_kernels=args.torch_compile,
         )
@@ -888,6 +898,7 @@ def run_optimizer(
                 f"{optimizer_name}/grad_norm": scalar(step_result["grad_norm"]),
                 f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
                 f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
+                f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
                 f"{optimizer_name}/basis_rotation_chordal": scalar(step_result["basis_rotation_chordal"]),
             }
             wandb_log(
@@ -921,6 +932,7 @@ def run_optimizer(
     measured_param_norms = [step["param_norm"] for step in measured_steps]
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
+    measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
     measured_basis_rotation_chordal = [step["basis_rotation_chordal"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
@@ -939,6 +951,7 @@ def run_optimizer(
         "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "sumotrack" else "n/a",
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "sumotrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "sumotrack" else 0,
+        "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "sumotrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "sumotrack" else False,
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
@@ -964,6 +977,7 @@ def run_optimizer(
         "mean_logged_param_norm": mean_scalar(measured_param_norms),
         "mean_logged_update_norm": mean_scalar(measured_update_norms),
         "mean_logged_update_to_param_ratio": mean_scalar(measured_update_to_param_ratios),
+        "mean_logged_projected_grad_max_norm": mean_scalar(measured_projected_grad_max_norms),
         "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_step_seconds": measured_elapsed / args.measure_steps,
@@ -1018,6 +1032,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
+    parser.add_argument("--projected-grad-clip-norm", type=float, default=2.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables")
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
     parser.add_argument(
         "--torch-compile",
@@ -1081,6 +1096,8 @@ def main() -> None:
         raise ValueError("rank must be positive")
     if args.basis_refresh_interval <= 0:
         raise ValueError("basis_refresh_interval must be positive")
+    if args.projected_grad_clip_norm < 0:
+        raise ValueError("projected_grad_clip_norm must be non-negative")
     if args.aurora_pp_iterations <= 0:
         raise ValueError("aurora_pp_iterations must be positive")
     if not 1 <= args.polar_ns_steps <= 5:

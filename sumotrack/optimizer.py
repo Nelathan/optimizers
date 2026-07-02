@@ -58,6 +58,7 @@ class SumoTrack(Optimizer):
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
+        projected_grad_clip_norm: float | None = None,
         consume_grad: bool = True,
         compile_tensor_kernels: bool = False,
         ecc: str | None = None,
@@ -89,6 +90,8 @@ class SumoTrack(Optimizer):
             raise ValueError(f"aurora_pp_iterations must be positive, got {aurora_pp_iterations}")
         if not 1 <= polar_ns_steps <= len(NEWTON_SCHULZ_COEFFICIENTS):
             raise ValueError(f"polar_ns_steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {polar_ns_steps}")
+        if projected_grad_clip_norm is not None and projected_grad_clip_norm <= 0:
+            raise ValueError(f"projected_grad_clip_norm must be positive when set, got {projected_grad_clip_norm}")
 
         defaults = dict(
             lr=lr,
@@ -103,6 +106,7 @@ class SumoTrack(Optimizer):
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
+            projected_grad_clip_norm=projected_grad_clip_norm,
             consume_grad=consume_grad,
             compile_tensor_kernels=compile_tensor_kernels,
             basis_refresh_step=0,
@@ -196,6 +200,7 @@ class SumoTrack(Optimizer):
         return {
             "matrix_update_norm_sq": None,
             "fallback_update_norm_sq": None,
+            "projected_grad_max_norm": 0.0,
             "matrix_params": 0,
             "fallback_params": 0,
             "projected_leverage_cv_sum": 0.0,
@@ -276,6 +281,15 @@ class SumoTrack(Optimizer):
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
             projected_grad = projector.project(grad)
+
+        projected_grad_norm = projected_grad.float().norm().detach()
+        if diagnostics is not None:
+            diagnostics["projected_grad_max_norm"] = max(diagnostics["projected_grad_max_norm"], float(projected_grad_norm.cpu()))
+        clip_norm = group.get("projected_grad_clip_norm")
+        if clip_norm is not None:
+            clip_scale = (projected_grad_norm.new_tensor(float(clip_norm)) / projected_grad_norm.clamp_min(1e-12)).clamp(max=1.0)
+            if float(clip_scale.cpu()) < 1.0:
+                projected_grad = projected_grad.mul(clip_scale.to(device=projected_grad.device, dtype=projected_grad.dtype))
 
         state["step"] = state.get("step", 0) + 1
         projected_exp_avg = state.get("projected_exp_avg")
