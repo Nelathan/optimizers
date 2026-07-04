@@ -4,6 +4,64 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
+## 2026-07-02: Projected activation compile spike and rank256 follow-up
+
+Question: under repaired LFM2 activation checkpointing, is full `lfm` projected activation intrinsically slower, or is the remaining overhead mostly Python/custom-autograd tensor math that `torch.compile` can cover without Triton or changing the SYNTH/model contract?
+
+Setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, stable `eigh`, Aurora `pp=2/ns=5`, CCE, faithful right-padded SYNTH batches, repaired activation checkpointing, residual-facing policy for the `off` control, activation-facing/right bases for `--projected-activation-backend lfm`, validation skipped, `seq_len=1024`, two warmup steps so basis init and one projected step happen before measurement. These are throughput/memory smokes, not quality claims.
+
+Implementation tested:
+
+- Moved harness model compilation until after SumoTrack optimizer creation and projected-activation backend installation, so Dynamo sees the wrapped forward path as the initial program while parameter identity remains stable. Later audit found this still compiled only the outer CausalLM wrapper for the CCE loss path; CCE unwraps to the inner base model plus `lm_head`, so these early compile rows did **not** prove the transformer hot path was compiled.
+- Added `set_projected_activation_compile(enabled)` in `sumotrack/projected_activation.py`. When `--torch-compile` and projected activation are both enabled, only pure tensor helper functions inside the custom backward paths are compiled; the Python side-channel that queues projected gradients into SumoTrack remains outside Dynamo.
+- The harness now compiles the inner training base model for CCE-style models and uses PyTorch functional AdamW for fallback parameters; fused functional AdamW is used only for fp32 CUDA fallback tensors because PyTorch rejects the mixed bf16-param/fp32-state fused case.
+
+Valid smokes:
+
+| run | backend | compile | shape | peak allocated CUDA | peak reserved CUDA | tokens/s | step sec | notes |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| pre-change checkpoint smoke | `off` | no | `bs4 × 5` | `1,697,642,496` | n/a | `14,914` | `0.274636` | repaired checkpoint baseline |
+| pre-change checkpoint smoke | `off` | yes | `bs4 × 5` | `1,697,642,496` | n/a | `14,980` | `0.273423` | compile alone barely moved baseline |
+| pre-change projected activation | `lfm` | no | `bs4 × 5` | `1,237,795,840` | `2,392,850,432` | `14,636` | `0.279863` | smaller but slower than `off` |
+| compile-after-install only | `lfm` | yes | `bs4 × 5` | `1,237,795,840` | n/a | `14,649` | `0.279618` | cleaner ordering, no speed win |
+| compiled PA backward tensors | `lfm` | yes | `bs4 × 5` | `1,197,753,344` | `2,392,850,432` | `15,973` | `0.256436` | first smaller-and-faster signal |
+| sequential control | `off` | yes | `bs8 × 5` | `2,056,244,736` | `2,220,883,968` | `15,267` | `0.536572` | same command family, no PA |
+| sequential projected activation | `lfm` | yes | `bs8 × 5` | `1,616,779,776` | `2,824,863,744` | `15,810` | `0.518161` | `~439 MB` lower allocated peak and `~3.4%` faster step |
+
+Interpretation:
+
+- Projected activation's eager slowdown was not inherent at this small smoke scale. Compiling the pure tensor math inside the custom backward path changed the `bs4` lane from smaller-but-slower to smaller-and-faster, and the sequential `bs8` comparison preserved a modest speed win while cutting allocated peak materially.
+- Compile-after-install was the right harness ordering cleanup, but by itself did not improve throughput. Later audit found the CCE training loss bypassed the compiled outer wrapper, so the early speed signal came from compiled projected-activation backward helpers and SumoTrack tensor kernels, not from compiling the transformer base path.
+- Reserved CUDA memory can rise with the compiled `lfm` path even while allocated peak falls; use allocated peak for the activation-storage claim and keep reserved memory visible for allocator/compile pressure.
+- A first `bs8` comparison was accidentally run in parallel on the same GPU and is invalid. Only the sequential `bs8` rows above should be used.
+- This was enough to keep projected activation as an active performance/library-design lead, but not enough to make it a default quality lane.
+
+Rank256 current-lane follow-up after cleanup:
+
+Command shape: repaired checkpointing, `--torch-compile`, `--projected-activation-backend lfm`, `bs16 × seq1024`, rank256, LR `3e-4`, LR warmup `50`, beta `0.9`, burst refresh `100`, dual rails `norm=2/ratio=6`, source retention sensor enabled, eval every 100. W&B run `anqz70ln` / `lfm-pa-compile-r256-bs16-lr3e4-warmup50-1k`.
+
+| run | status | target val | source val | train loss | update norm | chordal | peak CUDA | tokens/s | step sec |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| rank256 PA compile warmup | completed; quality valid, perf polluted | `1.677808` | `3.074101` | `1.663006` | `0.093577` | `0.351033` | `3,248,483,328` | `13,610` | `1.203802` |
+
+Step evals: `1.813641 / 3.018898` at step100, `1.754034 / 3.032445` at step200, `1.728505 / 3.043654` at step300, `1.714306 / 3.051821` at step400, `1.705434 / 3.054941` at step500, `1.698743 / 3.067508` at step600, `1.691712 / 3.050664` at step700, `1.688964 / 3.076720` at step800, `1.683509 / 3.074773` at step900, `1.677808 / 3.074101` at step1000.
+
+Rank256 interpretation:
+
+- The convergence result matches the expected geometry tradeoff: activation projection forces wrapped weights to activation-facing/storage-right bases, so it should not be expected to beat the residual-facing quality anchor. Against the prior residual-facing rank256 dual-rail 1k run (`1.674212 / 3.059725`, no LR warmup), this is slightly worse on both target and source, with the usual caveat that warmup/compile differ.
+- Do **not** use this row as a clean rank256 memory/speed comparison. Audit found two harness issues after the run: periodic eval time was included in measured training throughput, and peak memory was read after final eval/sample generation rather than immediately after the measured training loop. The convergence/source curve is still useful; the speed/peak fields are historical polluted telemetry until rerun with the fixed instrumentation and true inner-base compile.
+- The final sample had severe repetition. Treat that as another yellow flag for making activation-facing PA a default quality lane; it is not evidence of an arithmetic bug by itself, but it reinforces that residual-facing remains the product-quality anchor.
+- Net: projected activation remains useful as an opt-in memory/perf research path and possibly for lower-rank or larger-token pressure cases. It is not justified as the rank256 mainline default from this run.
+
+Follow-up design cleanup:
+
+- A clean speed smoke with fixed train-only timing and true CCE hot-path compile showed full all-right `lfm` projected activation at rank256 `bs16 × seq1024` was not a speed path: `13,888 tok/s`, `1.179724s/step`, peak `3,198,173,696` versus matched residual-facing `off` control at `19,369 tok/s`, `0.845878s/step`, peak `2,873,162,240`. This invalidates the earlier hope that full activation-facing wrappers were merely missing compile coverage.
+- The implementation was therefore cut back toward the intended portable primitive: generic side-aware projected `Linear`, right-side by default when rules do not say otherwise, but using the actual SumoTrack basis side when installed by the harness. Right side emits `full_grad @ Q.T` via saved projected activations; left side emits `P.T @ full_grad` by projecting `grad_out` inside custom backward. This preserves residual-facing geometry without a late full-gradient hook path.
+- The LFM fused MLP primitive remains right-only/all-right. Under residual-facing policy it falls back rather than pretending to support mixed right/right/left MLP geometry. Side-aware fused MLP is a separate future primitive if the generic `Linear` path earns more work.
+- A tiny liveness smoke after this cleanup (`rank64`, `bs4 × seq1024`, repaired checkpointing, CCE hot-path compile, `--projected-activation-backend lfm`, validation skipped) ran with residual-facing side counts restored (`left=32/right=50/auto=10`), `15,072 tok/s`, `0.271756s/step`, peak `1,598,120,960`. Treat this as a wrapper-contract smoke, not a benchmark.
+- The generic side-aware per-Linear route did **not** earn more performance work. At rank256 with true CCE hot-path compile, repaired checkpointing, LR warmup `50`, validation skipped, and residual-facing side counts (`left=32/right=50/auto=10`), matched `bs64 × seq1024` smokes with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` were decisive: `off` ran `20,089 tok/s`, `3.262229s/step`, peak `8,422,493,184`; side-aware `lfm` ran `14,564 tok/s`, `4.499743s/step`, peak `9,557,816,320`. A default-allocator `off` attempt OOMed from fragmentation while `lfm` fit, but the fair allocator retry removed that apparent capacity win. End this try: side-aware Linear is a correctness/design primitive, not the speed path.
+- Next open projected-gradient lead is **side-aware fused MLP**, not more per-Linear wrapping or late full-gradient hooks. The plausible win is fewer launches and block-local scheduling over the large MLP gate/up/down contractions. If a fused MLP primitive cannot beat the baseline in a synthetic/microbench shape matching rank256 and `bs16/bs64` token counts, do not integrate it into the LFM harness.
+
 ## 2026-07-02: Rank256 reopens the 350M default lane
 
 Question: after repaired checkpointing made larger token/update settings practical, is rank64 now the bottleneck, and does rank256 remain inside the useful memory budget?

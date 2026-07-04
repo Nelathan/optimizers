@@ -25,7 +25,7 @@ Important parts of the original pitch are now superseded by implementation evide
 - Basis init is stable side-Gram `eigh`, not random init or SVD.
 - Refresh smoothing is layer-staggered phase offsets for peak control, not general round-robin optimizer activity.
 - Projected gradients are queued into SumoTrack's optimizer side channel, not expanded or injected into full `.grad` slots.
-- Activation-facing/storage-right projection is the actual coordinate contract for projected activation. Residual-facing remains the baseline geometry; all-right/activation-facing is a measured tradeoff, not assumed free.
+- The generic projected `Linear` primitive is now side-aware: storage-right projection saves projected activations; storage-left projection forms projected loss-gradient contractions in custom backward. Residual-facing remains the optimizer-quality geometry. All-right/activation-facing was a measured tradeoff, not a default.
 
 ## Current status
 
@@ -40,29 +40,44 @@ The current root implementation is in:
 What is now implemented:
 
 - explicit SumoTrack projected-gradient queue via `SumoTrack.queue_projected_grad(param, projected_grad)`;
-- custom projected-activation `Linear` autograd path;
-- fused projected LFM/SwiGLU MLP autograd path;
+- generic side-aware projected `Linear` autograd path;
+- fused projected LFM/SwiGLU MLP autograd path for all-right/activation-facing bases;
 - opt-in harness backend `--projected-activation-backend lfm`;
+- opt-in compiled projected-activation backward tensor helpers when `--torch-compile` is used with the `lfm` backend;
 - LFM wrapper coverage for:
   - MLP `w1`, `w3`, `w2`;
   - standard-attention projection Linears `q_proj`, `k_proj`, `v_proj`, `out_proj`;
   - short-conv operator projection Linears `in_proj`, `out_proj`;
 - layer-staggered refresh schedule to avoid burst refresh dominating measured peak;
-- diagnostic `--projection-side-policy right` to separate activation-facing geometry from projected-backward implementation.
+- diagnostic `--projection-side-policy right` to separate activation-facing geometry from projected-backward implementation;
+- true CCE hot-path compile targeting: the harness compiles the inner base model that CCE actually calls, not just the outer CausalLM wrapper.
 - harness-local LFM2 decoder-layer checkpoint repair, because the Transformers LFM2 model advertises gradient checkpointing but does not call `_gradient_checkpointing_func` in `Lfm2Model.forward()`.
 
-Default training remains no activation projection unless explicitly requested. As of the repaired-checkpoint runs, projected activation is best understood as a nearly-finished memory sidequest rather than the main optimizer-quality lane: it is mathematically faithful and saves memory, but under real layer checkpointing the incremental win was only about `~275–300 MB` at `bs8 × seq1024` and the eager wrapper path was slower. That overhead may still be fixable, and in theory avoiding full `dW` materialization should become faster once the path is less Python/custom-autograd heavy, but the current mainline is repaired checkpointing plus residual-facing SumoTrack.
+Default training remains no activation projection unless explicitly requested. As of the repaired-checkpoint runs, projected activation is best understood as a performance/library-design sidequest rather than the main optimizer-quality lane. The first full `lfm` path was mathematically faithful to one-sided activation-facing projection and saved memory at rank64 pressure points, but activation-facing/storage-right geometry is not the residual-facing quality default. The current cleanup restores residual-facing side policy for wrapped params and makes the generic `Linear` projected-gradient path side-aware. Right side remains the actual activation-save path; left side preserves residual-facing geometry by projecting `grad_out` in custom backward and avoiding full `weight.grad`, but it does not have the same activation-storage economics. Fused LFM MLP remains right-only until a side-aware fused primitive is written. The current mainline remains repaired checkpointing plus residual-facing SumoTrack; projected activation is opt-in.
 
 ## Core coordinate fact
 
-For PyTorch `Linear.weight == [out_features, in_features]` and `out = input @ weight.T`:
+For PyTorch `Linear.weight == [out_features, in_features]` and `out = input @ weight.T`, the generic projected `Linear` has two one-sided forms.
+
+Storage-right / activation-facing projection stores `Q ∈ R^{rank×in}`:
 
 ```text
 projected_input = input @ Q.T        # [tokens, rank]
 projected_dW    = grad_out.T @ projected_input
 ```
 
-This is storage-right / activation-facing projection. It matches residual-facing for MLP up/gate and attention q/k/v. It does not match residual-facing for MLP down or attention output, so activation projection changes side geometry for those tensors.
+This matches `full_dW @ Q.T` without returning a full `weight.grad`, and can replace a saved full activation with a saved projected activation.
+
+Storage-left / loss-gradient-facing projection stores `P ∈ R^{out×rank}`:
+
+```text
+projected_grad_out = grad_out @ P    # [tokens, rank]
+projected_dW       = projected_grad_out.T @ input
+```
+
+This matches `P.T @ full_dW` without returning a full `weight.grad`. It preserves residual-facing geometry for MLP down and attention output tensors, but the projectable tensor exists only in backward, so it is not the same activation-save win as the right-side path.
+
+Right side matches residual-facing for MLP up/gate and attention q/k/v. Left side matches residual-facing for MLP down and attention output. The old all-right `lfm` activation projection changed side geometry for down/out tensors.
 
 The corrected-LR all-right control showed this geometry change is real but not a basic backward-math bug: full `lfm` activation projection and ordinary no-projection all-right SumoTrack were nearly identical at the 100-step quality sensor.
 
@@ -72,17 +87,17 @@ The corrected-LR all-right control showed this geometry change is real but not a
 
 PyTorch materializes the full weight gradient before parameter hooks run. Hook-time projection removed retained `.grad` buffers but barely moved LFM peak memory at faithful shapes. This path was removed.
 
-### Custom Linear works
+### Generic projected Linear works
 
 The projected `Linear` path:
 
 - runs the same full-rank forward;
-- saves projected input for weight-gradient formation;
-- emits `grad_out.T @ (input @ Q.T)` through a side channel;
+- saves projected input for right-side weight-gradient formation, or saves the ordinary input for left-side projected loss-gradient formation;
+- emits `grad_out.T @ (input @ Q.T)` for right-side bases or `(grad_out @ P).T @ input` for left-side bases through a side channel;
 - returns exact `grad_input` and optional bias grad;
 - leaves captured `weight.grad` as `None` on projected steps.
 
-Tiny tests prove equality to ordinary full `weight.grad @ Q.T`.
+Tiny tests prove equality to ordinary full-gradient projection on both storage sides: `full_grad @ Q.T` for right bases and `P.T @ full_grad` for left bases. Optimizer-ingress tests prove both sides drive the same SumoTrack update as ordinary full-gradient projection after basis initialization.
 
 ### Optimizer ingress works
 
@@ -211,7 +226,28 @@ This is the current honest boundary: projected activation is faithful and still 
 
 Current answer: lean on repaired checkpointing plus SumoTrack state savings first. Keep projected activation as an opt-in branch for memory pressure and future performance work, not as the default quality lane. If revisited, the next work should be speed/perf cleanup and larger-shape memory evidence, not more proof of gradient arithmetic.
 
-One useful variant remains open: projected activation does not have to force all wrapped weights to activation-facing bases. We could keep the residual-facing side policy as the optimizer geometry, use projected-activation backward only when the current basis is already activation-facing, and otherwise form each full Linear `dW` transiently and immediately project it into the residual-facing basis without accumulating full `.grad` buffers across the model. That would preserve residual-facing convergence while still avoiding the retained full-gradient pile; it would not remove every transient full `dW` peak, but it may recover a meaningful part of the memory win without the all-right geometry tradeoff.
+### Compile spike after repaired checkpointing
+
+The first speed cleanup moved model compilation after projected-activation backend installation and added `set_projected_activation_compile(enabled)`, which compiles only the pure tensor work inside the projected Linear and fused gated-MLP backward paths. The custom autograd Functions still own the Python side-channel that queues projected gradients into SumoTrack; optimizer bookkeeping stays outside Dynamo. Later audit found that compiling only the outer CausalLM wrapper misses the CCE hot path, because `cce_causal_lm_loss()` calls the inner base model plus `lm_head` directly. The harness now compiles that inner training base model for CCE-style models and uses PyTorch functional AdamW for fallback parameters; fused functional AdamW is used only for fp32 CUDA fallback tensors because PyTorch rejects mixed bf16-param/fp32-state fused AdamW.
+
+Short validation-skipped smokes, all with repaired activation checkpointing, rank 64, `seq1024`, two warmup steps, and `--torch-compile` where noted:
+
+| run | backend | compile | batch | peak allocated | peak reserved | step sec | tokens/s |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| pre-change `off` control | `off` | yes | 4 | `1,697,642,496` | n/a | `0.273423` | `14,980` |
+| pre-change eager PA | `lfm` | no | 4 | `1,237,795,840` | `2,392,850,432` | `0.279863` | `14,636` |
+| compile-after-install only | `lfm` | yes | 4 | `1,237,795,840` | n/a | `0.279618` | `14,649` |
+| compiled PA backward tensors | `lfm` | yes | 4 | `1,197,753,344` | `2,392,850,432` | `0.256436` | `15,973` |
+| sequential `off` control | `off` | yes | 8 | `2,056,244,736` | `2,220,883,968` | `0.536572` | `15,267` |
+| sequential compiled PA | `lfm` | yes | 8 | `1,616,779,776` | `2,824,863,744` | `0.518161` | `15,810` |
+
+The `bs8` rows were rerun sequentially after an invalid parallel same-GPU attempt; only the sequential numbers are evidence. The result was positive but preliminary: projected activation can be smaller and modestly faster under compile at rank64, while reserved memory may rise because of allocator/compile behavior.
+
+Rank256 current-lane follow-up: `--projected-activation-backend lfm --torch-compile`, repaired checkpointing, `bs16 × seq1024`, rank256, LR `3e-4`, LR warmup `50`, burst100, dual rails `2/6`, source retention enabled, W&B `anqz70ln`, completed 1k measured steps. Final target/source was `1.677808 / 3.074101`, train loss `1.663006`, and mean update norm `0.093577`. This is slightly worse than the residual-facing rank256 dual-rail quality anchor, consistent with activation-facing geometry costing some quality/source retention. Do **not** use the run's reported `3,248,483,328` peak, `13,610` tokens/s, or `1.203802s` step as clean performance evidence: the harness then included periodic eval in measured throughput, read peak memory after final eval/sample generation, and did not compile the inner CCE transformer base. Keep this path opt-in until rerun with fixed measurement and true hot-path compile.
+
+The side-aware generic `Linear` variant now preserves residual-facing geometry without forcing all wrapped weights to activation-facing bases. It is correct and portable, but the per-Linear custom-autograd scheduling did not earn more performance work. Fair rank256 `bs64 × seq1024` smokes with true CCE hot-path compile and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` favored the baseline: `off` ran `20,089 tok/s`, `3.262229s/step`, peak `8,422,493,184`; side-aware `lfm` ran `14,564 tok/s`, `4.499743s/step`, peak `9,557,816,320`. A default-allocator `off` attempt OOMed while `lfm` fit, but the expandable-segments retry showed that was allocator fragmentation, not a durable projected-gradient capacity win.
+
+End this try: generic projected `Linear` stays as a tested correctness primitive, not as the performance route.
 
 Boundary smokes with repaired checkpointing and full `lfm` projected activation at `seq1024`, validation skipped:
 
@@ -266,16 +302,16 @@ Interpretation still needs care. The monitor shows where the peak occurs in modu
 
 ## Open design questions
 
-1. **Remaining peak owner.** Is the next dominant object MLP input save, attention/short-conv kernel state, CCE/loss state, refresh fallback, optimizer update temps, or allocator timing?
-2. **Attention/short-conv economics.** Do projected Linear boundary saves still buy enough to matter once MLP is fixed, or are kernel internals now the wall?
-3. **Checkpointing as substrate.** Repaired decoder-layer checkpointing is now empirically best for the current `bs8` memory shape. Next decide what projected activation buys on top of real checkpointing and whether any remaining full-activation saves are worth cutting without kernel work.
-4. **Quality without checkpointing.** Now that the no-checkpoint full `lfm` path fits much better, run corrected-LR target/source sensors on the product-shaped path.
+1. **Side-aware fused MLP.** Can one fused custom autograd primitive handle gate/up right-side projected activations and down left-side projected loss gradients with fewer launches and better scheduling than per-Linear wrappers?
+2. **Fused MLP microbench gate.** At token counts matching `bs16` and `bs64`, and ranks `64/256`, does the fused primitive beat ordinary baseline backward on step time and peak? If not, do not integrate it.
+3. **Remaining peak owner after fused MLP.** If fused MLP wins locally, is the next dominant object MLP input save, attention/short-conv kernel state, CCE/loss state, refresh fallback, optimizer update temps, or allocator timing?
+4. **Checkpointing as substrate.** Repaired decoder-layer checkpointing is now empirically best for the current memory shape. Any projected-gradient primitive must prove incremental value on top of real checkpointing, not fake stock-LFM checkpointing.
 
 ## Next coherent cut
 
-Read the monitor before optimizing:
+Build the side-aware fused MLP primitive behind a microbench gate:
 
-1. validate repaired checkpointing in ordinary harness runs, not only monitor scripts;
-2. rerun corrected-LR quality/throughput sensors on the repaired checkpoint substrate;
-3. measure the incremental value of projected activation versus ordinary right-side/no-projection under real checkpointing;
-4. avoid kernel-level/Triton work unless a measured bottleneck leaves no higher-level route.
+1. implement the primitive outside the LFM harness first;
+2. test exact projected grads for gate/up/down against ordinary full-gradient projection on the correct sides;
+3. benchmark against ordinary PyTorch MLP backward at rank64/rank256 and token counts matching `bs16/bs64`;
+4. integrate into LFM only if the synthetic primitive beats baseline on the shapes that matter.

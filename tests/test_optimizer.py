@@ -229,7 +229,7 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(tuple(state["exp_avg"].shape), tuple(bias.shape))
         self.assertEqual(tuple(state["exp_avg_sq"].shape), tuple(bias.shape))
 
-    def test_bf16_fallback_uses_fp32_heavyball_moments(self):
+    def test_bf16_fallback_uses_fp32_adamw_moments(self):
         bias = torch.nn.Parameter(torch.randn(5, dtype=torch.bfloat16))
         opt = SumoTrack([bias], lr=0.01)
 
@@ -241,29 +241,28 @@ class SumoTrackTest(unittest.TestCase):
         self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
         self.assertEqual(bias.dtype, torch.bfloat16)
 
-    def test_fallback_matches_heavyball_adamw_one_step(self):
-        import heavyball
-
+    def test_fallback_matches_torch_adamw_one_step(self):
         torch.manual_seed(3)
         grad = torch.randn(5)
         base = torch.randn(5)
         sumo_bias = torch.nn.Parameter(base.clone())
-        heavyball_bias = torch.nn.Parameter(base.clone())
+        torch_bias = torch.nn.Parameter(base.clone())
         sumo_opt = SumoTrack([sumo_bias], lr=0.01, fallback_betas=(0.9, 0.99), weight_decay=0.01)
-        heavyball_opt = heavyball.AdamW(
-            [heavyball_bias],
+        torch_opt = torch.optim.AdamW(
+            [torch_bias],
             lr=0.01,
             betas=(0.9, 0.99),
             weight_decay=0.01,
-            compile_step=False,
+            foreach=False,
+            fused=False,
         )
 
         sumo_bias.grad = grad.clone()
-        heavyball_bias.grad = grad.clone()
+        torch_bias.grad = grad.clone()
         sumo_opt.step()
-        heavyball_opt.step()
+        torch_opt.step()
 
-        self.assertTrue(torch.allclose(sumo_bias, heavyball_bias))
+        self.assertTrue(torch.allclose(sumo_bias, torch_bias))
 
     def test_state_dict_round_trip_preserves_state_shapes(self):
         weight = torch.nn.Parameter(torch.randn(7, 4))

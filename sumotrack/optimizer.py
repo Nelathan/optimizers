@@ -7,8 +7,7 @@ from typing import Any, Iterable
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
-
-from heavyball import utils as heavyball_utils
+from torch.optim import _functional as torch_optim_functional
 
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
 
@@ -379,30 +378,38 @@ class SumoTrack(Optimizer):
 
     def _step_fallback_param(self, p: Tensor, grad: Tensor, group: dict, diagnostics: dict | None) -> None:
         state = self.state[p]
-        state["step"] = state.get("step", 0) + 1
         beta1, beta2 = group["fallback_betas"]
         exp_avg = state.get("exp_avg")
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg is None:
             exp_avg = torch.zeros_like(p, dtype=torch.float32)
             exp_avg_sq = torch.zeros_like(p, dtype=torch.float32)
+            state["step"] = torch.zeros((), dtype=torch.float32, device=p.device)
         state["exp_avg"] = exp_avg
         state["exp_avg_sq"] = exp_avg_sq
+        step = state["step"]
         before = p.detach().clone() if diagnostics is not None else None
-        update = grad.detach().clone()
-        heavyball_utils.fused_adam_(
+        torch_optim_functional.adamw(
             [p],
+            [grad.detach().float()],
             [exp_avg],
             [exp_avg_sq],
-            [update],
-            [grad],
-            beta1,
-            beta2,
-            state["step"],
-            group["lr"],
-            group["eps"],
-            group["weight_decay"],
-            False,
+            [],
+            [step],
+            foreach=False,
+            capturable=False,
+            differentiable=False,
+            fused=p.is_cuda and p.dtype == torch.float32,
+            grad_scale=None,
+            found_inf=None,
+            has_complex=False,
+            amsgrad=False,
+            beta1=beta1,
+            beta2=beta2,
+            lr=group["lr"],
+            weight_decay=group["weight_decay"],
+            eps=group["eps"],
+            maximize=False,
         )
         if diagnostics is not None:
             assert before is not None

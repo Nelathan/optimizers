@@ -11,6 +11,11 @@ def _orthonormal_rows(features: int, rank: int, *, dtype: torch.dtype = torch.fl
     return q.mT.contiguous()
 
 
+def _orthonormal_columns(features: int, rank: int, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    q, _r = torch.linalg.qr(torch.randn(features, rank, dtype=dtype), mode="reduced")
+    return q.contiguous()
+
+
 class ProjectedActivationTest(unittest.TestCase):
     def test_linear_emits_activation_facing_projected_grad_without_weight_grad(self):
         torch.manual_seed(20)
@@ -34,6 +39,34 @@ class ProjectedActivationTest(unittest.TestCase):
         proj_loss.backward()
 
         expected = reference.weight.grad @ basis.mT
+        self.assertIsNone(projected.weight.grad)
+        self.assertIsNotNone(projected.bias.grad)
+        self.assertTrue(torch.allclose(sink.projected_grads[projected.weight], expected, atol=1e-12))
+        self.assertTrue(torch.allclose(proj_x.grad, ref_x.grad, atol=1e-12))
+        self.assertTrue(torch.allclose(projected.bias.grad, reference.bias.grad, atol=1e-12))
+
+    def test_linear_emits_loss_gradient_facing_projected_grad_without_weight_grad(self):
+        torch.manual_seed(27)
+        batch, in_features, out_features, rank = 5, 7, 4, 3
+        basis = _orthonormal_columns(out_features, rank)
+        x = torch.randn(batch, in_features, dtype=torch.float64)
+        target = torch.randn(batch, out_features, dtype=torch.float64)
+
+        reference = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float64)
+        projected = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float64)
+        projected.load_state_dict(reference.state_dict())
+        sink = ProjectedActivationGradientSink()
+
+        ref_x = x.detach().clone().requires_grad_(True)
+        proj_x = x.detach().clone().requires_grad_(True)
+        ref_loss = (reference(ref_x) - target).square().mean()
+        proj_out = projected_activation_linear(proj_x, projected.weight, basis, sink, projected.weight, projected.bias, side="left")
+        proj_loss = (proj_out - target).square().mean()
+
+        ref_loss.backward()
+        proj_loss.backward()
+
+        expected = basis.mT @ reference.weight.grad
         self.assertIsNone(projected.weight.grad)
         self.assertIsNotNone(projected.bias.grad)
         self.assertTrue(torch.allclose(sink.projected_grads[projected.weight], expected, atol=1e-12))
@@ -88,6 +121,39 @@ class ProjectedActivationTest(unittest.TestCase):
         basis = projected_opt.state[projected.weight]["basis"]
         reference_loss = (reference(x) - target).square().mean()
         projected_loss = (projected_activation_linear(x, projected.weight, basis, sink, projected.weight) - target).square().mean()
+
+        reference_loss.backward()
+        projected_loss.backward()
+        projected_opt.queue_projected_grad(projected.weight, sink.projected_grads[projected.weight])
+        reference_opt.step()
+        projected_opt.step()
+
+        self.assertIsNone(projected.weight.grad)
+        self.assertTrue(torch.allclose(projected.weight, reference.weight, atol=1e-12))
+        self.assertTrue(torch.allclose(projected_opt.state[projected.weight]["projected_exp_avg"], reference_opt.state[reference.weight]["projected_exp_avg"], atol=1e-12))
+
+    def test_linear_left_projected_grad_queues_into_sumotrack_optimizer(self):
+        torch.manual_seed(28)
+        batch, in_features, out_features, rank = 5, 7, 4, 3
+        warm_x = torch.randn(batch, in_features, dtype=torch.float64)
+        warm_target = torch.randn(batch, out_features, dtype=torch.float64)
+        x = torch.randn(batch, in_features, dtype=torch.float64)
+        target = torch.randn(batch, out_features, dtype=torch.float64)
+        reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
+        projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
+        projected.load_state_dict(reference.state_dict())
+        reference_opt = SumoTrack([reference.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100)
+        projected_opt = SumoTrack([projected.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100)
+
+        (reference(warm_x) - warm_target).square().mean().backward()
+        (projected(warm_x) - warm_target).square().mean().backward()
+        reference_opt.step()
+        projected_opt.step()
+
+        sink = ProjectedActivationGradientSink()
+        basis = projected_opt.state[projected.weight]["basis"]
+        reference_loss = (reference(x) - target).square().mean()
+        projected_loss = (projected_activation_linear(x, projected.weight, basis, sink, projected.weight, side="left") - target).square().mean()
 
         reference_loss.backward()
         projected_loss.backward()

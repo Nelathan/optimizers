@@ -18,6 +18,14 @@ def assert_param_membership(test_case, param, params, expected: bool) -> None:
         test_case.assertFalse(present)
 
 
+def expected_projected_grad(opt: SumoTrack, param: torch.nn.Parameter, full_grad: torch.Tensor) -> torch.Tensor:
+    state = opt.state[param]
+    basis = state["basis"]
+    if state.get("projection_side_is_right", False):
+        return full_grad @ basis.mT
+    return basis.mT @ full_grad
+
+
 class TinyTopology(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -206,7 +214,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(stats["side_policy_right_tensors"], 3)
         self.assertEqual(stats["side_policy_left_tensors"], 0)
 
-    def test_projected_activation_param_group_override_uses_activation_axis(self):
+    def test_projected_activation_param_ids_do_not_override_residual_facing_side(self):
         gate = torch.nn.Parameter(torch.randn(16, 4))
         down = torch.nn.Parameter(torch.randn(4, 16))
         named = [
@@ -223,9 +231,9 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         group_by_param = {id(param): group for group in groups for param in group["params"]}
 
         self.assertEqual(group_by_param[id(gate)]["side"], "right")
-        self.assertEqual(group_by_param[id(down)]["side"], "right")
-        self.assertEqual(stats["side_policy_right_tensors"], 2)
-        self.assertEqual(stats["side_policy_left_tensors"], 0)
+        self.assertEqual(group_by_param[id(down)]["side"], "left")
+        self.assertEqual(stats["side_policy_right_tensors"], 1)
+        self.assertEqual(stats["side_policy_left_tensors"], 1)
 
     def test_layer_staggered_refresh_schedule_adds_layer_offsets_without_changing_sides(self):
         first = torch.nn.Parameter(torch.randn(16, 4))
@@ -238,7 +246,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         groups, _stats = build_sumotrack_param_groups(
             named,
             rank=4,
-            projection_side_policy="residual-facing",
+            projection_side_policy="right",
             basis_refresh_schedule="layer-staggered",
         )
         group = groups[0]
@@ -278,7 +286,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         groups, _stats = build_sumotrack_param_groups(
             named,
             rank=2,
-            projection_side_policy="residual-facing",
+            projection_side_policy="right",
             activation_projected_param_ids=activation_projected_ids,
         )
         opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
@@ -373,7 +381,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
             projected_weight = getattr(model.self_attn, name).weight
             reference_weight = getattr(reference.self_attn, name).weight
-            expected = reference_weight.grad @ opt.state[projected_weight]["basis"].mT
+            expected = expected_projected_grad(opt, projected_weight, reference_weight.grad)
             self.assertTrue(torch.allclose(opt._queued_projected_grads[projected_weight], expected, atol=1e-12))
 
     def test_lfm_projected_activation_backend_wraps_short_conv_projection_linears(self):
@@ -410,7 +418,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         for name in ("in_proj", "out_proj"):
             projected_weight = getattr(model.conv, name).weight
             reference_weight = getattr(reference.conv, name).weight
-            expected = reference_weight.grad @ opt.state[projected_weight]["basis"].mT
+            expected = expected_projected_grad(opt, projected_weight, reference_weight.grad)
             self.assertTrue(torch.allclose(opt._queued_projected_grads[projected_weight], expected, atol=1e-12))
 
     def test_uniform_rank_clamps_to_matrix_dimension(self):

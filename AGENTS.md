@@ -50,6 +50,8 @@ Stop at crossroads. If the exact model/cache/path is unclear, if pulling a model
 
 The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=4`, `seq_len=1024`, and CCE loss. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
+For expensive 1k-quality runs, use `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Record compile state in results so throughput comparisons stay honest.
+
 Random basis init is an ablation/stress path, not the quality default. Do not use it merely to dodge initialization cost unless the run is explicitly measuring fit/performance rather than optimizer quality.
 
 CCE is the loss path because the HF full-logits route is strictly worse for the memory/throughput questions this repo is asking. If a run needs an unoptimized loss route, stop immediately and re-evaluate the plan. Continue only if the work is explicitly reframed as an ablation outside the faithful benchmark path.

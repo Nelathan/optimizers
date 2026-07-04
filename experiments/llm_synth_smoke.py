@@ -17,7 +17,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sumotrack import SumoTrack, optimizer_state_bytes_by_category
-from sumotrack.projected_activation import OptimizerProjectedGradientSink, projected_activation_gated_mlp, projected_activation_linear
+from sumotrack.projected_activation import (
+    OptimizerProjectedGradientSink,
+    projected_activation_gated_mlp,
+    projected_activation_linear,
+    set_projected_activation_compile,
+)
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
@@ -340,10 +345,9 @@ def build_sumotrack_param_groups(
 
     grouped: dict[str, list[torch.nn.Parameter]] = {}
     refresh_offsets_by_side: dict[str, dict[int, int]] = {}
-    activation_projected_param_ids = activation_projected_param_ids or set()
     for name, param in named_params:
         role = transformer_matrix_role(name, param)
-        side = "right" if id(param) in activation_projected_param_ids and param.ndim == 2 else storage_side_for_residual_axis(role, projection_side_policy)
+        side = storage_side_for_residual_axis(role, projection_side_policy)
         grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
             if basis_refresh_schedule == "layer-staggered":
@@ -444,10 +448,11 @@ def _make_projected_activation_linear_forward(
     fallback_forward: Callable[[torch.Tensor], torch.Tensor],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     def forward(x: torch.Tensor) -> torch.Tensor:
-        basis = _projected_activation_linear_basis(linear, optimizer)
-        if basis is None:
+        projected = _projected_activation_linear_basis(linear, optimizer)
+        if projected is None:
             return fallback_forward(x)
-        return projected_activation_linear(x, linear.weight, basis, sink, linear.weight, linear.bias)
+        basis, side = projected
+        return projected_activation_linear(x, linear.weight, basis, sink, linear.weight, linear.bias, side=side)
 
     return forward
 
@@ -497,17 +502,20 @@ def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: Sumo
     return bases[0], bases[1], bases[2]
 
 
-def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: SumoTrack) -> torch.Tensor | None:
+def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: SumoTrack) -> tuple[torch.Tensor, str] | None:
     group = _optimizer_group_for_param(optimizer, linear.weight)
     if group is None or _sumotrack_param_refresh_due(group, linear.weight):
         return None
     state = optimizer.state.get(linear.weight, {})
     basis = state.get("basis")
-    if basis is None or not state.get("projection_side_is_right", False):
+    if basis is None:
         return None
-    if basis.ndim != 2 or basis.shape[1] != linear.weight.shape[1]:
+    side = "right" if state.get("projection_side_is_right", False) else "left"
+    if side == "right" and (basis.ndim != 2 or basis.shape[1] != linear.weight.shape[1]):
         return None
-    return basis
+    if side == "left" and (basis.ndim != 2 or basis.shape[0] != linear.weight.shape[0]):
+        return None
+    return basis, side
 
 
 def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn.Parameter) -> dict | None:
@@ -804,6 +812,28 @@ def apply_lr_warmup(optimizer: torch.optim.Optimizer, base_lrs: Sequence[float],
     return scale
 
 
+def should_compile_projected_activation(args, optimizer_name: str) -> bool:
+    return args.torch_compile and optimizer_name == "sumotrack" and args.projected_activation_backend != "off"
+
+
+def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
+    """Compile the module that the CCE training loss actually calls.
+
+    `cce_causal_lm_loss()` bypasses the CausalLM wrapper and calls the inner
+    base model plus `lm_head` directly to avoid materializing full logits. If we
+    only compile the outer wrapper, the hot transformer path remains eager.
+    """
+
+    if not enabled:
+        return model
+    base = getattr(model, "model", None)
+    lm_head = getattr(model, "lm_head", None)
+    if isinstance(base, torch.nn.Module) and isinstance(lm_head, torch.nn.Module):
+        model.model = torch.compile(base)  # type: ignore[assignment]
+        return model
+    return torch.compile(model)
+
+
 def run_optimizer(
     args,
     optimizer_name: str,
@@ -834,12 +864,10 @@ def run_optimizer(
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
-    if args.torch_compile:
-        model = torch.compile(model)
-
     if optimizer_name == "subspace":
         optimizer_name = "sumotrack"
 
+    set_projected_activation_compile(should_compile_projected_activation(args, optimizer_name))
     if optimizer_name == "sumotrack":
         optimizer = SumoTrack(
             sumotrack_param_groups,
@@ -856,11 +884,13 @@ def run_optimizer(
             compile_tensor_kernels=args.torch_compile,
         )
         projected_activation_modules = install_projected_activation_backend(model, optimizer, args.projected_activation_backend)
+        model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name in {"adamw", "torch_adamw"}:
         if args.projected_activation_backend != "off":
             raise RuntimeError("projected activation backend requires the sumotrack optimizer")
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
         projected_activation_modules = 0
+        model = maybe_compile_training_model(model, args.torch_compile)
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
     base_lrs = optimizer_base_lrs(optimizer)
@@ -889,6 +919,7 @@ def run_optimizer(
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     start_time = time.perf_counter()
+    eval_elapsed = 0.0
     for step in range(args.measure_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
         global_step = step + 1
@@ -928,8 +959,14 @@ def run_optimizer(
                 step=global_step,
             )
         if should_eval and not args.skip_validation:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            eval_start = time.perf_counter()
             eval_val = evaluate_loss(model, val_batches)
             eval_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            eval_elapsed += time.perf_counter() - eval_start
             print(f"{optimizer_name}_step={global_step} target_val_loss={eval_val:.6f} source_val_loss={eval_retention_val:.6f}")
             wandb_log(
                 wandb_run,
@@ -942,12 +979,15 @@ def run_optimizer(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     measured_elapsed = time.perf_counter() - start_time
+    training_elapsed = measured_elapsed - eval_elapsed
+    training_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+    training_peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
     final_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     if not args.skip_validation:
         print_final_eval_sample(model, tokenizer, val_texts, args)
-    peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
-    peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
+    post_eval_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+    post_eval_peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
     measured_param_norms = [step["param_norm"] for step in measured_steps]
@@ -987,7 +1027,8 @@ def run_optimizer(
         "actual_supervised_tokens": batch_supervised_tokens(train_batches[0]),
         "tokens_per_optimizer_step": batch_tokens(train_batches[0]) * args.grad_accum_steps,
         "supervised_tokens_per_optimizer_step": batch_supervised_tokens(train_batches[0]) * args.grad_accum_steps,
-        "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / measured_elapsed,
+        "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / training_elapsed,
+        "measured_tokens_per_second_with_eval": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / measured_elapsed,
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
         "state_bytes": state_bytes["total"],
@@ -1005,9 +1046,14 @@ def run_optimizer(
         "mean_logged_projected_grad_p90_to_moment_ratio": mean_scalar(measured_projected_grad_p90_to_moment_ratios),
         "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
         "measured_elapsed_seconds": measured_elapsed,
-        "measured_step_seconds": measured_elapsed / args.measure_steps,
-        "peak_cuda_bytes": peak,
-        "peak_cuda_reserved_bytes": peak_reserved,
+        "measured_train_elapsed_seconds": training_elapsed,
+        "measured_eval_elapsed_seconds": eval_elapsed,
+        "measured_step_seconds": training_elapsed / args.measure_steps,
+        "measured_step_seconds_with_eval": measured_elapsed / args.measure_steps,
+        "peak_cuda_bytes": training_peak,
+        "peak_cuda_reserved_bytes": training_peak_reserved,
+        "post_eval_peak_cuda_bytes": post_eval_peak,
+        "post_eval_peak_cuda_reserved_bytes": post_eval_peak_reserved,
     }
     del optimizer, model, tokenizer, train_batches, val_batches, retention_batches
     if device.type == "cuda":
