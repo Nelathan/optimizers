@@ -307,11 +307,10 @@ Interpretation still needs care. The monitor shows where the peak occurs in modu
 3. **Remaining peak owner after fused MLP.** If fused MLP wins locally, is the next dominant object MLP input save, attention/short-conv kernel state, CCE/loss state, refresh fallback, optimizer update temps, or allocator timing?
 4. **Checkpointing as substrate.** Repaired decoder-layer checkpointing is now empirically best for the current memory shape. Any projected-gradient primitive must prove incremental value on top of real checkpointing, not fake stock-LFM checkpointing.
 
-## Next coherent cut
+## Side-aware fused MLP: gate run, gate failed
 
-Build the side-aware fused MLP primitive behind a microbench gate:
+The side-aware fused MLP primitive was built and gated on 2026-07-05 (`_ProjectedActivationGatedMlpSideAware`, `experiments/fused_mlp_side_aware_microbench.py`, RESULTS.md entry). Math is fp64-exact on all three sides and no `[T, intermediate]` tensor is saved. The synthetic microbench at LFM-350M MLP dims tied the compiled ordinary baseline on step time and lost to it on peak at every (T, rank) tested.
 
-1. implement the primitive outside the LFM harness first;
-2. test exact projected grads for gate/up/down against ordinary full-gradient projection on the correct sides;
-3. benchmark against ordinary PyTorch MLP backward at rank64/rank256 and token counts matching `bs16/bs64`;
-4. integrate into LFM only if the synthetic primitive beats baseline on the shapes that matter.
+The failure is structural. The theoretical dW-FLOP saving is consumed by the gate/up recompute, and the down-left contraction needs `hidden` alive alongside the other `[T, f]` transients — a perfect schedule still holds ~3–4 simultaneously, which is parity with Inductor's save/recompute on the plain baseline, not a win. At `hidden=1024` the full weight grads avoided are ~13 MB each; the real memory object in this block is `[T, f]` activation liveness, and `torch.compile` already manages that on ordinary backward.
+
+Verdict: do not integrate into LFM. The projected-backward performance lane is closed at 350M shapes. Compiled ordinary backward plus repaired decoder-layer checkpointing is the performance path; the generic side-aware `Linear` and both fused MLP Functions remain tested correctness primitives for possible future shapes (much larger `hidden`, where avoided full weight grads stop being negligible), not active leads.

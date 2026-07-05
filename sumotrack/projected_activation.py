@@ -59,7 +59,7 @@ def set_projected_activation_compile(enabled: bool) -> None:
     compiled here, keeping optimizer state/bookkeeping out of Dynamo's graph.
     """
 
-    global _compiled_right_linear_backward, _compiled_left_linear_backward, _compiled_gated_mlp_backward
+    global _compiled_right_linear_backward, _compiled_left_linear_backward, _compiled_gated_mlp_backward, _compiled_side_aware_gated_mlp_backward
     if enabled:
         if _compiled_right_linear_backward is None:
             _compiled_right_linear_backward = torch.compile(_projected_activation_right_linear_backward_tensors)
@@ -67,10 +67,13 @@ def set_projected_activation_compile(enabled: bool) -> None:
             _compiled_left_linear_backward = torch.compile(_projected_activation_left_linear_backward_tensors)
         if _compiled_gated_mlp_backward is None:
             _compiled_gated_mlp_backward = torch.compile(_projected_activation_gated_mlp_backward_tensors)
+        if _compiled_side_aware_gated_mlp_backward is None:
+            _compiled_side_aware_gated_mlp_backward = torch.compile(_projected_activation_side_aware_gated_mlp_backward_tensors)
     else:
         _compiled_right_linear_backward = None
         _compiled_left_linear_backward = None
         _compiled_gated_mlp_backward = None
+        _compiled_side_aware_gated_mlp_backward = None
 
 
 def _right_linear_backward_kernel() -> RightLinearBackwardKernel:
@@ -324,6 +327,160 @@ def projected_activation_gated_mlp(
         gate_input_basis,
         up_input_basis,
         hidden_basis,
+        sink,
+        gate_key,
+        up_key,
+        down_key,
+    )
+
+
+SideAwareGatedMlpBackwardKernel = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor, Tensor]]
+
+
+_compiled_side_aware_gated_mlp_backward: SideAwareGatedMlpBackwardKernel | None = None
+
+
+def _side_aware_gated_mlp_backward_kernel() -> SideAwareGatedMlpBackwardKernel:
+    return _compiled_side_aware_gated_mlp_backward or _projected_activation_side_aware_gated_mlp_backward_tensors
+
+
+def _projected_activation_side_aware_gated_mlp_backward_tensors(
+    grad_output: Tensor,
+    projected_gate_input: Tensor,
+    projected_up_input: Tensor,
+    saved_input: Tensor,
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+    down_basis: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+    gate_pre = saved_input @ gate_weight.mT
+    up = saved_input @ up_weight.mT
+    silu_gate = torch.nn.functional.silu(gate_pre)
+    hidden = silu_gate * up
+
+    down_projected_grad = (grad_output_flat @ down_basis).mT @ hidden.reshape(-1, hidden.shape[-1])
+    grad_hidden = (grad_output_flat @ down_weight).reshape(gate_pre.shape)
+    del hidden
+
+    grad_up = grad_hidden * silu_gate
+    grad_up_flat = grad_up.reshape(-1, grad_up.shape[-1])
+    up_projected_grad = grad_up_flat.mT @ projected_up_input
+    grad_input_flat = grad_up_flat @ up_weight
+    del silu_gate, grad_up, grad_up_flat
+
+    sigmoid_gate = torch.sigmoid(gate_pre)
+    silu_grad = sigmoid_gate * (1.0 + gate_pre * (1.0 - sigmoid_gate))
+    grad_hidden.mul_(silu_grad)
+    del sigmoid_gate, silu_grad
+    grad_hidden.mul_(up)
+    del up
+    grad_gate_flat = grad_hidden.reshape(-1, grad_hidden.shape[-1])
+    gate_projected_grad = grad_gate_flat.mT @ projected_gate_input
+    grad_input_flat.add_(grad_gate_flat @ gate_weight)
+    del gate_pre, grad_gate_flat
+
+    return grad_input_flat.reshape(saved_input.shape), gate_projected_grad, up_projected_grad, down_projected_grad
+
+
+class _ProjectedActivationGatedMlpSideAware(Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input: Tensor,
+        gate_weight: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+        gate_input_basis: Tensor,
+        up_input_basis: Tensor,
+        down_basis: Tensor,
+        sink: ProjectedGradientSink,
+        gate_key: Any,
+        up_key: Any,
+        down_key: Any,
+    ) -> Tensor:
+        if input.shape[-1] != gate_weight.shape[1] or input.shape[-1] != up_weight.shape[1]:
+            raise ValueError("gate/up weights must consume the input feature dimension")
+        if gate_weight.shape != up_weight.shape:
+            raise ValueError(f"gate and up weights must have the same shape, got {tuple(gate_weight.shape)} and {tuple(up_weight.shape)}")
+        if down_weight.shape[1] != gate_weight.shape[0]:
+            raise ValueError("down weight must consume the gated intermediate dimension")
+        if gate_input_basis.ndim != 2 or gate_input_basis.shape[1] != input.shape[-1]:
+            raise ValueError(f"gate input basis must have shape [rank, hidden], got {tuple(gate_input_basis.shape)}")
+        if up_input_basis.ndim != 2 or up_input_basis.shape[1] != input.shape[-1]:
+            raise ValueError(f"up input basis must have shape [rank, hidden], got {tuple(up_input_basis.shape)}")
+        if down_basis.ndim != 2 or down_basis.shape[0] != down_weight.shape[0]:
+            raise ValueError(f"down basis must have shape [out_features, rank], got {tuple(down_basis.shape)} for down weight {tuple(down_weight.shape)}")
+
+        flat_input = input.reshape(-1, input.shape[-1])
+        gate_pre = input @ gate_weight.mT
+        up = input @ up_weight.mT
+        hidden = torch.nn.functional.silu(gate_pre) * up
+        output = hidden @ down_weight.mT
+        del gate_pre, up, hidden
+
+        projected_gate_input = flat_input @ gate_input_basis.mT
+        projected_up_input = flat_input @ up_input_basis.mT
+        ctx.save_for_backward(projected_gate_input, projected_up_input, input, gate_weight, up_weight, down_weight, down_basis)
+        ctx.input_shape = tuple(input.shape)
+        ctx.sink = sink
+        ctx.keys = (gate_key, up_key, down_key)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None, None, None, None, None, None, None, None]:
+        projected_gate_input, projected_up_input, input, gate_weight, up_weight, down_weight, down_basis = ctx.saved_tensors
+        gate_key, up_key, down_key = ctx.keys
+        grad_input, gate_projected_grad, up_projected_grad, down_projected_grad = _side_aware_gated_mlp_backward_kernel()(
+            grad_output,
+            projected_gate_input,
+            projected_up_input,
+            input,
+            gate_weight,
+            up_weight,
+            down_weight,
+            down_basis,
+        )
+
+        _sink_add(ctx.sink, gate_key, gate_projected_grad)
+        _sink_add(ctx.sink, up_key, up_projected_grad)
+        _sink_add(ctx.sink, down_key, down_projected_grad)
+
+        return grad_input, None, None, None, None, None, None, None, None, None, None
+
+
+def projected_activation_gated_mlp_side_aware(
+    input: Tensor,
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+    gate_input_basis: Tensor,
+    up_input_basis: Tensor,
+    down_basis: Tensor,
+    sink: ProjectedGradientSink,
+    gate_key: Any,
+    up_key: Any,
+    down_key: Any,
+) -> Tensor:
+    """SwiGLU-style MLP with residual-facing (side-aware) projected weight grads.
+
+    ``gate_weight``/``up_weight`` are storage-right: ``gate_input_basis``/
+    ``up_input_basis`` have shape ``[rank, in_features]`` and backward emits
+    ``full_dW @ basis.T``. ``down_weight`` is storage-left: ``down_basis`` has
+    shape ``[out_features, rank]`` and backward emits ``basis.T @ full_dW``.
+    The backward recomputes ``gate_pre``/``up``/``hidden`` rather than saving
+    the full ``[..., intermediate]`` intermediates from the forward pass.
+    """
+
+    return _ProjectedActivationGatedMlpSideAware.apply(
+        input,
+        gate_weight,
+        up_weight,
+        down_weight,
+        gate_input_basis,
+        up_input_basis,
+        down_basis,
         sink,
         gate_key,
         up_key,

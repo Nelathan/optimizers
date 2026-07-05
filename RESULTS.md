@@ -4,7 +4,37 @@ Short empirical notes from local runs. Treat these as terrain markers, not claim
 
 This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
-## 2026-07-02: Projected activation compile spike and rank256 follow-up
+## 2026-07-05: Side-aware fused MLP fails the microbench gate
+
+Question: can one fused side-aware projected gated-MLP primitive (gate/up storage-right projected-activation saves, down storage-left projected loss-gradient contraction — residual-facing geometry) beat ordinary autograd backward on step time and peak memory at the shapes that matter, as the pre-registered gate for any LFM integration?
+
+Setup:
+
+- New `_ProjectedActivationGatedMlpSideAware` in `sumotrack/projected_activation.py`, wired into the optional-compile kernel mechanism. Saves `x` plus two `[T, rank]` projected inputs; recomputes `gate_pre`/`up`/`hidden` in backward with scheduled frees.
+- fp64 equality tests prove all three sink-emitted projected grads match `full_dW @ Q.T` (gate/up) and `P.T @ full_dW` (down) and that `grad_input` is exact; saved-tensor test proves no `[T, intermediate]` retention. Full suite 80/80.
+- Standalone CUDA bf16 microbench (`experiments/fused_mlp_side_aware_microbench.py`), LFM2.5-350M MLP dims (`hidden=1024`, `intermediate=6656`), local 4070 SUPER. Contestants: eager full-grad-then-project (mainline cost today), the same under `torch.compile` (the bar), and the fused primitive with compiled backward tensors. 10 warmup / 50 timed iterations, profiler kernel counts.
+
+Results:
+
+| T | rank | contestant | step ms | peak bytes |
+| ---: | ---: | --- | ---: | ---: |
+| 16384 | 64 | baseline-eager | 35.725 | 1,743,389,696 |
+| 16384 | 64 | baseline-compiled | 32.822 | 1,192,887,296 |
+| 16384 | 64 | fused-projected | 32.771 | 1,508,508,672 |
+| 16384 | 256 | baseline-compiled | 32.884 | 1,190,921,216 |
+| 16384 | 256 | fused-projected | 33.936 | 1,519,125,504 |
+| 65536 | 64 | baseline-compiled | 131.661 | 4,461,298,688 |
+| 65536 | 64 | fused-projected | 131.958 | 5,846,467,584 |
+| 65536 | 256 | baseline-compiled | 131.982 | 4,462,478,336 |
+| 65536 | 256 | fused-projected | 136.215 | 5,897,978,880 |
+
+Notes:
+
+- Step time ties the compiled baseline within noise at every shape; the theoretical dW-FLOP saving is eaten by the gate/up recompute, as predicted.
+- Peak loses to the compiled baseline everywhere. The gap is structural, not a scheduling bug: the down-left contraction needs `hidden` alive alongside `gate_pre`/`up`/`silu_gate`/`grad_hidden` (~5 × `[T, f]` transients), and even a perfect schedule needs ~3–4 simultaneously — parity with Inductor's own save/recompute scheduling at best. At `hidden=1024` the full weight grads the projection avoids are only ~13 MB each; the memory question in this block is `[T, f]` activation liveness, which `torch.compile` already handles on the plain baseline.
+- Gate verdict: fail. Do not integrate into LFM. The projected-backward speed lane is closed at 350M shapes; compiled ordinary backward plus repaired checkpointing is the performance path. The primitive stays as a tested correctness artifact only.
+
+
 
 Question: under repaired LFM2 activation checkpointing, is full `lfm` projected activation intrinsically slower, or is the remaining overhead mostly Python/custom-autograd tensor math that `torch.compile` can cover without Triton or changing the SYNTH/model contract?
 

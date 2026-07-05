@@ -3,7 +3,12 @@ import unittest
 import torch
 
 from sumotrack import SumoTrack
-from sumotrack.projected_activation import ProjectedActivationGradientSink, projected_activation_gated_mlp, projected_activation_linear
+from sumotrack.projected_activation import (
+    ProjectedActivationGradientSink,
+    projected_activation_gated_mlp,
+    projected_activation_gated_mlp_side_aware,
+    projected_activation_linear,
+)
 
 
 def _orthonormal_rows(features: int, rank: int, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -243,6 +248,73 @@ class ProjectedActivationTest(unittest.TestCase):
         self.assertIn((batch, hidden), saved_shapes)
         self.assertIn((batch, rank_hidden), saved_shapes)
         self.assertIn((batch, rank_intermediate), saved_shapes)
+
+    def test_side_aware_fused_gated_mlp_matches_residual_facing_projection(self):
+        torch.manual_seed(31)
+        tokens, hidden, intermediate, rank = 32, 16, 40, 4
+        x = torch.randn(tokens, hidden, dtype=torch.float64)
+        target = torch.randn(tokens, hidden, dtype=torch.float64)
+        q_gate = _orthonormal_rows(hidden, rank)
+        q_up = _orthonormal_rows(hidden, rank)
+        p_down = _orthonormal_columns(hidden, rank)
+
+        reference = _TinyGatedMlp(hidden, intermediate, dtype=torch.float64)
+        gate_w = reference.gate.weight.detach().clone().requires_grad_(True)
+        up_w = reference.up.weight.detach().clone().requires_grad_(True)
+        down_w = reference.down.weight.detach().clone().requires_grad_(True)
+
+        ref_x = x.detach().clone().requires_grad_(True)
+        proj_x = x.detach().clone().requires_grad_(True)
+
+        ref_loss = (reference(ref_x) - target).square().mean()
+        ref_loss.backward()
+
+        sink = ProjectedActivationGradientSink()
+        output = projected_activation_gated_mlp_side_aware(
+            proj_x, gate_w, up_w, down_w, q_gate, q_up, p_down, sink, "gate", "up", "down"
+        )
+        proj_loss = (output - target).square().mean()
+        proj_loss.backward()
+
+        expected_gate = reference.gate.weight.grad @ q_gate.mT
+        expected_up = reference.up.weight.grad @ q_up.mT
+        expected_down = p_down.mT @ reference.down.weight.grad
+
+        self.assertTrue(torch.allclose(output, reference.last_output, atol=1e-10, rtol=1e-8))
+        self.assertTrue(torch.allclose(proj_x.grad, ref_x.grad, atol=1e-10, rtol=1e-8))
+        self.assertIsNone(gate_w.grad)
+        self.assertIsNone(up_w.grad)
+        self.assertIsNone(down_w.grad)
+        self.assertTrue(torch.allclose(sink.projected_grads["gate"], expected_gate, atol=1e-10, rtol=1e-8))
+        self.assertTrue(torch.allclose(sink.projected_grads["up"], expected_up, atol=1e-10, rtol=1e-8))
+        self.assertTrue(torch.allclose(sink.projected_grads["down"], expected_down, atol=1e-10, rtol=1e-8))
+
+    def test_side_aware_fused_gated_mlp_does_not_save_full_intermediate_activations(self):
+        torch.manual_seed(32)
+        tokens, hidden, intermediate, rank = 32, 16, 40, 4
+        x = torch.randn(tokens, hidden, dtype=torch.float64, requires_grad=True)
+        q_gate = _orthonormal_rows(hidden, rank)
+        q_up = _orthonormal_rows(hidden, rank)
+        p_down = _orthonormal_columns(hidden, rank)
+        gate_w = torch.randn(intermediate, hidden, dtype=torch.float64)
+        up_w = torch.randn(intermediate, hidden, dtype=torch.float64)
+        down_w = torch.randn(hidden, intermediate, dtype=torch.float64)
+        sink = ProjectedActivationGradientSink()
+        saved_shapes = []
+
+        def pack(tensor):
+            saved_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            output = projected_activation_gated_mlp_side_aware(
+                x, gate_w, up_w, down_w, q_gate, q_up, p_down, sink, "gate", "up", "down"
+            )
+            output.square().mean().backward()
+
+        self.assertNotIn((tokens, intermediate), saved_shapes)
+        self.assertIn((tokens, hidden), saved_shapes)
+        self.assertIn((tokens, rank), saved_shapes)
 
 
 class _TinyGatedMlp(torch.nn.Module):
