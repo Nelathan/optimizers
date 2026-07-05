@@ -622,6 +622,7 @@ def print_final_eval_sample(model, tokenizer, val_texts: list[str], args) -> Non
             temperature=args.final_sample_temperature,
             top_k=args.final_sample_top_k,
             top_p=args.final_sample_top_p,
+            repetition_penalty=args.final_sample_repetition_penalty,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -859,7 +860,7 @@ def run_optimizer(
         activation_projected_param_ids,
         args.basis_refresh_schedule,
     )
-    train_batch_count = (args.warmup_steps + args.measure_steps) * args.grad_accum_steps
+    train_batch_count = (args.warmup_steps + args.max_steps) * args.grad_accum_steps
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_batch_count, args.batching, "synth")
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
@@ -909,6 +910,7 @@ def run_optimizer(
     )
     measured_steps = []
     loss_window = []
+    last_eval_val = float("nan")
 
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
@@ -920,7 +922,7 @@ def run_optimizer(
         torch.cuda.reset_peak_memory_stats(device)
     start_time = time.perf_counter()
     eval_elapsed = 0.0
-    for step in range(args.measure_steps):
+    for step in range(args.max_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
         global_step = step + 1
         lr_scale = apply_lr_warmup(optimizer, base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
@@ -940,6 +942,7 @@ def run_optimizer(
         )
         measured_steps.append(step_result)
         loss_window.append(step_result["loss"])
+        train_loss = None
         if should_log_train:
             train_loss = scalar(torch.stack(loss_window).mean())
             loss_window.clear()
@@ -967,7 +970,7 @@ def run_optimizer(
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             eval_elapsed += time.perf_counter() - eval_start
-            print(f"{optimizer_name}_step={global_step} target_val_loss={eval_val:.6f} source_val_loss={eval_retention_val:.6f}")
+            last_eval_val = eval_val
             wandb_log(
                 wandb_run,
                 {
@@ -975,6 +978,14 @@ def run_optimizer(
                     f"{optimizer_name}/source_val_loss": eval_retention_val,
                 },
                 step=global_step,
+            )
+        if should_log_train or should_eval:
+            avg_step_seconds = (time.perf_counter() - start_time - eval_elapsed) / global_step
+            console_train_loss = train_loss if train_loss is not None else scalar(step_result["loss"])
+            print(
+                f"step={global_step} train_loss={console_train_loss:.6f} eval_loss={last_eval_val:.6f} "
+                f"avg_step_seconds={avg_step_seconds:.4f}",
+                flush=True,
             )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1027,8 +1038,8 @@ def run_optimizer(
         "actual_supervised_tokens": batch_supervised_tokens(train_batches[0]),
         "tokens_per_optimizer_step": batch_tokens(train_batches[0]) * args.grad_accum_steps,
         "supervised_tokens_per_optimizer_step": batch_supervised_tokens(train_batches[0]) * args.grad_accum_steps,
-        "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / training_elapsed,
-        "measured_tokens_per_second_with_eval": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.measure_steps) / measured_elapsed,
+        "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.max_steps) / training_elapsed,
+        "measured_tokens_per_second_with_eval": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.max_steps) / measured_elapsed,
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
         "state_bytes": state_bytes["total"],
@@ -1048,8 +1059,8 @@ def run_optimizer(
         "measured_elapsed_seconds": measured_elapsed,
         "measured_train_elapsed_seconds": training_elapsed,
         "measured_eval_elapsed_seconds": eval_elapsed,
-        "measured_step_seconds": training_elapsed / args.measure_steps,
-        "measured_step_seconds_with_eval": measured_elapsed / args.measure_steps,
+        "measured_step_seconds": training_elapsed / args.max_steps,
+        "measured_step_seconds_with_eval": measured_elapsed / args.max_steps,
         "peak_cuda_bytes": training_peak,
         "peak_cuda_reserved_bytes": training_peak_reserved,
         "post_eval_peak_cuda_bytes": post_eval_peak,
@@ -1074,7 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
-    parser.add_argument("--measure-steps", type=int, default=3)
+    parser.add_argument("--max-steps", type=int, default=3, help="ceiling on measured optimizer steps; clamped down with a warning if the dataset can't supply this many rows")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -1123,6 +1134,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-sample-temperature", type=float, default=0.6)
     parser.add_argument("--final-sample-top-k", type=int, default=20)
     parser.add_argument("--final-sample-top-p", type=float, default=0.95)
+    parser.add_argument("--final-sample-repetition-penalty", type=float, default=1.1, help="mild repetition penalty for final qualitative generation; 1.0 disables")
     parser.add_argument("--allow-dirty-final-sample", action="store_true", help="allow printing target-HF samples for non-SYNTH formats; never enable for dirty/NSFW datasets")
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
@@ -1137,8 +1149,8 @@ def main() -> None:
 
     if args.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
-    if args.measure_steps <= 0:
-        raise ValueError("measure_steps must be positive")
+    if args.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
     if args.grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive")
     if args.seq_len <= 1:
@@ -1161,6 +1173,8 @@ def main() -> None:
         raise ValueError("final_sample_top_k must be positive")
     if not 0 < args.final_sample_top_p <= 1:
         raise ValueError("final_sample_top_p must be in (0, 1]")
+    if args.final_sample_repetition_penalty <= 0:
+        raise ValueError("final_sample_repetition_penalty must be positive")
     if args.wandb_log_every < 0:
         raise ValueError("wandb_log_every must be non-negative")
     if args.retention_data_dir and args.retention_hf_dataset:
@@ -1184,14 +1198,29 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
     model_name = args.model
 
-    total_train_steps = args.warmup_steps + args.measure_steps
+    total_train_steps = args.warmup_steps + args.max_steps
     train_blocks = max(total_train_steps * args.grad_accum_steps, 1)
     val_blocks = args.val_blocks
     target_source = args.data_dir
     if args.target_hf_dataset:
+        train_limit = packed_text_limit(train_blocks, args.batch_size, args.seq_len)
+        if train_limit > args.target_val_offset:
+            while train_blocks > 1 and packed_text_limit(train_blocks, args.batch_size, args.seq_len) > args.target_val_offset:
+                train_blocks -= 1
+            train_limit = packed_text_limit(train_blocks, args.batch_size, args.seq_len)
+            clamped_total_steps = max(train_blocks // args.grad_accum_steps, 1)
+            clamped_max_steps = max(clamped_total_steps - args.warmup_steps, 1)
+            print(
+                f"warning: --max-steps {args.max_steps} needs {packed_text_limit(max(total_train_steps * args.grad_accum_steps, 1), args.batch_size, args.seq_len)} "
+                f"training rows but only {args.target_val_offset} are available before --target-val-offset; "
+                f"clamping to --max-steps {clamped_max_steps}",
+                flush=True,
+            )
+            args.max_steps = clamped_max_steps
+            total_train_steps = args.warmup_steps + args.max_steps
         train_texts, target_train_parquet = hf_first_parquet_texts(
             args.target_hf_dataset,
-            limit=packed_text_limit(train_blocks, args.batch_size, args.seq_len),
+            limit=train_limit,
             dataset_format=args.target_format,
         )
         val_texts, target_val_parquet = hf_first_parquet_texts(
@@ -1223,7 +1252,7 @@ def main() -> None:
     print(f"train_texts={len(train_texts)} val_texts={len(val_texts)} retention_texts={len(retention_texts) if retention_texts else 0}")
     print(
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
-        f"warmup_steps={args.warmup_steps} measure_steps={args.measure_steps} param_scope={args.param_scope} "
+        f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
@@ -1233,6 +1262,7 @@ def main() -> None:
         f"skip_validation={args.skip_validation} eval_every={args.eval_every} "
         f"final_sample={args.final_sample} final_sample_max_seq_len={args.final_sample_max_seq_len} "
         f"final_sample_temperature={args.final_sample_temperature} final_sample_top_k={args.final_sample_top_k} final_sample_top_p={args.final_sample_top_p} "
+        f"final_sample_repetition_penalty={args.final_sample_repetition_penalty} "
         f"wandb_run={args.wandb_run or 'none'} wandb_entity={args.wandb_entity} consume_grad={not args.keep_grads_after_step}"
     )
 

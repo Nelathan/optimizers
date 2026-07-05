@@ -45,6 +45,28 @@ The small-model faithful SYNTH lane is the current clean product-shaped dataset 
 
 Treat the 350M faithful SYNTH setup as both a regression harness and the current optimizer-shape tuner. Use it when a new code path, rank/token setting, performance change, or comparator needs a known-good control. Do not casually move to another model or dataset: that resets the ablation stack and changes the question.
 
+### Current default lane (copy-pasteable)
+
+The CLI's own flag defaults already match this lane on every axis except batch size, rank, LR, and checkpointing (see table below). Per `AGENTS.md`, override only the axis under test — the block below is the full best-candidate shape, not a template to restate for one-axis ablations:
+
+```bash
+HF_HUB_OFFLINE=1 uv run python experiments/llm_synth_smoke.py \
+  --batch-size 16 --rank 256 --sumotrack-lr 3e-4 \
+  --activation-checkpointing --measure-steps 1000
+```
+
+Divergences from CLI defaults, and why:
+
+| flag | CLI default | this lane | why |
+| --- | --- | --- | --- |
+| `--batch-size` | `4` | `16` | more tokens/optimizer-update outperformed maximizing batch size alone (see Durable facts) |
+| `--rank` | `64` | `256` | rank256 is the current best 350M candidate, not the old `bs8/rank64` continuity lane |
+| `--sumotrack-lr` | `2e-4` | `3e-4` | tuned for the rank256/bs16 shape; `4e-4` hurt source too much, `2e-4` untested in this exact lane |
+| `--activation-checkpointing` | off | on | repaired LFM2 checkpointing is what reopened this token/rank regime under memory pressure |
+| `--measure-steps` | `3` | `1000` | default `3` is a fast correctness smoke, not a training run; use `1000` only when the question needs a real convergence signal |
+
+Everything else (`param-scope`, `seq-len`, `lr-warmup-steps`, `beta`, `projection-side-policy`, `basis-init`, `basis-refresh-interval/schedule`, `projected-grad-clip-norm/ratio`) is already the CLI default — do not restate it.
+
 ## Durable empirical facts
 
 ### What worked
