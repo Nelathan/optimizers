@@ -53,6 +53,9 @@ class SumoTrack(Optimizer):
         rank: int = 32,
         side: ProjectionSide | str = ProjectionSide.AUTO,
         basis_init: str = "eigh",
+        moment_mode: str = "ema",
+        second_moment_beta: float = 0.99,
+        adafactor_eps: float = 1e-30,
         grassmann_step_size: float = 0.01,
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
@@ -82,6 +85,12 @@ class SumoTrack(Optimizer):
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
         basis_init = ProjectorInitMethod(basis_init).value
+        if moment_mode not in ("ema", "none", "second_moment", "adafactor", "adafactor_ema"):
+            raise ValueError(f"moment_mode must be one of 'ema', 'none', 'second_moment', 'adafactor', 'adafactor_ema', got {moment_mode!r}")
+        if not 0 <= second_moment_beta < 1:
+            raise ValueError(f"second_moment_beta must be in [0, 1), got {second_moment_beta}")
+        if adafactor_eps <= 0:
+            raise ValueError(f"adafactor_eps must be positive, got {adafactor_eps}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
         if basis_refresh_interval <= 0:
@@ -104,6 +113,9 @@ class SumoTrack(Optimizer):
             rank=rank,
             side=ProjectionSide(side).value,
             basis_init=basis_init,
+            moment_mode=moment_mode,
+            second_moment_beta=second_moment_beta,
+            adafactor_eps=adafactor_eps,
             grassmann_step_size=grassmann_step_size,
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
@@ -118,6 +130,7 @@ class SumoTrack(Optimizer):
         self.diagnostics_enabled = False
         self.diagnostics_leverage_enabled = False
         self.diagnostics_basis_enabled = False
+        self.diagnostics_aurora_health_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
         self._compiled_orthogonalize_update = torch.compile(SumoTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
         self._queued_projected_grads: dict[Tensor, Tensor] = {}
@@ -216,6 +229,9 @@ class SumoTrack(Optimizer):
             "projected_leverage_tensors": 0,
             "basis_rotation_chordal_sum": 0.0,
             "basis_refresh_tensors": 0,
+            "aurora_alignment_sum": 0.0,
+            "aurora_erank_sum": 0.0,
+            "aurora_health_tensors": 0,
         }
 
     def _finalize_diagnostics(self, diagnostics: dict[str, Any] | None) -> dict[str, float]:
@@ -247,6 +263,10 @@ class SumoTrack(Optimizer):
         basis_count = diagnostics["basis_refresh_tensors"]
         diagnostics["mean_basis_rotation_chordal"] = diagnostics["basis_rotation_chordal_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
+        aurora_count = diagnostics["aurora_health_tensors"]
+        diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
+        diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
+        diagnostics["aurora_health_tensors"] = float(aurora_count)
         return diagnostics
 
     def _refresh_param_ids(self, group: dict, matrix_params: list[Tensor]) -> set[int]:
@@ -278,6 +298,8 @@ class SumoTrack(Optimizer):
         state = self.state[p]
         projector = self._projector_from_state(p, group, state)
         if queued_projected_grad is not None:
+            if group["moment_mode"] in ("adafactor", "adafactor_ema"):
+                raise RuntimeError("adafactor/adafactor_ema moment_mode dampens the full gradient before projection and is incompatible with queued projected gradients")
             if not projector.is_initialized:
                 raise RuntimeError("queued projected gradients require an initialized SumoTrack basis; run a full-gradient step first")
             if refresh_basis:
@@ -293,6 +315,9 @@ class SumoTrack(Optimizer):
         else:
             if grad is None:
                 raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+            moment_mode = group["moment_mode"]
+            if moment_mode in ("adafactor", "adafactor_ema"):
+                grad = self._adafactor_dampen_full_grad(grad, group, state)
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
             projected_grad = projector.project(grad)
@@ -319,9 +344,30 @@ class SumoTrack(Optimizer):
             projected_grad = projected_grad.mul(clip_scale.to(device=projected_grad.device, dtype=projected_grad.dtype))
 
         state["step"] = state.get("step", 0) + 1
-        if projected_exp_avg is None:
-            projected_exp_avg = torch.zeros_like(projected_grad)
-        projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
+        moment_mode = group["moment_mode"]
+        if moment_mode == "ema":
+            if projected_exp_avg is None:
+                projected_exp_avg = torch.zeros_like(projected_grad)
+            projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
+        elif moment_mode == "none":
+            # No momentum, no dampening: Aurora sees the (clipped) projected
+            # gradient directly, unsmoothed step to step.
+            projected_exp_avg = projected_grad
+        elif moment_mode == "second_moment":
+            projected_exp_avg = self._second_moment_dampen(projected_grad, group, state)
+        elif moment_mode == "adafactor":
+            # Full-gradient dampening already applied above; the projected moment
+            # slot is simply the (already dampened) projected gradient itself.
+            projected_exp_avg = projected_grad
+        elif moment_mode == "adafactor_ema":
+            # Same full-gradient Adafactor dampening as adafactor mode, but the
+            # dampened+projected gradient still feeds a first-moment EMA (same
+            # beta as ema mode) instead of replacing the moment slot outright.
+            if projected_exp_avg is None:
+                projected_exp_avg = torch.zeros_like(projected_grad)
+            projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
+        else:  # pragma: no cover - validated in __init__
+            raise AssertionError(f"unexpected moment_mode: {moment_mode}")
         state["projected_exp_avg"] = projected_exp_avg
 
         return MatrixUpdate(
@@ -331,6 +377,68 @@ class SumoTrack(Optimizer):
             projected_exp_avg=projected_exp_avg,
             original_shape=tuple(p.shape),
         )
+
+    @staticmethod
+    def _second_moment_dampen(projected_grad: Tensor, group: dict, state: dict) -> Tensor:
+        """Arm 2: no first-moment EMA; feed grad / sqrt(v_hat) into Aurora instead.
+
+        Tracks a bias-corrected elementwise EMA of squared projected gradients
+        (RMSprop/Adam-v2-style) and dampens the *current* projected gradient by
+        it. There is no momentum state; each step's Aurora input depends only on
+        the current gradient and the running second-moment estimate.
+        """
+
+        beta2 = group["second_moment_beta"]
+        eps = group["eps"]
+        step = state["step"]
+        v = state.get("second_moment")
+        if v is None:
+            # Matches ema mode's moment dtype (param dtype, typically bf16): PLAN.md's
+            # fp32-moment migration found no quality benefit, so this arm should not get
+            # a free precision advantage over ema by defaulting to fp32 accumulation.
+            v = torch.zeros_like(projected_grad)
+        grad32 = projected_grad.float()
+        v32 = v.float()
+        v32.mul_(beta2).addcmul_(grad32, grad32, value=1.0 - beta2)
+        state["second_moment"] = v32.to(dtype=projected_grad.dtype)
+        bias_correction = 1.0 - beta2**step
+        v_hat = v32 / bias_correction
+        dampened = grad32 / (v_hat.sqrt() + eps)
+        return dampened.to(dtype=projected_grad.dtype)
+
+    @staticmethod
+    def _adafactor_dampen_full_grad(grad: Tensor, group: dict, state: dict) -> Tensor:
+        """Arms 3/4: Adafactor-style row/col factored second moment on the full
+        gradient, applied before basis refresh and before projection so the
+        same dampened gradient feeds both consumers. No first-moment EMA.
+        """
+
+        beta2 = group["second_moment_beta"]
+        eps = group["adafactor_eps"]
+        step = state.get("adafactor_step", 0) + 1
+        state["adafactor_step"] = step
+
+        grad32 = grad.float()
+        grad_sq = grad32.square() + eps
+        row_var = state.get("adafactor_row_var")
+        col_var = state.get("adafactor_col_var")
+        if row_var is None:
+            row_var = torch.zeros(grad32.shape[0], device=grad32.device, dtype=torch.float32)
+            col_var = torch.zeros(grad32.shape[1], device=grad32.device, dtype=torch.float32)
+        row_var.mul_(beta2).add_(grad_sq.mean(dim=1), alpha=1.0 - beta2)
+        col_var.mul_(beta2).add_(grad_sq.mean(dim=0), alpha=1.0 - beta2)
+        state["adafactor_row_var"] = row_var
+        state["adafactor_col_var"] = col_var
+
+        bias_correction = 1.0 - beta2**step
+        row_hat = row_var / bias_correction
+        col_hat = col_var / bias_correction
+        # Shazeer & Stern (2018) factored second-moment reconstruction: R C^T / sum(R).
+        # row_hat/col_hat are stored as per-row/per-column means (not sums), so the
+        # sum-based normalizer is row_hat.mean() (mean of means == sum/n cancelling n).
+        factor = (row_hat.unsqueeze(1) @ col_hat.unsqueeze(0)) / row_hat.mean().clamp_min(eps)
+        dampened = grad32 / factor.sqrt().clamp_min(eps)
+        return dampened.to(dtype=grad.dtype)
 
     def _apply_matrix_update_buckets(self, entries: list[MatrixUpdate], group: dict, diagnostics: dict | None) -> None:
         if not entries:
@@ -366,6 +474,12 @@ class SumoTrack(Optimizer):
                 diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
                 diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
                 diagnostics["projected_leverage_tensors"] += 1
+            if self.diagnostics_aurora_health_enabled:
+                alignment = self._aurora_alignment(entry.projected_exp_avg, update_hat)
+                erank = self._effective_rank(entry.projected_exp_avg)
+                diagnostics["aurora_alignment_sum"] += alignment
+                diagnostics["aurora_erank_sum"] += erank
+                diagnostics["aurora_health_tensors"] += 1
         update = entry.projector.project_back(update_hat).to(dtype=entry.param.dtype)
 
         if group["weight_decay"]:
@@ -622,6 +736,50 @@ class SumoTrack(Optimizer):
             cols = math.prod(original_shape[1:])
             return orthogonalized_update * math.sqrt(max(1.0, rows / cols))
         raise AssertionError(f"unexpected orthogonalization scale mode: {scale_mode}")
+
+    @staticmethod
+    def _aurora_alignment(pre_aurora: Tensor, update_hat: Tensor, eps: float = 1e-12) -> float:
+        """Cosine similarity between the pre-Aurora tensor and Aurora's orthogonalized
+        output, in Frobenius inner-product terms: ``<M, O>_F / (||M||_F ||O||_F)``.
+
+        Newton-Schulz/polar orthogonalization always lands on a semi-orthogonal
+        matrix regardless of input quality, so the output's own properties cannot
+        tell you whether the input was worth orthogonalizing. This measures how
+        much Aurora had to distort the input direction to reach the manifold: high
+        alignment means the pre-Aurora tensor was already well-shaped: low
+        alignment means Aurora is fighting a noisy or ill-conditioned input.
+        """
+
+        m = pre_aurora.float()
+        o = update_hat.float()
+        inner = (m * o).sum()
+        denom = (m.norm() * o.norm()).clamp_min(eps)
+        return float((inner / denom).detach().cpu())
+
+    @staticmethod
+    def _effective_rank(matrix: Tensor, eps: float = 1e-12) -> float:
+        """Spectral effective rank (Roy & Vetterli 2007): ``exp(-sum(p_i log p_i))``
+        where ``p_i`` are the matrix's singular values normalized to sum to 1.
+
+        A single dominant singular value (rank-1-ish, e.g. one noisy gradient
+        direction) gives erank near 1. A flat spectrum across all r singular
+        values (using the full available rank) gives erank near r. Computed via
+        eigh on the smaller-side Gram matrix (eigenvalues are squared singular
+        values) rather than a full SVD, matching the cost profile Newton-Schulz
+        already uses internally for this same rank-sized tensor.
+        """
+
+        if matrix.ndim != 2 or min(matrix.shape) == 0:
+            return float("nan")
+        work = matrix.float()
+        gram = work @ work.mT if work.shape[-2] <= work.shape[-1] else work.mT @ work
+        eigenvalues = torch.linalg.eigvalsh(gram).clamp_min(0.0)
+        singular_values = eigenvalues.sqrt()
+        total = singular_values.sum().clamp_min(eps)
+        p = singular_values / total
+        # p_i log p_i -> 0 as p_i -> 0; clamp inside log to avoid log(0) on exact zeros.
+        entropy = -(p * p.clamp_min(eps).log()).sum()
+        return float(entropy.exp().detach().cpu())
 
     @staticmethod
     def _large_axis_leverage_stats(update: Tensor, eps: float = 1e-12) -> tuple[float, float, float]:

@@ -767,6 +767,8 @@ def train_step(
         optimizer.diagnostics_leverage_enabled = False
     if hasattr(optimizer, "diagnostics_basis_enabled"):
         optimizer.diagnostics_basis_enabled = collect_basis
+    if hasattr(optimizer, "diagnostics_aurora_health_enabled"):
+        optimizer.diagnostics_aurora_health_enabled = collect_norms
     optimizer.zero_grad(set_to_none=True)
     losses = []
     for offset in range(grad_accum_steps):
@@ -781,6 +783,8 @@ def train_step(
     projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
     projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
     basis_rotation_chordal = optimizer_basis_rotation(optimizer) if collect_basis else float("nan")
+    aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
+    aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
     return {
@@ -792,6 +796,8 @@ def train_step(
         "projected_grad_max_norm": projected_grad_max_norm,
         "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
         "basis_rotation_chordal": basis_rotation_chordal,
+        "aurora_alignment": aurora_alignment,
+        "aurora_erank": aurora_erank,
     }
 
 
@@ -875,6 +881,8 @@ def run_optimizer(
             lr=args.sumotrack_lr,
             beta=args.beta,
             basis_init=args.basis_init,
+            moment_mode=args.moment_mode,
+            second_moment_beta=args.second_moment_beta,
             grassmann_step_size=args.grassmann_step_size,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
@@ -954,6 +962,8 @@ def run_optimizer(
                 f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
                 f"{optimizer_name}/projected_grad_p90_to_moment_ratio": scalar(step_result["projected_grad_p90_to_moment_ratio"]),
                 f"{optimizer_name}/basis_rotation_chordal": scalar(step_result["basis_rotation_chordal"]),
+                f"{optimizer_name}/aurora_alignment": scalar(step_result["aurora_alignment"]),
+                f"{optimizer_name}/aurora_erank": scalar(step_result["aurora_erank"]),
                 f"{optimizer_name}/lr_scale": lr_scale,
             }
             wandb_log(
@@ -1007,6 +1017,8 @@ def run_optimizer(
     measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
     measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
     measured_basis_rotation_chordal = [step["basis_rotation_chordal"] for step in measured_steps]
+    measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
+    measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
@@ -1056,6 +1068,8 @@ def run_optimizer(
         "mean_logged_projected_grad_max_norm": mean_scalar(measured_projected_grad_max_norms),
         "mean_logged_projected_grad_p90_to_moment_ratio": mean_scalar(measured_projected_grad_p90_to_moment_ratios),
         "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
+        "mean_logged_aurora_alignment": mean_scalar(measured_aurora_alignment),
+        "mean_logged_aurora_erank": mean_scalar(measured_aurora_erank),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_train_elapsed_seconds": training_elapsed,
         "measured_eval_elapsed_seconds": eval_elapsed,
@@ -1105,6 +1119,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.9)
+    parser.add_argument(
+        "--moment-mode",
+        choices=("ema", "none", "second_moment", "adafactor", "adafactor_ema"),
+        default="ema",
+        help="projected moment ablation: ema is the default first-moment path; none removes momentum entirely and feeds the (clipped) projected gradient straight into Aurora; second_moment drops the EMA and feeds grad/sqrt(v_hat) into Aurora; adafactor drops the EMA and dampens the full gradient with a row/col factored second moment before basis refresh and projection; adafactor_ema applies the same full-gradient Adafactor dampening but still feeds the result through a first-moment EMA (--beta) instead of replacing the moment slot outright",
+    )
+    parser.add_argument("--second-moment-beta", type=float, default=0.99, help="EMA beta for --moment-mode second_moment/adafactor/adafactor_ema second-moment tracking")
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
     parser.add_argument(
@@ -1189,6 +1210,10 @@ def main() -> None:
         raise ValueError("projected_grad_clip_ratio must be non-negative")
     if args.lr_warmup_steps < 0:
         raise ValueError("lr_warmup_steps must be non-negative")
+    if not 0 <= args.second_moment_beta < 1:
+        raise ValueError("second_moment_beta must be in [0, 1)")
+    if args.moment_mode in ("adafactor", "adafactor_ema") and args.projected_activation_backend != "off":
+        raise ValueError("--moment-mode adafactor/adafactor_ema dampens the full gradient before projection and is incompatible with --projected-activation-backend")
     if args.aurora_pp_iterations <= 0:
         raise ValueError("aurora_pp_iterations must be positive")
     if not 1 <= args.polar_ns_steps <= 5:

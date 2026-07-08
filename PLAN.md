@@ -50,7 +50,7 @@ Treat the 350M faithful SYNTH setup as both a regression harness and the current
 The CLI's own flag defaults already match this lane on every axis except batch size, rank, LR, and checkpointing (see table below). Per `AGENTS.md`, override only the axis under test — the block below is the full best-candidate shape, not a template to restate for one-axis ablations:
 
 ```bash
-HF_HUB_OFFLINE=1 uv run python experiments/llm_synth_smoke.py \
+uv run python experiments/llm_synth_smoke.py \
   --batch-size 16 --rank 256 --sumotrack-lr 3e-4 \
   --activation-checkpointing --measure-steps 1000
 ```
