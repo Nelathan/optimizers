@@ -111,8 +111,9 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.lr_warmup_steps, 50)
         self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.basis_refresh_schedule, "burst")
-        self.assertEqual(args.projected_grad_clip_norm, 2.0)
-        self.assertEqual(args.projected_grad_clip_ratio, 6.0)
+        self.assertEqual(args.moment_mode, "adafactor_ema")
+        self.assertEqual(args.projected_grad_clip_norm, 2000.0)
+        self.assertEqual(args.projected_grad_clip_ratio, 0.0)
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
         self.assertEqual(args.wandb_log_every, 20)
@@ -289,7 +290,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             projection_side_policy="right",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema")
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 

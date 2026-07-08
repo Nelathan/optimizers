@@ -53,8 +53,8 @@ class SumoTrack(Optimizer):
         rank: int = 32,
         side: ProjectionSide | str = ProjectionSide.AUTO,
         basis_init: str = "eigh",
-        moment_mode: str = "ema",
-        second_moment_beta: float = 0.99,
+        moment_mode: str = "adafactor_ema",
+        adafactor_beta2: float = 0.99,
         adafactor_eps: float = 1e-30,
         grassmann_step_size: float = 0.01,
         basis_refresh_interval: int = 100,
@@ -85,10 +85,10 @@ class SumoTrack(Optimizer):
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
         basis_init = ProjectorInitMethod(basis_init).value
-        if moment_mode not in ("ema", "none", "second_moment", "adafactor", "adafactor_ema"):
-            raise ValueError(f"moment_mode must be one of 'ema', 'none', 'second_moment', 'adafactor', 'adafactor_ema', got {moment_mode!r}")
-        if not 0 <= second_moment_beta < 1:
-            raise ValueError(f"second_moment_beta must be in [0, 1), got {second_moment_beta}")
+        if moment_mode not in ("ema", "adafactor_ema"):
+            raise ValueError(f"moment_mode must be one of 'ema', 'adafactor_ema', got {moment_mode!r}")
+        if not 0 <= adafactor_beta2 < 1:
+            raise ValueError(f"adafactor_beta2 must be in [0, 1), got {adafactor_beta2}")
         if adafactor_eps <= 0:
             raise ValueError(f"adafactor_eps must be positive, got {adafactor_eps}")
         if grassmann_step_size <= 0:
@@ -114,7 +114,7 @@ class SumoTrack(Optimizer):
             side=ProjectionSide(side).value,
             basis_init=basis_init,
             moment_mode=moment_mode,
-            second_moment_beta=second_moment_beta,
+            adafactor_beta2=adafactor_beta2,
             adafactor_eps=adafactor_eps,
             grassmann_step_size=grassmann_step_size,
             basis_refresh_interval=basis_refresh_interval,
@@ -298,8 +298,8 @@ class SumoTrack(Optimizer):
         state = self.state[p]
         projector = self._projector_from_state(p, group, state)
         if queued_projected_grad is not None:
-            if group["moment_mode"] in ("adafactor", "adafactor_ema"):
-                raise RuntimeError("adafactor/adafactor_ema moment_mode dampens the full gradient before projection and is incompatible with queued projected gradients")
+            if group["moment_mode"] == "adafactor_ema":
+                raise RuntimeError("adafactor_ema moment_mode dampens the full gradient before projection and is incompatible with queued projected gradients")
             if not projector.is_initialized:
                 raise RuntimeError("queued projected gradients require an initialized SumoTrack basis; run a full-gradient step first")
             if refresh_basis:
@@ -316,7 +316,7 @@ class SumoTrack(Optimizer):
             if grad is None:
                 raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
             moment_mode = group["moment_mode"]
-            if moment_mode in ("adafactor", "adafactor_ema"):
+            if moment_mode == "adafactor_ema":
                 grad = self._adafactor_dampen_full_grad(grad, group, state)
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
@@ -345,24 +345,11 @@ class SumoTrack(Optimizer):
 
         state["step"] = state.get("step", 0) + 1
         moment_mode = group["moment_mode"]
-        if moment_mode == "ema":
-            if projected_exp_avg is None:
-                projected_exp_avg = torch.zeros_like(projected_grad)
-            projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
-        elif moment_mode == "none":
-            # No momentum, no dampening: Aurora sees the (clipped) projected
-            # gradient directly, unsmoothed step to step.
-            projected_exp_avg = projected_grad
-        elif moment_mode == "second_moment":
-            projected_exp_avg = self._second_moment_dampen(projected_grad, group, state)
-        elif moment_mode == "adafactor":
-            # Full-gradient dampening already applied above; the projected moment
-            # slot is simply the (already dampened) projected gradient itself.
-            projected_exp_avg = projected_grad
-        elif moment_mode == "adafactor_ema":
-            # Same full-gradient Adafactor dampening as adafactor mode, but the
-            # dampened+projected gradient still feeds a first-moment EMA (same
-            # beta as ema mode) instead of replacing the moment slot outright.
+        if moment_mode in ("ema", "adafactor_ema"):
+            # adafactor_ema applies the same full-gradient Adafactor dampening
+            # above (before basis refresh and projection); the dampened,
+            # projected gradient still feeds this same first-moment EMA rather
+            # than replacing the moment slot outright.
             if projected_exp_avg is None:
                 projected_exp_avg = torch.zeros_like(projected_grad)
             projected_exp_avg.mul_(group["beta"]).add_(projected_grad, alpha=1.0 - group["beta"])
@@ -379,41 +366,14 @@ class SumoTrack(Optimizer):
         )
 
     @staticmethod
-    def _second_moment_dampen(projected_grad: Tensor, group: dict, state: dict) -> Tensor:
-        """Arm 2: no first-moment EMA; feed grad / sqrt(v_hat) into Aurora instead.
-
-        Tracks a bias-corrected elementwise EMA of squared projected gradients
-        (RMSprop/Adam-v2-style) and dampens the *current* projected gradient by
-        it. There is no momentum state; each step's Aurora input depends only on
-        the current gradient and the running second-moment estimate.
-        """
-
-        beta2 = group["second_moment_beta"]
-        eps = group["eps"]
-        step = state["step"]
-        v = state.get("second_moment")
-        if v is None:
-            # Matches ema mode's moment dtype (param dtype, typically bf16): PLAN.md's
-            # fp32-moment migration found no quality benefit, so this arm should not get
-            # a free precision advantage over ema by defaulting to fp32 accumulation.
-            v = torch.zeros_like(projected_grad)
-        grad32 = projected_grad.float()
-        v32 = v.float()
-        v32.mul_(beta2).addcmul_(grad32, grad32, value=1.0 - beta2)
-        state["second_moment"] = v32.to(dtype=projected_grad.dtype)
-        bias_correction = 1.0 - beta2**step
-        v_hat = v32 / bias_correction
-        dampened = grad32 / (v_hat.sqrt() + eps)
-        return dampened.to(dtype=projected_grad.dtype)
-
-    @staticmethod
     def _adafactor_dampen_full_grad(grad: Tensor, group: dict, state: dict) -> Tensor:
-        """Arms 3/4: Adafactor-style row/col factored second moment on the full
-        gradient, applied before basis refresh and before projection so the
-        same dampened gradient feeds both consumers. No first-moment EMA.
+        """Adafactor-style row/col factored second moment on the full gradient,
+        applied before basis refresh and before projection so the same dampened
+        gradient feeds both consumers, then still passed through the same
+        first-moment EMA as ema mode.
         """
 
-        beta2 = group["second_moment_beta"]
+        beta2 = group["adafactor_beta2"]
         eps = group["adafactor_eps"]
         step = state.get("adafactor_step", 0) + 1
         state["adafactor_step"] = step

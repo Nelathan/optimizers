@@ -882,7 +882,7 @@ def run_optimizer(
             beta=args.beta,
             basis_init=args.basis_init,
             moment_mode=args.moment_mode,
-            second_moment_beta=args.second_moment_beta,
+            adafactor_beta2=args.adafactor_beta2,
             grassmann_step_size=args.grassmann_step_size,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
@@ -1121,11 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta", type=float, default=0.9)
     parser.add_argument(
         "--moment-mode",
-        choices=("ema", "none", "second_moment", "adafactor", "adafactor_ema"),
-        default="ema",
-        help="projected moment ablation: ema is the default first-moment path; none removes momentum entirely and feeds the (clipped) projected gradient straight into Aurora; second_moment drops the EMA and feeds grad/sqrt(v_hat) into Aurora; adafactor drops the EMA and dampens the full gradient with a row/col factored second moment before basis refresh and projection; adafactor_ema applies the same full-gradient Adafactor dampening but still feeds the result through a first-moment EMA (--beta) instead of replacing the moment slot outright",
+        choices=("ema", "adafactor_ema"),
+        default="adafactor_ema",
+        help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis refresh and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
-    parser.add_argument("--second-moment-beta", type=float, default=0.99, help="EMA beta for --moment-mode second_moment/adafactor/adafactor_ema second-moment tracking")
+    parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
     parser.add_argument("--grassmann-step-size", type=float, default=0.01)
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
     parser.add_argument(
@@ -1136,8 +1136,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
-    parser.add_argument("--projected-grad-clip-norm", type=float, default=2.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables")
-    parser.add_argument("--projected-grad-clip-ratio", type=float, default=6.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables")
+    parser.add_argument("--projected-grad-clip-norm", type=float, default=2000.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. Tuned for adafactor_ema's native scale (~1800-2000, stable, safety-backstop only); --moment-mode ema needs a much tighter override, e.g. 2.0")
+    parser.add_argument("--projected-grad-clip-ratio", type=float, default=0.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables. adafactor_ema's projected-grad norm is stable so this rail is unnecessary there; --moment-mode ema needs it re-enabled, e.g. 6.0")
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
     parser.add_argument(
         "--torch-compile",
@@ -1210,10 +1210,10 @@ def main() -> None:
         raise ValueError("projected_grad_clip_ratio must be non-negative")
     if args.lr_warmup_steps < 0:
         raise ValueError("lr_warmup_steps must be non-negative")
-    if not 0 <= args.second_moment_beta < 1:
-        raise ValueError("second_moment_beta must be in [0, 1)")
-    if args.moment_mode in ("adafactor", "adafactor_ema") and args.projected_activation_backend != "off":
-        raise ValueError("--moment-mode adafactor/adafactor_ema dampens the full gradient before projection and is incompatible with --projected-activation-backend")
+    if not 0 <= args.adafactor_beta2 < 1:
+        raise ValueError("adafactor_beta2 must be in [0, 1)")
+    if args.moment_mode == "adafactor_ema" and args.projected_activation_backend != "off":
+        raise ValueError("--moment-mode adafactor_ema dampens the full gradient before projection and is incompatible with --projected-activation-backend")
     if args.aurora_pp_iterations <= 0:
         raise ValueError("aurora_pp_iterations must be positive")
     if not 1 <= args.polar_ns_steps <= 5:

@@ -43,7 +43,7 @@ class SumoTrackTest(unittest.TestCase):
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100)
+        opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100, moment_mode="ema")
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -60,7 +60,7 @@ class SumoTrackTest(unittest.TestCase):
 
     def test_projected_grad_ratio_clip_bounds_gradient_relative_to_moment(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_ratio=2.0, basis_refresh_interval=100)
+        opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_ratio=2.0, basis_refresh_interval=100, moment_mode="ema")
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -105,8 +105,8 @@ class SumoTrackTest(unittest.TestCase):
         step_grad = torch.randn_like(base)
         full_weight = torch.nn.Parameter(base.clone())
         queued_weight = torch.nn.Parameter(base.clone())
-        full_opt = SumoTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100)
-        queued_opt = SumoTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100)
+        full_opt = SumoTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema")
+        queued_opt = SumoTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema")
 
         full_weight.grad = warm_grad.clone()
         queued_weight.grad = warm_grad.clone()
@@ -128,7 +128,7 @@ class SumoTrackTest(unittest.TestCase):
 
     def test_queued_projected_grad_requires_initialized_basis(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = SumoTrack([weight], lr=0.01, rank=2, side="right")
+        opt = SumoTrack([weight], lr=0.01, rank=2, side="right", moment_mode="ema")
 
         opt.queue_projected_grad(weight, torch.randn(6, 2))
 
@@ -137,7 +137,7 @@ class SumoTrackTest(unittest.TestCase):
 
     def test_queued_projected_grad_rejects_refresh_step_without_full_grad(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = SumoTrack([weight], lr=0.01, rank=2, side="right", basis_refresh_interval=1)
+        opt = SumoTrack([weight], lr=0.01, rank=2, side="right", basis_refresh_interval=1, moment_mode="ema")
         weight.grad = torch.randn_like(weight)
         opt.step()
         projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
@@ -468,6 +468,7 @@ class SumoTrackTest(unittest.TestCase):
             rank=2,
             grassmann_step_size=0.01,
             basis_refresh_interval=1,
+            moment_mode="ema",
         )
 
         weight.grad = torch.randn_like(weight)
