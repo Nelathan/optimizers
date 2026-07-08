@@ -74,20 +74,23 @@ def scalar(value: float | int | torch.Tensor) -> float:
     return float(value.detach().float().cpu())
 
 
-def mean_scalar(values: list[float | int | torch.Tensor]) -> float:
-    finite = []
-    for value in values:
+def last_finite_scalar(values: list[float | int | torch.Tensor]) -> float:
+    """Last non-NaN value, e.g. the last real basis refresh event rather than
+    whatever step happened to be logged last (which is NaN on non-refresh steps).
+    """
+
+    for value in reversed(values):
         number = scalar(value)
         if number == number:
-            finite.append(number)
-    return sum(finite) / len(finite) if finite else float("nan")
+            return number
+    return float("nan")
 
 
-def optimizer_basis_rotation(optimizer: torch.optim.Optimizer) -> float:
+def optimizer_rotation_energy(optimizer: torch.optim.Optimizer) -> float:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
         return float("nan")
-    return float(diagnostics.get("mean_basis_rotation_chordal", float("nan")))
+    return float(diagnostics.get("mean_rotation_energy", float("nan")))
 
 
 def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float:
@@ -782,9 +785,11 @@ def train_step(
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
     projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
     projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
-    basis_rotation_chordal = optimizer_basis_rotation(optimizer) if collect_basis else float("nan")
+    rotation_energy = optimizer_rotation_energy(optimizer) if collect_basis else float("nan")
+    tangent_sigma_max = optimizer_diagnostic(optimizer, "mean_tangent_sigma_max") if collect_basis else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
+    aurora_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
     return {
@@ -795,9 +800,11 @@ def train_step(
         "update_to_param_ratio": update_to_param_ratio,
         "projected_grad_max_norm": projected_grad_max_norm,
         "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
-        "basis_rotation_chordal": basis_rotation_chordal,
+        "rotation_energy": rotation_energy,
+        "tangent_sigma_max": tangent_sigma_max,
         "aurora_alignment": aurora_alignment,
         "aurora_erank": aurora_erank,
+        "aurora_erank_pct": aurora_erank_pct,
     }
 
 
@@ -961,11 +968,22 @@ def run_optimizer(
                 f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
                 f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
                 f"{optimizer_name}/projected_grad_p90_to_moment_ratio": scalar(step_result["projected_grad_p90_to_moment_ratio"]),
-                f"{optimizer_name}/basis_rotation_chordal": scalar(step_result["basis_rotation_chordal"]),
                 f"{optimizer_name}/aurora_alignment": scalar(step_result["aurora_alignment"]),
                 f"{optimizer_name}/aurora_erank": scalar(step_result["aurora_erank"]),
+                f"{optimizer_name}/aurora_erank_pct": scalar(step_result["aurora_erank_pct"]),
                 f"{optimizer_name}/lr_scale": lr_scale,
             }
+            # rotation_energy/tangent_sigma_max are only meaningful on the
+            # rare step a basis refresh actually fires; omit them entirely on
+            # other steps rather than logging NaN, so wandb's per-run summary
+            # reflects the last real refresh event instead of whatever step
+            # happened to be logged last.
+            rotation_energy = scalar(step_result["rotation_energy"])
+            if rotation_energy == rotation_energy:
+                train_metrics[f"{optimizer_name}/rotation_energy"] = rotation_energy
+            tangent_sigma_max = scalar(step_result["tangent_sigma_max"])
+            if tangent_sigma_max == tangent_sigma_max:
+                train_metrics[f"{optimizer_name}/tangent_sigma_max"] = tangent_sigma_max
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1007,6 +1025,14 @@ def run_optimizer(
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     if not args.skip_validation:
         print_final_eval_sample(model, tokenizer, val_texts, args)
+        wandb_log(
+            wandb_run,
+            {
+                f"{optimizer_name}/target_val_loss": final_val,
+                f"{optimizer_name}/source_val_loss": final_retention_val,
+            },
+            step=global_step,
+        )
     post_eval_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     post_eval_peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
     measured_losses = [step["loss"] for step in measured_steps]
@@ -1016,9 +1042,11 @@ def run_optimizer(
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
     measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
-    measured_basis_rotation_chordal = [step["basis_rotation_chordal"] for step in measured_steps]
+    measured_rotation_energy = [step["rotation_energy"] for step in measured_steps]
+    measured_tangent_sigma_max = [step["tangent_sigma_max"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
+    measured_aurora_erank_pct = [step["aurora_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
@@ -1061,15 +1089,20 @@ def run_optimizer(
         "final_retention_val_loss": final_retention_val,
         "retention_val_loss_delta": final_retention_val - initial_retention_val,
         "last_measured_train_loss": scalar(measured_losses[-1]),
-        "mean_logged_grad_norm": mean_scalar(measured_grad_norms),
-        "mean_logged_param_norm": mean_scalar(measured_param_norms),
-        "mean_logged_update_norm": mean_scalar(measured_update_norms),
-        "mean_logged_update_to_param_ratio": mean_scalar(measured_update_to_param_ratios),
-        "mean_logged_projected_grad_max_norm": mean_scalar(measured_projected_grad_max_norms),
-        "mean_logged_projected_grad_p90_to_moment_ratio": mean_scalar(measured_projected_grad_p90_to_moment_ratios),
-        "mean_logged_basis_rotation_chordal": mean_scalar(measured_basis_rotation_chordal),
-        "mean_logged_aurora_alignment": mean_scalar(measured_aurora_alignment),
-        "mean_logged_aurora_erank": mean_scalar(measured_aurora_erank),
+        "last_logged_grad_norm": last_finite_scalar(measured_grad_norms),
+        "last_logged_param_norm": last_finite_scalar(measured_param_norms),
+        "last_logged_update_norm": last_finite_scalar(measured_update_norms),
+        "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
+        "last_logged_projected_grad_max_norm": last_finite_scalar(measured_projected_grad_max_norms),
+        "last_logged_projected_grad_p90_to_moment_ratio": last_finite_scalar(measured_projected_grad_p90_to_moment_ratios),
+        # rotation_energy/tangent_sigma_max are only defined on refresh
+        # steps; last_finite_scalar reports the last real refresh event rather
+        # than mixing in NaN gaps.
+        "last_logged_rotation_energy": last_finite_scalar(measured_rotation_energy),
+        "last_logged_tangent_sigma_max": last_finite_scalar(measured_tangent_sigma_max),
+        "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
+        "last_logged_aurora_erank": last_finite_scalar(measured_aurora_erank),
+        "last_logged_aurora_erank_pct": last_finite_scalar(measured_aurora_erank_pct),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_train_elapsed_seconds": training_elapsed,
         "measured_eval_elapsed_seconds": eval_elapsed,
@@ -1126,7 +1159,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis refresh and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.01)
+    parser.add_argument("--grassmann-step-size", type=float, default=1e4)
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
     parser.add_argument(
         "--basis-refresh-schedule",

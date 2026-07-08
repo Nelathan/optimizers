@@ -41,6 +41,8 @@ class SubspaceProjector:
     init_method: ProjectorInitMethod | str = ProjectorInitMethod.EIGH
     basis: Tensor | None = None
     resolved_side: ProjectionSide | None = field(default=None, init=False)
+    last_tangent_sigma_max: float = field(default=float("nan"), init=False)
+    last_rotation_energy: float = field(default=float("nan"), init=False)
 
     def __post_init__(self) -> None:
         if self.rank <= 0:
@@ -164,12 +166,20 @@ class SubspaceProjector:
 
     @torch.no_grad()
     def update_grassmann(self, matrix: Tensor, step_size: float) -> Tensor:
-        """Refresh the basis with a small Grassmann/Stiefel tangent step.
+        """Refresh the basis with a Grassmann geodesic tangent step.
 
-        The update minimizes the residual of projecting ``matrix`` into the
-        current basis, then retracts with QR. This is intentionally device-safe
-        and dtype-safe rather than a literal port of SubTrack's CUDA-bound
-        rank-1 geodesic update.
+        Port of SubTrack's ``track_the_subspace``: project the least-squares
+        residual onto the tangent space at the current (column-orthonormal) basis,
+        take its top-``rank`` singular triple, and retract along the exact geodesic
+        (``cos``/``sin`` rotation of the ``[Q@V, U]`` principal-angle frame) rather
+        than a first-order QR retraction. SubTrack calls this with ``k=1``; ``k=rank``
+        here is the direct spectral generalization to a rank-``r`` tracked subspace.
+
+        The rotation is ``step_size * sigma`` with raw singular values (self-annealing:
+        big residual -> big step, well-fit -> small step, so the tracker settles).
+        The one storage-layout adaptation: RIGHT-side bases are stored row-orthonormal
+        and are transposed into SubTrack's column-orthonormal convention before the
+        shared geodesic and transposed back after.
         """
 
         if step_size <= 0:
@@ -181,22 +191,72 @@ class SubspaceProjector:
         work_matrix = work_matrix / norm.clamp_min(1e-12)
         work_basis = basis.float() if basis.dtype in (torch.float16, torch.bfloat16) else basis
 
+        # SubTrack's track_the_subspace is defined for a COLUMN-orthonormal basis
+        # Q:[dim, rank] with the gradient G:[dim, cols] laid out so Q projects its
+        # rows. Its tangent is (I - Q Q.T) @ partial -- the partial with its
+        # Q-column-space component removed from the LEFT, which is exactly what makes
+        # the left-singular vectors U orthogonal to Q so that [Q@V, U] is a valid
+        # orthonormal 2k-frame. Our RIGHT basis is stored row-orthonormal [rank, n];
+        # transpose it (and G) into that canonical [dim, rank] form, run the one
+        # shared geodesic, then transpose the result back. LEFT is already canonical.
         if side is ProjectionSide.RIGHT:
-            projected = work_matrix @ work_basis.mT
-            residual = work_matrix - projected @ work_basis
-            partial = -2.0 * (projected.mT @ residual)
-            tangent = partial - (partial @ work_basis.mT) @ work_basis
-            new_basis = self._orthonormalize_rows(work_basis - step_size * tangent)
+            canon_basis = work_basis.mT  # [n, rank], column-orthonormal
+            canon_grad = work_matrix.mT  # [n, rows]
         else:
-            projected = work_basis.mT @ work_matrix
-            residual = work_matrix - work_basis @ projected
-            partial = -2.0 * (residual @ projected.mT)
-            tangent = partial - work_basis @ (work_basis.mT @ partial)
-            new_basis = self._orthonormalize_columns(work_basis - step_size * tangent)
+            canon_basis = work_basis  # [m, rank], column-orthonormal
+            canon_grad = work_matrix  # [m, cols]
+
+        # Least-squares residual of projecting the gradient into the current basis,
+        # then the Euclidean gradient of ||residual||^2 w.r.t. the basis, projected
+        # onto the tangent space at Q (component orthogonal to Q's columns).
+        estimated_w = canon_basis.mT @ canon_grad
+        residual = canon_grad - canon_basis @ estimated_w
+        partial = -2.0 * (residual @ estimated_w.mT)
+        tangent = partial - canon_basis @ (canon_basis.mT @ partial)
+
+        eff_rank = min(canon_basis.shape[1], tangent.shape[0], tangent.shape[1])
+        singular_u, singular_values, singular_v = self._rank_k_svd(tangent, eff_rank)
+        self.last_tangent_sigma_max = float(singular_values.max().detach().cpu()) if singular_values.numel() else float("nan")
+
+        # Self-annealing geodesic retraction, faithful to SubTrack: rotate each
+        # principal direction by ``step_size * sigma_i`` (raw singular values, not
+        # normalized). This is deliberately NOT scale-free -- sigma carries the
+        # residual magnitude, so a poorly-fit basis takes big steps and a well-fit
+        # one takes small ones, letting the tracker settle to a fixed point instead
+        # of being forced back to a constant top-angle every refresh. We briefly
+        # normalized by sigma_max to fight a drifting sigma, but that drift was the
+        # frame bug injecting garbage into the tangent; with the frame fixed sigma is
+        # stable on its own, and normalizing actively re-inflated the residual tail
+        # each refresh, preventing convergence (chordal rose instead of shrinking).
+        # step_size is back in SubTrack's units (their default is 1e4), tuned against
+        # our sigma scale rather than borrowed.
+        rotation = step_size * singular_values
+        # Direct rotation signal: total rotation energy = sum over all directions of
+        # |sin(step_size * sigma_i)|. 0 = basis static (no-op step), larger = more
+        # total subspace rotation this refresh. Read from the quantity that actually
+        # drives the geodesic, so unlike a chordal SVD of the result it has no
+        # rank-dependent float-noise floor.
+        self.last_rotation_energy = float(torch.sin(rotation).abs().sum().detach().cpu()) if rotation.numel() else float("nan")
+        cos_block = torch.diag(torch.cos(rotation))
+        sin_block = torch.diag(torch.sin(-rotation))
+        basis_v = canon_basis @ singular_v
+        rotated = torch.cat([basis_v, singular_u], dim=1) @ torch.cat([cos_block, sin_block], dim=0)
+        eye_rank = torch.eye(singular_v.shape[0], device=canon_basis.device, dtype=canon_basis.dtype)
+        canon_new = rotated @ singular_v.mT + canon_basis @ (eye_rank - singular_v @ singular_v.mT)
+
+        # Back to storage layout: RIGHT is stored row-orthonormal, LEFT column-orthonormal.
+        new_basis = canon_new.mT if side is ProjectionSide.RIGHT else canon_new
 
         self.basis = new_basis.to(device=matrix.device, dtype=matrix.dtype).contiguous()
         self.resolved_side = side
         return self.basis
+
+    @staticmethod
+    def _rank_k_svd(matrix: Tensor, k: int) -> tuple[Tensor, Tensor, Tensor]:
+        """Top-``k`` singular triple ``(U, sigma, V)`` with ``V`` as columns (not V^T)."""
+
+        u, sigma, vh = torch.linalg.svd(matrix, full_matrices=False)
+        return u[:, :k], sigma[:k], vh.mT[:, :k]
 
     @torch.no_grad()
     def orthonormality_error(self) -> Tensor:

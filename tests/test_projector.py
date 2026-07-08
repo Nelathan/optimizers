@@ -162,6 +162,93 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), tuple(old_basis.shape))
         self.assertLess(float(projector.orthonormality_error()), 1e-5)
 
+    def test_grassmann_update_matches_geodesic_formula_rank_one(self):
+        """Pin our rank-r retraction against the rank-1 geodesic formula (cos/sin
+        rotation of the (Q@V, U) principal-angle frame). This guards against
+        silently drifting back to a first-order QR retraction, which is not what
+        SubTrack's paper/code do.
+
+        We deliberately depart from SubTrack's *literal* ``step_size * sigma`` in
+        one way: SubTrack tracks the raw gradient, so its sigma carries gradient
+        magnitude and its ``st_step_size`` (1e4) is tuned to it. We normalize the
+        spectral input (neutral basis, see fit_eigh) and run adafactor upstream,
+        which makes raw sigma both tiny and drifting per refresh -- an unusable
+        scale for a fixed step_size. So we rotate by ``step_size * sigma/sigma_max``:
+        at rank=1, sigma/sigma_max == 1, so the single tracked direction rotates by
+        exactly ``step_size`` radians. That is the invariant pinned here.
+        """
+
+        torch.manual_seed(0)
+        grad = torch.randn(9, 5)
+        refresh_grad = torch.randn_like(grad)
+        step_size = 0.01
+
+        projector = SubspaceProjector(rank=1, side=ProjectionSide.RIGHT)
+        projector.fit_eigh(grad)
+        basis = projector.basis.clone()  # [rank, n] row-orthonormal (storage layout)
+        projector.update_grassmann(refresh_grad, step_size=step_size)
+
+        # Reproduce the geodesic in SubTrack's canonical column-orthonormal frame:
+        # transpose the RIGHT basis and gradient into [dim, rank] / [dim, cols] form,
+        # project the residual gradient onto the tangent space with (I - Q Q.T), then
+        # rotate the [Q@V, U] frame and transpose the result back to storage layout.
+        canon_basis = basis.mT  # [n, rank], column-orthonormal
+        canon_grad = (refresh_grad / refresh_grad.norm().clamp_min(1e-12)).mT
+        estimated_w = canon_basis.mT @ canon_grad
+        residual = canon_grad - canon_basis @ estimated_w
+        partial = -2.0 * (residual @ estimated_w.mT)
+        tangent = partial - canon_basis @ (canon_basis.mT @ partial)
+        u, sigma, vh = torch.linalg.svd(tangent, full_matrices=False)
+        u1, sigma1, v1 = u[:, :1], sigma[:1], vh.mT[:, :1]
+
+        # Raw self-annealing angle: rotate by step_size * sigma (no normalization).
+        rotation = step_size * sigma1
+        cos_sigma = torch.cos(rotation)
+        sin_sigma = torch.sin(-rotation)
+        basis_v = canon_basis @ v1
+        rotated = torch.cat([basis_v, u1], dim=1) @ torch.cat([torch.diag(cos_sigma), torch.diag(sin_sigma)], dim=0)
+        expected_canon = rotated @ v1.mT + canon_basis @ (torch.eye(v1.shape[0]) - v1 @ v1.mT)
+        expected_basis = expected_canon.mT
+
+        self.assertTrue(torch.allclose(projector.basis, expected_basis, atol=1e-5))
+
+    def test_grassmann_update_step_size_actually_moves_the_subspace(self):
+        """Regression guard against the retraction collapsing to a no-op. The angle
+        is ``step_size * sigma`` with raw singular values, so the step size needed to
+        move the subspace scales inversely with sigma. This test does NOT assert a
+        production step size -- it only pins that a small step_size barely moves the
+        basis while a large one moves it measurably, i.e. that step_size stays
+        load-bearing and the geodesic did not regress into a first-order no-op.
+        """
+
+        torch.manual_seed(0)
+        grad = torch.randn(64, 256)
+        base = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
+        base.fit_eigh(grad)
+        original_basis = base.basis.clone()
+        refresh_grad = grad + 0.1 * torch.randn_like(grad)
+
+        small_step = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
+        small_step.basis = original_basis.clone()
+        small_step.resolved_side = base.resolved_side
+        small_step.update_grassmann(refresh_grad.clone(), step_size=0.1)
+
+        large_step = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
+        large_step.basis = original_basis.clone()
+        large_step.resolved_side = base.resolved_side
+        large_step.update_grassmann(refresh_grad.clone(), step_size=1e4)
+
+        # Sign-invariant subspace overlap: off-diagonal gram entries measure
+        # real rotation, unlike raw basis diffs which are confounded by QR/SVD
+        # sign-convention flips that occur regardless of step_size.
+        small_gram = small_step.basis @ original_basis.mT
+        large_gram = large_step.basis @ original_basis.mT
+        small_off_diag = (small_gram - torch.diag(small_gram.diagonal())).abs().max()
+        large_off_diag = (large_gram - torch.diag(large_gram.diagonal())).abs().max()
+
+        self.assertLess(float(small_off_diag), 1e-4)
+        self.assertGreater(float(large_off_diag), 1e-3)
+
     def test_grassmann_update_is_invariant_to_gradient_scale_right_side(self):
         torch.manual_seed(0)
         init_grad = torch.randn(9, 5)

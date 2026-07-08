@@ -56,7 +56,7 @@ class SumoTrack(Optimizer):
         moment_mode: str = "adafactor_ema",
         adafactor_beta2: float = 0.99,
         adafactor_eps: float = 1e-30,
-        grassmann_step_size: float = 0.01,
+        grassmann_step_size: float = 1e4,
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -227,10 +227,12 @@ class SumoTrack(Optimizer):
             "projected_leverage_min_ratio_sum": 0.0,
             "projected_leverage_max_ratio_sum": 0.0,
             "projected_leverage_tensors": 0,
-            "basis_rotation_chordal_sum": 0.0,
+            "rotation_energy_sum": 0.0,
+            "tangent_sigma_max_sum": 0.0,
             "basis_refresh_tensors": 0,
             "aurora_alignment_sum": 0.0,
             "aurora_erank_sum": 0.0,
+            "aurora_erank_pct_sum": 0.0,
             "aurora_health_tensors": 0,
         }
 
@@ -261,11 +263,13 @@ class SumoTrack(Optimizer):
         else:
             diagnostics["projected_grad_p90_to_moment_ratio"] = float("nan")
         basis_count = diagnostics["basis_refresh_tensors"]
-        diagnostics["mean_basis_rotation_chordal"] = diagnostics["basis_rotation_chordal_sum"] / basis_count if basis_count else float("nan")
+        diagnostics["mean_rotation_energy"] = diagnostics["rotation_energy_sum"] / basis_count if basis_count else float("nan")
+        diagnostics["mean_tangent_sigma_max"] = diagnostics["tangent_sigma_max_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
         aurora_count = diagnostics["aurora_health_tensors"]
         diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
+        diagnostics["mean_aurora_erank_pct"] = diagnostics["aurora_erank_pct_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["aurora_health_tensors"] = float(aurora_count)
         return diagnostics
 
@@ -439,6 +443,7 @@ class SumoTrack(Optimizer):
                 erank = self._effective_rank(entry.projected_exp_avg)
                 diagnostics["aurora_alignment_sum"] += alignment
                 diagnostics["aurora_erank_sum"] += erank
+                diagnostics["aurora_erank_pct_sum"] += erank / min(entry.projected_exp_avg.shape)
                 diagnostics["aurora_health_tensors"] += 1
         update = entry.projector.project_back(update_hat).to(dtype=entry.param.dtype)
 
@@ -506,8 +511,7 @@ class SumoTrack(Optimizer):
             projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
 
         if old_projector is not None and diagnostics is not None and self.diagnostics_basis_enabled:
-            chordal = self._basis_rotation_chordal(old_projector, projector)
-            self._accumulate_basis_diagnostics(diagnostics, chordal)
+            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_energy, projector.last_tangent_sigma_max)
 
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
@@ -533,23 +537,9 @@ class SumoTrack(Optimizer):
         return (projector.basis.shape[1], p.shape[1])
 
     @staticmethod
-    def _basis_columns(projector: SubspaceProjector) -> Tensor:
-        if projector.basis is None:
-            raise RuntimeError("basis is not initialized")
-        side = projector.resolved_side if projector.resolved_side is not None else projector.side
-        return projector.basis.mT.float() if side is ProjectionSide.RIGHT else projector.basis.float()
-
-    @staticmethod
-    def _basis_rotation_chordal(old_projector: SubspaceProjector, new_projector: SubspaceProjector) -> float:
-        old_columns = SumoTrack._basis_columns(old_projector)
-        new_columns = SumoTrack._basis_columns(new_projector)
-        singular_values = torch.linalg.svdvals(old_columns.mT @ new_columns).clamp(0.0, 1.0)
-        chordal = (1.0 - singular_values.square()).sum().sqrt()
-        return float(chordal.detach().cpu())
-
-    @staticmethod
-    def _accumulate_basis_diagnostics(diagnostics: dict, chordal: float) -> None:
-        diagnostics["basis_rotation_chordal_sum"] += chordal
+    def _accumulate_basis_diagnostics(diagnostics: dict, rotation_energy: float, tangent_sigma_max: float) -> None:
+        diagnostics["rotation_energy_sum"] += rotation_energy
+        diagnostics["tangent_sigma_max_sum"] += tangent_sigma_max
         diagnostics["basis_refresh_tensors"] += 1
 
     @staticmethod
