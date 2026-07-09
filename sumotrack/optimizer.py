@@ -56,7 +56,9 @@ class SumoTrack(Optimizer):
         moment_mode: str = "adafactor_ema",
         adafactor_beta2: float = 0.99,
         adafactor_eps: float = 1e-30,
-        grassmann_step_size: float = 1e4,
+        grad_clip_norm: float | None = 10.0,
+        grassmann_step_size: float = 5.0,  # TEMPORARY: best estimate, not recalibrated for the fixed sigma scale (see SUBSPACE_TRACKING.md)
+        grassmann_sigma_clip: float = 0.1,
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -91,8 +93,12 @@ class SumoTrack(Optimizer):
             raise ValueError(f"adafactor_beta2 must be in [0, 1), got {adafactor_beta2}")
         if adafactor_eps <= 0:
             raise ValueError(f"adafactor_eps must be positive, got {adafactor_eps}")
+        if grad_clip_norm is not None and grad_clip_norm <= 0:
+            raise ValueError(f"grad_clip_norm must be positive when set, got {grad_clip_norm}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
+        if grassmann_sigma_clip <= 0:
+            raise ValueError(f"grassmann_sigma_clip must be positive, got {grassmann_sigma_clip}")
         if basis_refresh_interval <= 0:
             raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
         if aurora_pp_iterations <= 0:
@@ -116,7 +122,9 @@ class SumoTrack(Optimizer):
             moment_mode=moment_mode,
             adafactor_beta2=adafactor_beta2,
             adafactor_eps=adafactor_eps,
+            grad_clip_norm=grad_clip_norm,
             grassmann_step_size=grassmann_step_size,
+            grassmann_sigma_clip=grassmann_sigma_clip,
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
@@ -227,7 +235,7 @@ class SumoTrack(Optimizer):
             "projected_leverage_min_ratio_sum": 0.0,
             "projected_leverage_max_ratio_sum": 0.0,
             "projected_leverage_tensors": 0,
-            "rotation_energy_sum": 0.0,
+            "rotation_angle_sum": 0.0,
             "tangent_sigma_max_sum": 0.0,
             "basis_refresh_tensors": 0,
             "aurora_alignment_sum": 0.0,
@@ -263,7 +271,7 @@ class SumoTrack(Optimizer):
         else:
             diagnostics["projected_grad_p90_to_moment_ratio"] = float("nan")
         basis_count = diagnostics["basis_refresh_tensors"]
-        diagnostics["mean_rotation_energy"] = diagnostics["rotation_energy_sum"] / basis_count if basis_count else float("nan")
+        diagnostics["mean_rotation_angle"] = diagnostics["rotation_angle_sum"] / basis_count if basis_count else float("nan")
         diagnostics["mean_tangent_sigma_max"] = diagnostics["tangent_sigma_max_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
         aurora_count = diagnostics["aurora_health_tensors"]
@@ -319,6 +327,21 @@ class SumoTrack(Optimizer):
         else:
             if grad is None:
                 raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+            # Clip the RAW gradient before it reaches adafactor. A blip batch (grad
+            # norm spiking ~180x) otherwise poisons the adafactor row/col second
+            # moment: grad_sq of the blip is ~30000x normal, and with beta2=0.99 that
+            # spike decays over ~100 steps, over-dampening whole gradient directions
+            # for the entire window -- the basis then tracks a *starved* residual and
+            # each subsequent refresh adapts to the corruption (observed: a single
+            # step-54 blip collapsed alignment for the whole back half of a 100-step
+            # run). Clipping here protects adafactor's state, the basis refresh, and
+            # the projection in one place -- upstream of everything, which is why the
+            # projected-grad clip (downstream, moment-only) could not stop it.
+            grad_clip_norm = group.get("grad_clip_norm")
+            if grad_clip_norm is not None:
+                raw_norm = grad.float().norm()
+                clip_scale = (grad.new_tensor(float(grad_clip_norm)) / raw_norm.clamp_min(1e-12)).clamp(max=1.0)
+                grad = grad.mul(clip_scale)
             moment_mode = group["moment_mode"]
             if moment_mode == "adafactor_ema":
                 grad = self._adafactor_dampen_full_grad(grad, group, state)
@@ -402,6 +425,19 @@ class SumoTrack(Optimizer):
         # sum-based normalizer is row_hat.mean() (mean of means == sum/n cancelling n).
         factor = (row_hat.unsqueeze(1) @ col_hat.unsqueeze(0)) / row_hat.mean().clamp_min(eps)
         dampened = grad32 / factor.sqrt().clamp_min(eps)
+        # Restore the raw gradient's scale. The factored second moment normalizes each
+        # element to RMS~1, which is Adafactor's *direction* convention but blows the
+        # magnitude up: an RMS-1 [m,n] matrix has Frobenius norm sqrt(m*n) (e.g. ~2610
+        # for a 6656x1024 MLP grad, ~261x a norm-10 raw grad). Real Adafactor hides
+        # this behind the learning rate; we feed the dampened grad into the basis
+        # tracker's tangent/sigma path, where sigma scales *quadratically* with
+        # magnitude and so explodes (~1e5). Rescaling to the raw grad's RMS keeps
+        # Adafactor's SNR reweighting (the point) while restoring scale: dampened is
+        # RMS-1, so multiplying by grad's RMS makes it RMS-match the raw grad
+        # per-element. This returns projected-grad norm to the pre-Adafactor regime
+        # (~1.77 at rank 32), which is why the clip rail belongs back at ~2, not 2000.
+        grad_rms = grad32.square().mean().sqrt().clamp_min(eps)
+        dampened = dampened * grad_rms
         return dampened.to(dtype=grad.dtype)
 
     def _apply_matrix_update_buckets(self, entries: list[MatrixUpdate], group: dict, diagnostics: dict | None) -> None:
@@ -508,10 +544,14 @@ class SumoTrack(Optimizer):
         if not projector.is_initialized:
             projector.fit(grad)
         else:
-            projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+            projector.update_grassmann(
+                grad,
+                step_size=group["grassmann_step_size"],
+                sigma_clip=group["grassmann_sigma_clip"],
+            )
 
         if old_projector is not None and diagnostics is not None and self.diagnostics_basis_enabled:
-            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_energy, projector.last_tangent_sigma_max)
+            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle, projector.last_tangent_sigma_max)
 
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
@@ -537,8 +577,8 @@ class SumoTrack(Optimizer):
         return (projector.basis.shape[1], p.shape[1])
 
     @staticmethod
-    def _accumulate_basis_diagnostics(diagnostics: dict, rotation_energy: float, tangent_sigma_max: float) -> None:
-        diagnostics["rotation_energy_sum"] += rotation_energy
+    def _accumulate_basis_diagnostics(diagnostics: dict, rotation_angle: float, tangent_sigma_max: float) -> None:
+        diagnostics["rotation_angle_sum"] += rotation_angle
         diagnostics["tangent_sigma_max_sum"] += tangent_sigma_max
         diagnostics["basis_refresh_tensors"] += 1
 

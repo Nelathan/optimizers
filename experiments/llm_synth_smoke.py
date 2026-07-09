@@ -86,11 +86,11 @@ def last_finite_scalar(values: list[float | int | torch.Tensor]) -> float:
     return float("nan")
 
 
-def optimizer_rotation_energy(optimizer: torch.optim.Optimizer) -> float:
+def optimizer_rotation_angle(optimizer: torch.optim.Optimizer) -> float:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
         return float("nan")
-    return float(diagnostics.get("mean_rotation_energy", float("nan")))
+    return float(diagnostics.get("mean_rotation_angle", float("nan")))
 
 
 def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float:
@@ -785,7 +785,7 @@ def train_step(
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
     projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
     projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
-    rotation_energy = optimizer_rotation_energy(optimizer) if collect_basis else float("nan")
+    rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
     tangent_sigma_max = optimizer_diagnostic(optimizer, "mean_tangent_sigma_max") if collect_basis else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
@@ -800,7 +800,7 @@ def train_step(
         "update_to_param_ratio": update_to_param_ratio,
         "projected_grad_max_norm": projected_grad_max_norm,
         "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
-        "rotation_energy": rotation_energy,
+        "rotation_angle": rotation_angle,
         "tangent_sigma_max": tangent_sigma_max,
         "aurora_alignment": aurora_alignment,
         "aurora_erank": aurora_erank,
@@ -890,7 +890,9 @@ def run_optimizer(
             basis_init=args.basis_init,
             moment_mode=args.moment_mode,
             adafactor_beta2=args.adafactor_beta2,
+            grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
             grassmann_step_size=args.grassmann_step_size,
+            grassmann_sigma_clip=args.grassmann_sigma_clip,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
@@ -973,14 +975,14 @@ def run_optimizer(
                 f"{optimizer_name}/aurora_erank_pct": scalar(step_result["aurora_erank_pct"]),
                 f"{optimizer_name}/lr_scale": lr_scale,
             }
-            # rotation_energy/tangent_sigma_max are only meaningful on the
+            # rotation_angle/tangent_sigma_max are only meaningful on the
             # rare step a basis refresh actually fires; omit them entirely on
             # other steps rather than logging NaN, so wandb's per-run summary
             # reflects the last real refresh event instead of whatever step
             # happened to be logged last.
-            rotation_energy = scalar(step_result["rotation_energy"])
-            if rotation_energy == rotation_energy:
-                train_metrics[f"{optimizer_name}/rotation_energy"] = rotation_energy
+            rotation_angle = scalar(step_result["rotation_angle"])
+            if rotation_angle == rotation_angle:
+                train_metrics[f"{optimizer_name}/rotation_angle"] = rotation_angle
             tangent_sigma_max = scalar(step_result["tangent_sigma_max"])
             if tangent_sigma_max == tangent_sigma_max:
                 train_metrics[f"{optimizer_name}/tangent_sigma_max"] = tangent_sigma_max
@@ -1042,7 +1044,7 @@ def run_optimizer(
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
     measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
-    measured_rotation_energy = [step["rotation_energy"] for step in measured_steps]
+    measured_rotation_angle = [step["rotation_angle"] for step in measured_steps]
     measured_tangent_sigma_max = [step["tangent_sigma_max"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
@@ -1095,10 +1097,10 @@ def run_optimizer(
         "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
         "last_logged_projected_grad_max_norm": last_finite_scalar(measured_projected_grad_max_norms),
         "last_logged_projected_grad_p90_to_moment_ratio": last_finite_scalar(measured_projected_grad_p90_to_moment_ratios),
-        # rotation_energy/tangent_sigma_max are only defined on refresh
+        # rotation_angle/tangent_sigma_max are only defined on refresh
         # steps; last_finite_scalar reports the last real refresh event rather
         # than mixing in NaN gaps.
-        "last_logged_rotation_energy": last_finite_scalar(measured_rotation_energy),
+        "last_logged_rotation_angle": last_finite_scalar(measured_rotation_angle),
         "last_logged_tangent_sigma_max": last_finite_scalar(measured_tangent_sigma_max),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
         "last_logged_aurora_erank": last_finite_scalar(measured_aurora_erank),
@@ -1159,7 +1161,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis refresh and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
-    parser.add_argument("--grassmann-step-size", type=float, default=1e4)
+    parser.add_argument("--grad-clip-norm", type=float, default=10.0, help="clip the RAW gradient to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 10 sits just above the post-warmup grad body (mostly <10) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
+    parser.add_argument("--grassmann-step-size", type=float, default=5.0, help="TEMPORARY default: best current estimate, NOT recalibrated for the fixed sigma scale (sigma dropped ~10x after the normalization/adafactor fixes). Recalibrate before trusting. See SUBSPACE_TRACKING.md.")
+    parser.add_argument("--grassmann-sigma-clip", type=float, default=0.1, help="cap on the tangent singular value used for the rotation angle; bounds how far a single noisy batch can rotate the basis, letting step_size be raised. Surgical to the tracker (adafactor/moment path sees the raw grad). Safety cap, not denoising -- that is the accumulation lattice's job.")
     parser.add_argument("--basis-refresh-interval", type=int, default=100)
     parser.add_argument(
         "--basis-refresh-schedule",
@@ -1169,7 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
-    parser.add_argument("--projected-grad-clip-norm", type=float, default=2000.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. Tuned for adafactor_ema's native scale (~1800-2000, stable, safety-backstop only); --moment-mode ema needs a much tighter override, e.g. 2.0")
+    parser.add_argument("--projected-grad-clip-norm", type=float, default=0.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. OFF now: raw-grad clipping (--grad-clip-norm) bounds the gradient upstream of adafactor/projection, which makes this downstream moment-only clip redundant (and it could not stop a blip from poisoning adafactor's second moment anyway -- that damage is upstream). Re-enable only if a specific moment-scale failure reappears.")
     parser.add_argument("--projected-grad-clip-ratio", type=float, default=0.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables. adafactor_ema's projected-grad norm is stable so this rail is unnecessary there; --moment-mode ema needs it re-enabled, e.g. 6.0")
     parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
     parser.add_argument(

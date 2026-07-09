@@ -34,11 +34,23 @@ sidequest fixed both.
   `σ` are the tangent's singular values. It is **exactly orthonormal by
   construction** — no trailing QR/re-orthonormalization needed — *once the frame
   is built correctly*.
-- **k=rank, not k=1.** SubTrack always calls it with `k=1` (rotate the single
-  dominant direction). We use `k=eff_rank` (rotate the whole tracked spectrum at
-  once). This is the faithful spectral generalization, not a shortcut — see the
-  Masterplan for why k=1-vs-k=rank is actually a live research axis given our
-  flat tangent spectrum.
+- **k=1 — drift, not spin.** SubTrack rotates the *single* dominant tangent
+  direction per refresh (`rank_k_matrix_estimation(..., k=1)`); the rest of the
+  frame is carried unrotated by the `(I − V Vᵀ)` term. That is the intended
+  behaviour and it is what we now do. An earlier pass of *this* port had quietly
+  set `k=eff_rank` (rotate the whole spectrum at once) and back-justified it in
+  this doc as a "faithful spectral generalization." It was not a shared decision
+  and not the heading — it was an unacknowledged divergence introduced by the
+  port. Full-spectrum rotation *spins* the basis on the near-isotropic noise tail
+  and thrashes (this is the step-5/step-50 fragility we measured). Rank-1 lets the
+  basis **drift**: one controlled correction per refresh, noise averaged out
+  *through* the motion across refreshes rather than tracked. The Touge image is
+  exact — drift the line, don't spin the tires.
+  - Multi-rank rotation is **parked, not dead.** It may be worth revisiting, but
+    it is not the priority and was never signed off. The heading is drift.
+  - k=1 vs *stacked* rank-1 (accumulate per-step top-1 tangents, then rotate) is
+    the genuinely open axis — see the Masterplan. That is a real research
+    question; k=1-vs-full-spectrum is not.
 
 ### The frame bug (the real bug tests hid)
 - **SubTrack's geodesic is defined for a COLUMN-orthonormal basis `Q:[dim,rank]`**
@@ -79,14 +91,87 @@ sidequest fixed both.
   to the spectrum's *shape* (shrinks it for high-rank/flat tangents),
   reintroducing exactly the drift we're removing. But the current answer is: **do
   not normalize; use raw `σ`.**
+- *(Superseded description above:* "we normalize the spectral input to unit norm"
+  *was true until this was fixed — see next entry. The input normalization is GONE.)*
+
+### The σ poison and the adafactor RMS inflation (two coupled fixes)
+Two bugs sat on top of each other; fixing one exposed the other. Both are fixed.
+- **Bug 1 — per-step Frobenius normalization poisoned σ.** `update_grassmann`
+  divided the gradient by its own norm each refresh (`work_matrix / norm`). This
+  made σ a *scale-free ratio*: structurally blind to residual magnitude, so it
+  could not self-anneal. Measured smoking gun: on the real harness (rank32, bs16),
+  σ read **flat ~0.066 for BOTH eigh and random init** — identical, no anneal. A
+  good basis and a garbage basis looked the same. Removed the normalization.
+- **Bug 2 — adafactor dampening inflates magnitude 261×.** Removing Bug 1 made σ
+  explode to **~250,000** (angle ~1.3M rad → `cos/sin` of noise → basis flung to a
+  random orientation each step, step time 0.53s→1.25s). Root cause: our simplified
+  Shazeer-form `_adafactor_dampen_full_grad` outputs a gradient with **RMS≈1 per
+  element**, whose Frobenius norm is `√(m·n)` — e.g. ~2610 for a 6656×1024 MLP grad,
+  ~261× a norm-10 raw grad. σ scales *quadratically* with magnitude, so it blew up.
+  This is *why* the projected-grad norm was ~1200–2000 (it appeared *with* adafactor,
+  as the user recalled) — not projection geometry (orthonormal projection can only
+  *shrink* norm), an RMS-vs-norm unit mismatch. **The old Frobenius normalization
+  had been masking this all along; EMA and Newton-Schulz don't care about input
+  scale, so nothing complained.**
+- **Fix:** rescale the dampened gradient to the raw grad's **RMS** (`dampened *
+  grad.rms()`), preserving adafactor's SNR *direction* while restoring *magnitude*.
+- **Result (measured, fixed code):** σ sane and **annealing** (eigh 0.229→0.036,
+  random 0.134→0.040, ~9× decay as the basis fits — see Q6). projected-grad norm
+  back to the **pre-adafactor ~2–4.6 regime**, so `projected_grad_clip_norm`
+  reverted `2000 → 2` (the old 2 was calibrated to exactly this scale; 2000 was a
+  symptom of the blowup, not a real threshold). Clip ratio left as-is; observe.
+- *Open — `step_size = 5` is the PERSISTED-BUT-TEMPORARY default.* It was tuned
+  against the *inflated/normalized* σ scale; σ is now ~10× smaller and annealing, so
+  5 is **not recalibrated** for the fixed regime. It is persisted as the default in
+  both `SumoTrack(grassmann_step_size=5.0)` and the harness `--grassmann-step-size`
+  because it is the best current estimate and beats the old placeholder `1e4` — but
+  it is explicitly a placeholder, marked `# TEMPORARY` in code. **Recalibrate on the
+  fixed/clipped code before trusting any result that depends on it.** (Feeds
+  Q-step-size.)
+
+### The three clips, and what each does (and does not) protect
+Three independent guards, each protecting a different consumer. They are NOT
+interchangeable — the session learned this the hard way.
+- **σ clip (`grassmann_sigma_clip`, default 0.1).** Caps the tangent singular value
+  → bounds the *rotation angle* so one noisy batch can't fling the basis far. Fires
+  during the early warmup (σ > 0.1), inert once σ anneals below it. Verified it caps
+  the reported σ (test). **Safety cap on step magnitude — NOT denoising and NOT a
+  fix for basis quality decay** (measured: clipping σ made erank decay slightly
+  *worse*, not better — so the decay is an *aim* problem, not a magnitude one).
+- **Raw-grad clip (`grad_clip_norm`, default 8).** Clips the raw gradient BEFORE
+  adafactor/basis/projection. This is the load-bearing one. A blip batch (grad norm
+  spiking ~180× to 1481) otherwise poisons adafactor's row/col second moment:
+  `grad_sq` of the blip is ~30000× normal, and at `beta2=0.99` that spike decays
+  over ~100 steps, over-dampening whole gradient directions for the entire window →
+  basis tracks a *starved* residual → **alignment collapses for the whole back half
+  of the run** (measured: a single step-54 blip tanked alignment 0.71→~0.5 over 45
+  steps). Clipping the raw grad to 8 stops it at the source: same seed/blip batch,
+  grad_norm now capped 1481→8.8 at step 54, **alignment holds 0.722 instead of
+  collapsing**, erank recovers to the healthy 23.7. (max grad_norm 16.3 over the run
+  → the clip also catches smaller spikes, doing steady work.)
+- **Projected-grad clip (`projected_grad_clip_norm`, now default 0/OFF).** Clips the
+  *projected* grad, downstream, protecting only the moment EMA. **Turned off:** raw
+  clipping bounds the gradient upstream of everything, making this redundant. And it
+  could *never* have stopped the blip collapse — the damage is in adafactor's
+  second-moment state (upstream), which a moment-only clip does not touch. The old
+  2000 value was a symptom of the adafactor RMS inflation (now fixed), not a real
+  threshold.
+- **Separation of concerns proven:** the blip collapse (adafactor poison, fixed by
+  raw clip) and the *slow* alignment/erank decay (noisy single-batch aim, needs the
+  averaging lattice) are TWO DIFFERENT problems. The raw clip fixed the first; the
+  second persists (alignment still gently declines 0.834→0.722, same as a healthy
+  no-blip run) and is the lattice's job.
 
 ### Diagnostics
-- **`rotation_energy`** = `Σ_i |sin(step_size·σ_i)|` over all tracked directions,
-  computed inside `update_grassmann`. 0 = basis static (no-op step), larger =
-  more total subspace rotation this refresh. Read from the quantity that actually
-  drives the geodesic, so unlike a chordal distance it has **no rank-dependent
-  float-noise floor**. Threaded projector → optimizer (`mean_rotation_energy`) →
-  harness/wandb.
+- **`rotation_angle`** (radians) = `step_size·σ₁`, the geodesic angle of the one
+  rotated direction, computed inside `update_grassmann`. 0 = basis static (no-op /
+  well-fit direction), grows without a ceiling = a bigger turn. **Monotonic in how
+  far the basis turned.** Superseded `rotation_energy` = `Σ|sin(step_size·σ_i)|`,
+  which was dishonest: `sin` peaks at 90° and *comes back down*, aliasing a large
+  wrapping rotation as a small one. Both avoid the chordal float-noise floor; only
+  the radian never lies about magnitude. Threaded projector → optimizer
+  (`mean_rotation_angle`) → harness/wandb. (Historical run tables below still quote
+  the old `rotation_energy` — that is what was logged at the time; kept accurate.)
 - **`chordal` was removed.** `basis_rotation_chordal` (principal-angle chordal
   distance between consecutive bases via `svdvals(old.mT @ new)`) has a **noise
   floor that grows with rank** — at rank 256 it reported `~0.52` for a basis that
@@ -98,7 +183,14 @@ sidequest fixed both.
   frame bug or a divergent step. After the frame fix it is stable across
   `step_size` from 0.1 to 500.
 
-### Step 0 calibration result (rank 64, bs16, 200 steps)
+### Step 0 calibration result (rank 64, bs16, 200 steps) — NOTE: pre-k=1 (spin)
+> **Superseded framing.** This entire sweep was run under the old full-spectrum
+> rotation (`k=eff_rank`, "spin"). Its `rotation_energy` column is the *spin*
+> energy (16 at step 50 = 64 directions each rotating), not the drift energy. The
+> "step_size≈50 optimum" is therefore a spin artifact — under k=1 the honest
+> step_size is far smaller (see the drift-vs-spin subsection below). Kept for the
+> record; do not use its step_size number for the drift path.
+
 The first masterplan step: find a `step_size` where tracking is neither an
 idle no-op nor thrashing into noise. Coarse sweep `{0.1, 5, 50, 500}`:
 
@@ -131,6 +223,37 @@ idle no-op nor thrashing into noise. Coarse sweep `{0.1, 5, 50, 500}`:
   50 is the calibrated value for *our* normalized+adafactor σ scale at this rank.
   Not yet set as the default; that's a crossroads we stopped at.)
 
+### Drift vs spin, measured (rank 64, bs8, interval 20, 100 steps, synth)
+After switching the port to `k=1` (drift), a 3-arm run isolates what the rank of
+rotation actually changes. Same seed, same everything but the rotation:
+
+| arm | rotation | `step_size` | rotation_energy | erank /64 | alignment | last train loss |
+|-----|----------|-------------|-----------------|-----------|-----------|-----------------|
+| spin | full-rank | 50 | **16.6** | 54.1 | 0.825 | 2.113 |
+| hot drift | k=1 | 50 | 0.55 | 50.4 | 0.764 | 2.116 |
+| gentle drift | k=1 | 5 | 0.35 | 48.8 | 0.733 | 2.116 |
+
+- **`rotation_energy` cleanly separates spin from drift (~30×).** Full-rank sums
+  `|sin(step_size·σ_i)|` over all 64 directions; with the tail near-degenerate
+  noise, every one contributes, so the basis is churned across 64 axes each
+  refresh. k=1 rotates one axis → energy drops below 1. The diagnostic does its
+  job: it *names* the spin.
+- **k=1 makes `step_size` honest.** At σ_max≈0.07, `step_size=50` gives an angle
+  `50·0.07 ≈ 3.5 rad` — past 90°, wrapping — even for a *single* direction. That
+  is why 50 was never a "gentle" number; the old calibration was tuning the spin.
+  Under k=1 the drift regime (small angle, a few degrees per refresh) wants
+  `step_size` on the order of `1–5`, not 50. The knob only becomes meaningful once
+  the algorithm is honest — which is exactly why we did not promote 50 to default.
+- **The uncomfortable part: loss does not move.** All three arms land within
+  `0.003` train loss, and spin's erank/alignment are marginally *higher*. At
+  rank 64 over 100 steps the basis churn neither helps nor hurts loss. This
+  re-confirms the standing fact — **basis quality does not bind loss at loose
+  rank/short horizon** — and means the drift fix is an *honesty* win (correct
+  mechanism, honest diagnostic, meaningful knob), **not yet a demonstrated loss
+  payoff.** Proving payoff still needs the parked experiment: a real bottleneck
+  (tighter rank) or a long enough horizon for staleness to bite. Drift is the
+  precondition for that experiment to mean anything; it is not itself the result.
+
 ---
 
 ## What did not work
@@ -158,15 +281,21 @@ idle no-op nor thrashing into noise. Coarse sweep `{0.1, 5, 50, 500}`:
 
 Step-0 (step_size calibration) is done. This is the arc it was step 0 *of*.
 
-Framing insight that drives everything below: our per-refresh tangent spectrum is
-**nearly flat** (measured: σ[1]/σ[0]=0.994, top-1 holds 0.8% of energy). That is
-*not* a failure — it is the success signature of a well-fit, deliberately
-over-provisioned rank (we inflated rank until the bottleneck vanished, so the
-residual left over is near-isotropic noise). The flatness is *why* SubTrack's k=1
-doesn't transfer directly (their averaged residual is low-rank; our single-batch
-residual is flat) and *why* the payoff of tracking is invisible at loose rank.
-The masterplan is about making tracking matter and doing it without full-rank
-state.
+Framing insight that drives everything below: our per-refresh *single-batch*
+tangent spectrum is **nearly flat** (measured: σ[1]/σ[0]=0.994, top-1 holds 0.8%
+of energy). At the loose over-provisioned rank we measured it, that flatness is
+the success signature of a well-fit basis (residual left over is near-isotropic
+noise). But that same flatness is the whole problem for tracking: **the failure
+of the residual is mostly noise, and that noise is the thrashing.** Rotating the
+top-1 direction of a *single noisy batch* drifts toward a direction that is
+partly garbage. SubTrack sidesteps this by averaging: they accumulate the grad
+over the interval and take the top-1 of the *averaged* residual, which is
+genuinely low-rank. We reject their full-`[m,n]` accumulation buffer (see below),
+so the masterplan's job is to get the same noise-averaging without full-rank
+state. The candidate forms live in **The accumulation design space** (the lattice)
+below, and the questions they must answer live in the **Question ledger**. The
+answer is drift + averaging, never full-spectrum spin — but *which* averaging is
+an open space to evaluate, not a settled pick.
 
 ### Contact vs storage (the governing principle)
 We always need **full-rank contact** with the gradient — the out-of-subspace
@@ -175,32 +304,112 @@ is blind to it. But contact ≠ storage. The raw grad exists transiently in the
 backward pass; we can extract a low-rank tracking signal from it without ever
 *storing* `[m,n]`. Every approach below touches full-rank grad, none stores it.
 
-### Approach A — per-step top-1 geodesic (basis as accumulator)
-Fire `update_grassmann` *every step* on the single-batch tangent, rank-1 rotation,
-no buffer. Noise averages out **across steps** because the basis itself becomes
-the accumulator — each step rotates a little toward that step's top-1 direction.
-- **Cost-cleared:** step time at rank 64 with per-refresh SVD is identical to
-  baseline (1.09s); per-step tangent SVD is affordable.
-- Sub-variants to test: fire *every step* vs *interval-only on the latest batch*.
-- Risk: single-batch top-1 may be too noisy at tight rank (step-5/step-50
-  fragility is evidence for this).
+### Session findings: random-init rank-32 step_size sweep (bs8, per-step, 200 steps)
+Stress test — random init + tight rank 32 + per-step update, to make tracking do
+real work (eigh init was too good/un-stale for loss to move). Swept step_size
+{5,10,50}. Read on wandb; do not re-tabulate.
+- **Decision: `step_size = 5`, sweep closed.** Best p90 projected-grad ratio
+  (least noise surviving), σ *annealing* (0.092→0.077), still climbing at 200 →
+  should give a strong basis over 1k with a smoothed direction + better init.
+- **σ is ~stable across a 10× step_size range (~0.07–0.09).** Best hypothesis:
+  **adafactor** — the basis/residual is SNR-shaped (adafactor was chosen so
+  selection tracks signal-to-noise, not magnitude), so the tangent's top σ is a
+  *ratio* that neither inflates nor collapses. Consequence: step_size is a pure
+  angle knob multiplying a near-fixed σ. Not a "spectrum shape" story.
+- **No breaking point in the useful range.** step_50 did *not* tumble (I predicted
+  it would): σ still annealed, loss still fell. Because σ self-anneals *faster*
+  under a big step (fast fit → small residual → small σ → small angle). But
+  step_50's rank is suspect — likely noise-inflated erank (EMA thrashing, p90 up),
+  not real utilization. Higher step_size not worth testing; 50 already looks worse.
+- **Loss is basis-independent even here.** All arms ~2.0 train loss at a real
+  rank-32 bottleneck. Confirms the lever is not "rotate harder" — it is **aim**
+  (smooth the direction), which is what accumulation buys. Caveat: bs8 (default is
+  bs16, noisier), train-loss only (no eval), single seed — the ranking is soft
+  until the eval baseline exists.
 
-### Approach B — stack rank-1 tangents, then SVD (the real improvement)
-Instead of buffering the full-rank `[m,n]` grad (SubTrack's dirty move), buffer
-the per-step **rank-1 tangent vectors**: each step contributes one `[m]`-vector
-(top-1 tangent, scaled by σ). Stack `interval` of them → `[m, interval]` buffer
-(`interval/n` the memory of the full grad buffer). SVD/eigh the stack at refresh →
-dominant directions of the *accumulated* tangent → rotate toward them.
-- **Strictly better than SubTrack:** same noise-averaging benefit (top directions
-  of stacked tangents ≈ top of averaged residual), full-rank contact each step,
-  low-rank storage only.
-- A is B with interval=1 and immediate rotate. **Build A's per-step-tangent
-  machinery first — it's the substrate for both** — get it trusted, then B is a
-  small extension (stack + SVD instead of immediate rotate).
-- Open sub-question (throughput, measure don't guess): is per-step
-  residual+top-1-SVD cheap enough to run every step (A-immediate), or should we
-  stack and pay one SVD at refresh (B)? The step-0 timing (SVD is free at rank 64)
-  is the first data point.
+### Measured baseline behavior — per-step top-1, no accumulation (lattice N=1)
+This is the degenerate corner of the lattice (rank-1 tangent, no buffer, rotate
+every step) — what the rank-32 sweep actually ran. Findings that constrain the
+space:
+- **"A_cheap" (interval > 1, no accumulation) is DEAD.** Doing single-batch updates
+  *less often* can't beat doing them every step — it just samples the same noise
+  more sparsely. Every-step or accumulate; nothing between.
+- **Per-step-no-accumulation converges the basis, but slowly and never sharply**
+  (rotation flat, basis wobbles toward but doesn't settle) — because the
+  single-batch top-1 direction is partly noise (see Q9). This is the empirical case
+  *for* accumulation, and the reason the lattice exists.
+
+### Accumulation geometry — can tangents even be smoothed? (leads, to eval)
+SubTrack never smoothed *tangents* (it averages the raw grad, then computes one
+tangent). We are off their map here, so these are open and must be measured.
+- **SubTrack top-1 confirmed from source.** `track_the_subspace` builds the full
+  `[m,rank]` tangent, then `rank_k_matrix_estimation(tangent, k=1)` keeps only the
+  top singular triple and rotates by `cos/sin(step_size·σ₁)`. Our port matches.
+  So "rank-1 SVD of the tangent → one `[m]` vector" is *exactly* what SubTrack
+  already computes each step — accumulation just buffers/EMAs that vector instead
+  of consuming it immediately. Clean insertion point.
+- **Reducing to rank-1 first avoids Karcher.** If we keep only the top-1 `[m]`
+  vector, we accumulate *ambient vectors in `[m]`*, not points on the Grassmannian
+  → linear sum/EMA is legal, no Riemannian barycenter (Karcher) needed. Karcher
+  only enters if we average rotations/subspaces *directly*. Rank-1-then-accumulate
+  sidesteps it by construction. (mergekit's Karcher = the correct tool *if* we ever
+  averaged subspaces; we don't. mergekit's SLERP/Multi-SLERP = spherical vector
+  averaging, relevant only if per-step directions swing widely → normalize the EMA.)
+- **The parallel-transport question (the real geometric risk).** Each step rotates
+  Q→Q', so the tangent space moves: a tangent from step 1 lives in `T_{Q₁}`, not
+  `T_{Q₂}`. Averaging tangents across *different* tangent spaces is the geometric
+  sin. It is only a good approximation when the per-step angle is *small* (frames
+  ≈ coincide, error is 2nd-order). At step_size 5 the angle is ~20–30°, which is
+  **not obviously small** — transport error might be real. Same condition both
+  ways: the drift regime (gentle enough to converge) is also the regime where
+  naive tangent-EMA is *approximately* valid. **Must measure, not assume:** after a
+  Q→Q' rotation, log `‖(I−Q'Q'ᵀ)·old_tangent − old_tangent‖ / ‖old_tangent‖` — how
+  much the old direction sticks out of the new tangent space. Small → naive EMA
+  fine. Large → need parallel transport (Karcher-flavored, the cost SubTrack dodged
+  by never smoothing tangents).
+- **CAVEAT for the baseline: eigh ≠ the tracked basis's target.** eigh picks
+  directions by side-Gram magnitude; adafactor upstream reweights directions by
+  SNR. So the eigh baseline and a tracked basis are optimizing *different* notions
+  of "important direction" — eigh is not the ground truth the tracker should match,
+  just a strong static reference. Don't read "tracked ≈ eigh" as success/failure
+  of tracking per se.
+
+### The accumulation design space (the lattice — evaluate, do not collapse)
+This is a *space of candidates to evaluate*, not a ranked list with a chosen
+winner. The axes interact and the signs are unknown; picking one arm early throws
+away the comparisons that tell us which axis dominates. Do not prune before
+measuring. The candidate forms on the table:
+
+| # | What is accumulated | How | Reset on rotate? | Storage | Karcher? | Transport? |
+|---|---|---|---|---|---|---|
+| C1 | full tangent `[m,rank]` | running **sum** → /N | yes (clear buffer) | O(m·rank) | no (ambient) | none (single rotate) |
+| C2 | full tangent `[m,rank]` | **EMA** | no | O(m·rank) | no | **needed** (EMA spans frames) |
+| C3 | rank-1 of tangent `[m]` | sum or EMA | sum:yes / ema:no | O(m) | no | ema:needed |
+| C4 | rank-n of tangent `[m,n]` | sum or EMA | " | O(m·n) | no | ema:needed |
+| C5 | stack of rank-1 `[m,N]` | stack, SVD at refresh | yes | O(m·N) | no | none (stack in one frame) |
+| C6 | **rotations** (solved on manifold) | buffer + Riemannian mean | yes | O(rotations) | **YES** | n/a (already on manifold) |
+
+Two orthogonal design axes cut across the table, and a third:
+- **What we reduce to before accumulating** (full tangent → rank-n → rank-1):
+  smaller = cheaper + keeps us in ambient vector space (linear averaging legal,
+  no Karcher). Richer = more of the residual retained but risks re-introducing the
+  noise the reduction was meant to strip.
+- **Sum-then-reset vs EMA-no-reset:** a *reset buffer* (C1/C3-sum/C5) accumulates
+  within one frame `T_Q`, rotates once, clears — **no transport needed**, clean
+  geometry, but rotates only every N steps (not true per-step drift). An *EMA*
+  (C2/C3-ema/C4-ema) rotates every step (true drift) but its running average spans
+  *changing* frames `T_{Q_t}` — **transport is required or the average is a
+  geometric sin.** This is the core tension: per-step drift ⟺ transport cost.
+- **Accumulate directions vs accumulate rotations (C6):** everything C1–C5 averages
+  in tangent/ambient space then exponentiates *once*. C6 instead solves each step's
+  rotation and averages the *rotations* on the manifold (Karcher/Riemannian mean).
+  This is the only form that needs Karcher — and the only one that never commits
+  the average-across-frames sin, because it works intrinsically. Most expensive,
+  most correct-by-construction. Keep it in the space; do not dismiss it.
+
+Retired framing: the old "Approach A (per-step, no buffer) / Approach B (stack +
+SVD)" split was two points in this lattice (A = C3-immediate at N=1; B = C5).
+A_cheap (interval>1 with no accumulation) is dead. The lattice supersedes them.
 
 ### Approach 4b (deferred) — EMA-weighted rank replacement
 Project the EMA back to see which basis dimensions carry little moment energy →
@@ -209,35 +418,109 @@ low-moment-energy directions and preserve high-moment ones. This is a
 *weighting on the rank update*, distinct from the tangent-source question above.
 Evaluate after A/B give a trusted tracker.
 
-### Open design questions (not yet experiments)
-- **eigh-init vs adafactor-update basis mismatch.** `fit_eigh` init selects
-  dimensions by *magnitude* (side-Gram eigenvectors, ignores variance/SNR). The
-  adafactor-fed *update* selects dimensions by *signal-to-noise* (adafactor
-  dampening favors good-SNR directions, not massive singular values). But *loss*
-  cares about the massive singular values. So init, update, and loss optimize
-  three different notions of "important direction." Whether this mismatch matters
-  — and whether tracking should be biased back toward high-singular-value
-  directions — is an open thread worth its own investigation.
-- **Staleness horizon.** The basis should go stale over training the way a LoRA
-  adapter saturates, which is *why* we track at all. Not clearly measurable in
-  1k-step runs — the payoff of tracking may only appear on longer horizons. Test
-  either by tightening rank (make subspace quality bind on loss sooner) or
-  lengthening the run.
-- **k=1 vs k=rank under a flat spectrum.** Neither is obviously right when the
-  tangent is flat: faithful k=1 rotates one arbitrary direction out of 256
-  near-equal ones (near-useless); k=rank rotates the whole block roughly rigidly
-  (drifts). Averaging (A/B) sharpens the spectrum and may make k=1-ish behavior
-  meaningful again. Resolve alongside A/B, not before.
+## Question ledger (the real artifact — do not let these fall out of view)
+This work is not about reaching a goal; it is about **answering questions**. The
+most important discipline here, unlike software engineering: never forget a
+question, always note new ones, and update each answer as evidence arrives. Status
+tags: 🔴 open · 🟡 partial evidence · 🟢 answered (with the evidence) · ⚫ retired.
+When a run produces evidence, update the relevant row — that is the point.
 
-### Immediate crossroads (where we stopped)
-Two ways to make subspace quality bind on loss, to be picked *with the captain*:
-1. **Tighten to rank 32 at step 50** — force the bottleneck to pinch (erank can't
-   hide near the ceiling), the direct test of whether tracking *matters*.
-2. **Extend to 500+ steps at rank 64 / step 50** — give the better subspace time
-   to pay off.
+**Q1 — Can tangent spaces be smoothed at all, geometrically?** 🟡
+- *Why it matters:* gates the entire EMA/no-reset half of the lattice (C2/C3-ema/C4).
+- *Evaluate:* after a Q→Q' rotate, log `‖(I−Q'Q'ᵀ)·old_tangent − old_tangent‖ /
+  ‖old_tangent‖` — the fraction of the old direction that leaves the new tangent
+  space. Small → naive EMA legal; large → transport (or reset-buffer) required.
+- *Evidence so far:* none measured. At step_size 5 the per-step angle is ~20–30°,
+  which is **not obviously small** — the user flags 30° as possibly a real sin.
+  Unresolved until the probe runs.
 
-Lean: (1) — cheaper per run, and 200 steps already showed the subspace-quality
-signal cleanly. But this is a walk-together decision, not a solo call.
+**Q2 — Sum-reset vs EMA: does per-step drift beat every-N drift, net of transport
+cost?** 🔴
+- *Why:* the central lattice tension. EMA gives continuous drift but pays
+  transport; reset-buffer is clean but coarser-grained.
+- *Evaluate:* run a reset-buffer arm (C3-sum, N≈10) against an EMA arm (C3-ema)
+  at matched step_size, read convergence (σ anneal, alignment climb) and eval loss.
+- *Evidence:* none. Do not pre-rank; measure.
+
+**Q3 — What reduction before accumulating: full tangent / rank-n / rank-1?** 🔴
+- *Why:* smaller stays in ambient space (no Karcher) and is cheaper, but may throw
+  away structure. rank-1 is what SubTrack already computes per step (confirmed from
+  source), so it's the cheapest insertion point — but "cheapest" is not "best."
+- *Evaluate:* compare C3 (rank-1) vs C4 (rank-n) vs C1 (full tangent sum) on basis
+  convergence + eval loss at matched everything.
+- *Evidence:* none directly. Indirect: single-batch top-1 is noisy (drift wobbles,
+  doesn't settle) — motivates *accumulating* the rank-1, not abandoning it.
+
+**Q4 — Is Karcher (C6, averaging rotations on the manifold) worth its cost?** 🔴
+- *Why:* it's the only form that never commits the average-across-frames sin, but
+  it's the most expensive and needs Riemannian machinery.
+- *Evaluate:* only after Q1/Q2 — if naive/reset forms converge well, C6 is
+  unnecessary; if transport error is large and reset is too coarse, C6 is the
+  principled fallback. Gate on Q1's transport measurement.
+- *Evidence:* none. Held as the correct-by-construction backstop.
+
+**Q5 — Does a better basis bind on loss at all, at these scales?** 🟡
+- *Why:* the whole payoff question. If loss is basis-independent everywhere we can
+  run, tracking is a dead lever and the effort belongs elsewhere.
+- *Evaluate:* eval loss (not train loss) across basis-quality-varying arms; tighten
+  rank / lengthen horizon to make quality bind.
+- *Evidence:* drift-vs-spin (rank64/100 steps) and the rank-32 sweep (bs8/200)
+  both showed **train loss unmoved** while subspace metrics moved a lot. But: no
+  *eval* loss yet, bs8 not bs16, ≤200 steps. Soft-negative, not settled. The
+  baseline (eigh, rank32, step5, bs16, eval on, 200 steps) is the first honest read.
+
+**Q6 — Does σ track fit, or is it flat?** 🟢 (answered — with a corrected story)
+- *Why:* if σ is a fixed artifact, step_size is a pure angle knob and σ carries no
+  "am I fit yet" signal. If σ *anneals* as the basis fits, σ is a trustworthy
+  convergence readout.
+- *Two bugs had to be fixed before σ could answer anything (see "The σ poison and
+  the adafactor RMS inflation" in Durable facts):*
+  1. A **per-step Frobenius normalization** in `update_grassmann` made σ a
+     scale-free ratio — measured *flat at ~0.066 for BOTH eigh and random init*, no
+     anneal, structurally quality-blind. (This falsified my earlier handwave that
+     "eigh reads 0.014, random 0.08" — that was a different run/regime; under
+     normalization σ cannot distinguish init at all.) Removed.
+  2. Removal exposed σ **exploding to ~250,000** (rotation angle ~1.3M rad, pure
+     numeric garbage): the Shazeer-adafactor dampening outputs RMS≈1 per element,
+     whose Frobenius norm is √(m·n) ≈ 261× the raw grad norm. σ scales
+     *quadratically* with magnitude, so it blew up. Fixed by rescaling the dampened
+     grad to the raw-grad RMS (keeps adafactor's SNR *direction*, restores *scale*).
+- *Answer, measured on the fixed code (rank32, bs16, step5, 100 steps):* **σ now
+  anneals ~9× as the basis fits** — eigh 0.229→0.036, random 0.134→0.040 (both:
+  warmup bump while LR ramps, then decay to ~0.04). Under normalization this was
+  impossible (flat 0.066). So **σ is a trustworthy *convergence-rate* readout.**
+- *Corrected nuance (do not overclaim):* σ tracks *convergence*, not *quality*.
+  Both inits anneal to nearly the same σ (~0.04); the *quality* difference shows up
+  in **erank** (eigh holds 23.7, random collapses to 18.4), not σ endpoint. σ = "am
+  I still fitting"; erank = "how good is what I fit." Complementary, not redundant.
+  My earlier "σ tracks quality" was wrong; the evidence says convergence.
+
+**Q7 — eigh-init vs adafactor-update vs loss: three notions of "important
+direction."** 🔴
+- `fit_eigh` selects by *magnitude* (side-Gram eigenvectors); adafactor-fed update
+  selects by *SNR*; *loss* cares about *massive singular values*. Three different
+  targets. Whether the mismatch matters, and whether tracking should be biased back
+  toward high-singular-value directions, is open. Also means: **do not read
+  "tracked ≈ eigh" as tracking success/failure** — they optimize different things.
+
+**Q8 — Staleness horizon: does the basis go stale enough that tracking pays,
+within a runnable horizon?** 🔴
+- LoRA-saturation analogy is *why* we track. May only appear on long runs. Evaluate
+  by tightening rank (bind sooner) or lengthening (let staleness bite). Tied to Q5.
+
+**Q9 — k=1 under a flat single-batch spectrum: coin-flip direction?** 🟡
+- k=1 rotates one direction of ~64 near-equal ones; on a single noisy batch that
+  direction is partly arbitrary. Accumulation (the lattice) exists to sharpen the
+  spectrum so top-1 is real. Full-spectrum rotation is *not* the fix (measured: 30×
+  the rotation of k=1, churns the basis, buys no loss — see drift-vs-spin). Resolve
+  as the lattice arms produce sharper accumulated spectra.
+
+### Immediate next step (walk-together)
+**Baseline first:** eigh init, rank 32, step_size 5, **bs16**, eval on, 200 steps
+— the honest ranking reference (eval, not train) that every lattice arm gets
+measured against. It directly feeds Q5 and Q6. Only after the baseline do we pick
+the first lattice arm to evaluate — and that pick is a walk-together decision
+across the space above, not a solo collapse to one point.
 
 ---
 
@@ -248,7 +531,9 @@ signal cleanly. But this is a walk-together decision, not a solo call.
 - Our implementation: `sumotrack/projector.py::update_grassmann`.
 - Diagnostics plumbing: `sumotrack/optimizer.py` (`_refresh_projector`,
   `_accumulate_basis_diagnostics`, `_new_diagnostics`, `_finalize_diagnostics`)
-  and `experiments/llm_synth_smoke.py` (`optimizer_rotation_energy`, per-step
-  logging, summary fields).
+  and `experiments/llm_synth_smoke.py` (`optimizer_rotation_angle`, per-step
+  logging, summary fields). Note: the basis-motion diagnostic is now the raw
+  geodesic **angle in radians** (`mean_rotation_angle`), not `|sin(angle)|` —
+  sin aliases a wrapping rotation as a small one; the radian never lies.
 - Tests: `tests/test_projector.py` (geodesic formula rank-1, orthonormality under
   real rotation, gradient-scale invariance, step-size load-bearing).

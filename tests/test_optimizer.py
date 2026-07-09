@@ -456,7 +456,7 @@ class SumoTrackTest(unittest.TestCase):
 
         diagnostics = opt.last_step_diagnostics
         self.assertEqual(diagnostics["basis_refresh_tensors"], 1.0)
-        self.assertGreaterEqual(diagnostics["mean_rotation_energy"], 0.0)
+        self.assertGreaterEqual(diagnostics["mean_rotation_angle"], 0.0)
         self.assertNotIn("mean_basis_capture_before", diagnostics)
         self.assertNotIn("mean_basis_rotation_top1_sin", diagnostics)
 

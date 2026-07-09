@@ -42,7 +42,7 @@ class SubspaceProjector:
     basis: Tensor | None = None
     resolved_side: ProjectionSide | None = field(default=None, init=False)
     last_tangent_sigma_max: float = field(default=float("nan"), init=False)
-    last_rotation_energy: float = field(default=float("nan"), init=False)
+    last_rotation_angle: float = field(default=float("nan"), init=False)
 
     def __post_init__(self) -> None:
         if self.rank <= 0:
@@ -165,7 +165,7 @@ class SubspaceProjector:
         return self.project_back(self.project(matrix))
 
     @torch.no_grad()
-    def update_grassmann(self, matrix: Tensor, step_size: float) -> Tensor:
+    def update_grassmann(self, matrix: Tensor, step_size: float, sigma_clip: float | None = 0.1) -> Tensor:
         """Refresh the basis with a Grassmann geodesic tangent step.
 
         Port of SubTrack's ``track_the_subspace``: project the least-squares
@@ -187,8 +187,14 @@ class SubspaceProjector:
         basis = self._basis_for(matrix)
         side = self._basis_side()
         work_matrix = self._spectral_input(matrix)
-        norm = work_matrix.norm()
-        work_matrix = work_matrix / norm.clamp_min(1e-12)
+        # NO Frobenius normalization. We previously divided the gradient by its global
+        # norm here for gradient-scale invariance, but that made the tangent sigma a
+        # scale-free ratio -- structurally blind to residual *magnitude*, so it could
+        # not self-anneal and reported the same ~0.07 for a well-fit (eigh) and a
+        # garbage (random) basis alike (measured: both ~0.066 at step 100). Self-
+        # annealing *needs* sigma to carry residual size (big residual -> big step ->
+        # settle). Adafactor upstream already conditions the gradient scale by SNR, so
+        # the invariance was both redundant and poisonous. sigma now carries magnitude.
         work_basis = basis.float() if basis.dtype in (torch.float16, torch.bfloat16) else basis
 
         # SubTrack's track_the_subspace is defined for a COLUMN-orthonormal basis
@@ -214,9 +220,30 @@ class SubspaceProjector:
         partial = -2.0 * (residual @ estimated_w.mT)
         tangent = partial - canon_basis @ (canon_basis.mT @ partial)
 
-        eff_rank = min(canon_basis.shape[1], tangent.shape[0], tangent.shape[1])
-        singular_u, singular_values, singular_v = self._rank_k_svd(tangent, eff_rank)
+        # Rank-1 rotation, faithful to SubTrack (``rank_k_matrix_estimation(..., k=1)``):
+        # rotate the *single* dominant tangent direction and carry the rest of the
+        # frame unrotated via the ``(I - V V.T)`` term below. This is deliberate --
+        # the residual tail is near-isotropic noise, so rotating the whole spectrum
+        # (which our earlier port did, via ``k=eff_rank``) spins the basis on that
+        # noise and thrashes. Rotating only the top direction lets the basis *drift*:
+        # one controlled correction per refresh, noise averaged out through the
+        # motion across refreshes rather than tracked. Full-spectrum rotation is a
+        # parked idea, not the heading.
+        singular_u, singular_values, singular_v = self._rank_k_svd(tangent, 1)
+        # Record the RAW (unclipped) sigma into the diagnostic -- it is the honest
+        # residual-magnitude measurement, and a clipped readout would hide whether the
+        # clip is firing or how big a spike actually was. The clip below affects only
+        # the values fed to the rotation, not this readout.
         self.last_tangent_sigma_max = float(singular_values.max().detach().cpu()) if singular_values.numel() else float("nan")
+        # Clip sigma to bound the rotation angle. sigma carries residual magnitude
+        # (self-annealing, good), but a single noisy batch can spike it and fling the
+        # basis too far in one step. Capping sigma protects the *step size* without
+        # touching the moment/projection path (adafactor still sees the raw noise,
+        # which the user wants -- the clip is surgical to the tracker). This is a
+        # safety cap, NOT denoising: it bounds how far a noisy direction rotates, it
+        # does not improve the *aim* (that is the accumulation lattice's job).
+        if sigma_clip is not None and singular_values.numel():
+            singular_values = singular_values.clamp_max(sigma_clip)
 
         # Self-annealing geodesic retraction, faithful to SubTrack: rotate each
         # principal direction by ``step_size * sigma_i`` (raw singular values, not
@@ -231,12 +258,14 @@ class SubspaceProjector:
         # step_size is back in SubTrack's units (their default is 1e4), tuned against
         # our sigma scale rather than borrowed.
         rotation = step_size * singular_values
-        # Direct rotation signal: total rotation energy = sum over all directions of
-        # |sin(step_size * sigma_i)|. 0 = basis static (no-op step), larger = more
-        # total subspace rotation this refresh. Read from the quantity that actually
-        # drives the geodesic, so unlike a chordal SVD of the result it has no
-        # rank-dependent float-noise floor.
-        self.last_rotation_energy = float(torch.sin(rotation).abs().sum().detach().cpu()) if rotation.numel() else float("nan")
+        # Honest rotation signal: the geodesic angle itself, in radians
+        # (step_size * sigma_1 for the one rotated direction). Monotonic in how far
+        # the basis turned -- 0 = static, grows without a ceiling. We deliberately do
+        # NOT report |sin(angle)|: sin peaks at angle=pi/2 and *comes back down* past
+        # 90 deg, so it aliases a big (wrapping) rotation as a small one. The raw
+        # radian never lies about magnitude. (``.sum()`` is over a length-1 vector
+        # now -- kept for shape safety.)
+        self.last_rotation_angle = float(rotation.abs().sum().detach().cpu()) if rotation.numel() else float("nan")
         cos_block = torch.diag(torch.cos(rotation))
         sin_block = torch.diag(torch.sin(-rotation))
         basis_v = canon_basis @ singular_v
