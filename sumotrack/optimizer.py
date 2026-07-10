@@ -56,9 +56,8 @@ class SumoTrack(Optimizer):
         moment_mode: str = "adafactor_ema",
         adafactor_beta2: float = 0.99,
         adafactor_eps: float = 1e-30,
-        grad_clip_norm: float | None = 10.0,
-        grassmann_step_size: float = 5.0,  # TEMPORARY: best estimate, not recalibrated for the fixed sigma scale (see SUBSPACE_TRACKING.md)
-        grassmann_sigma_clip: float = 0.1,
+        grad_clip_norm: float | None = 2.5,
+        grassmann_step_size: float = 1.0,
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -68,6 +67,7 @@ class SumoTrack(Optimizer):
         compile_tensor_kernels: bool = False,
         ecc: str | None = None,
         param_ecc: str | None = None,
+        grassmann_accumulate: bool = True,  # TEMPORARY ablation flag: False reproduces the pre-accumulation single-grad refresh path exactly; retire after the A/B.
     ) -> None:
         if ecc is not None or param_ecc is not None:
             raise NotImplementedError(
@@ -97,8 +97,6 @@ class SumoTrack(Optimizer):
             raise ValueError(f"grad_clip_norm must be positive when set, got {grad_clip_norm}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
-        if grassmann_sigma_clip <= 0:
-            raise ValueError(f"grassmann_sigma_clip must be positive, got {grassmann_sigma_clip}")
         if basis_refresh_interval <= 0:
             raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
         if aurora_pp_iterations <= 0:
@@ -124,7 +122,6 @@ class SumoTrack(Optimizer):
             adafactor_eps=adafactor_eps,
             grad_clip_norm=grad_clip_norm,
             grassmann_step_size=grassmann_step_size,
-            grassmann_sigma_clip=grassmann_sigma_clip,
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
@@ -133,6 +130,7 @@ class SumoTrack(Optimizer):
             consume_grad=consume_grad,
             compile_tensor_kernels=compile_tensor_kernels,
             basis_refresh_step=0,
+            grassmann_accumulate=grassmann_accumulate,
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
@@ -227,6 +225,7 @@ class SumoTrack(Optimizer):
         return {
             "matrix_update_norm_sq": None,
             "fallback_update_norm_sq": None,
+            "nonfinite_grad_tensors": None,
             "projected_grad_max_norm": None,
             "projected_grad_ratio_values": [],
             "matrix_params": 0,
@@ -238,6 +237,8 @@ class SumoTrack(Optimizer):
             "rotation_angle_sum": 0.0,
             "tangent_sigma_max_sum": 0.0,
             "basis_refresh_tensors": 0,
+            "basis_capture_sum": None,
+            "basis_capture_tensors": 0,
             "aurora_alignment_sum": 0.0,
             "aurora_erank_sum": 0.0,
             "aurora_erank_pct_sum": 0.0,
@@ -260,6 +261,8 @@ class SumoTrack(Optimizer):
         diagnostics["update_norm"] = float((matrix_norm_sq + fallback_norm_sq).sqrt().detach().cpu())
         projected_grad_max_norm = diagnostics["projected_grad_max_norm"]
         diagnostics["projected_grad_max_norm"] = float(projected_grad_max_norm.detach().cpu()) if projected_grad_max_norm is not None else float("nan")
+        nonfinite = diagnostics["nonfinite_grad_tensors"]
+        diagnostics["nonfinite_grad_tensors"] = float(nonfinite.detach().cpu()) if nonfinite is not None else 0.0
         count = diagnostics["projected_leverage_tensors"]
         diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
@@ -270,6 +273,9 @@ class SumoTrack(Optimizer):
             diagnostics["projected_grad_p90_to_moment_ratio"] = float(torch.quantile(ratio_tensor.float(), 0.9).detach().cpu())
         else:
             diagnostics["projected_grad_p90_to_moment_ratio"] = float("nan")
+        capture_sum = diagnostics.pop("basis_capture_sum")
+        capture_count = diagnostics.pop("basis_capture_tensors")
+        diagnostics["mean_basis_capture"] = float((capture_sum / capture_count).detach().cpu()) if capture_count else float("nan")
         basis_count = diagnostics["basis_refresh_tensors"]
         diagnostics["mean_rotation_angle"] = diagnostics["rotation_angle_sum"] / basis_count if basis_count else float("nan")
         diagnostics["mean_tangent_sigma_max"] = diagnostics["tangent_sigma_max_sum"] / basis_count if basis_count else float("nan")
@@ -327,6 +333,18 @@ class SumoTrack(Optimizer):
         else:
             if grad is None:
                 raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+            # Sync-free non-finite guard. A NaN/inf batch otherwise poisons every
+            # downstream consumer at once: the clip scale (NaN norm -> NaN scale ->
+            # whole grad NaN), adafactor's row/col vars, the tangent buffer, and
+            # eventually the refresh SVD -- and an `isfinite().all()` branch would be
+            # a device->host sync in the hot path. Zeroing non-finite elements drops
+            # their contribution for one step instead. Visibility lives in the
+            # diagnostics path (which already syncs at finalize), not here.
+            if diagnostics is not None:
+                nonfinite = (~torch.isfinite(grad)).any().detach()
+                current = diagnostics["nonfinite_grad_tensors"]
+                diagnostics["nonfinite_grad_tensors"] = nonfinite if current is None else current + nonfinite
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
             # Clip the RAW gradient before it reaches adafactor. A blip batch (grad
             # norm spiking ~180x) otherwise poisons the adafactor row/col second
             # moment: grad_sq of the blip is ~30000x normal, and with beta2=0.99 that
@@ -345,6 +363,13 @@ class SumoTrack(Optimizer):
             moment_mode = group["moment_mode"]
             if moment_mode == "adafactor_ema":
                 grad = self._adafactor_dampen_full_grad(grad, group, state)
+            # Accumulate this step's tangent BEFORE any refresh, mirroring SubTrack
+            # (which adds the boundary grad to accumulated_grad before calling
+            # track_the_subspace). The buffer only makes sense at the basis it was
+            # computed against, so it must never straddle a basis change -- hence
+            # accumulate first, then let _refresh_projector reset/reseed it.
+            if group["grassmann_accumulate"] and projector.is_initialized:
+                self._accumulate_tangent(projector, grad, state)
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
             projected_grad = projector.project(grad)
@@ -353,6 +378,15 @@ class SumoTrack(Optimizer):
         if diagnostics is not None:
             current_max = diagnostics["projected_grad_max_norm"]
             diagnostics["projected_grad_max_norm"] = projected_grad_norm if current_max is None else torch.maximum(current_max, projected_grad_norm)
+            # Fit/capture: fraction of the (dampened) gradient the basis captures,
+            # ||Q^T g|| / ||g||. This is the basis-QUALITY readout; sigma is only
+            # contact/steepness and is non-monotone in quality (sigma=0 both for a
+            # perfect basis and one orthogonal to the signal).
+            if grad is not None:
+                capture = projected_grad_norm / grad.float().norm().clamp_min(1e-12)
+                current_sum = diagnostics["basis_capture_sum"]
+                diagnostics["basis_capture_sum"] = capture if current_sum is None else current_sum + capture
+                diagnostics["basis_capture_tensors"] += 1
         projected_exp_avg = state.get("projected_exp_avg")
         moment_norm = projected_exp_avg.float().norm().detach() if projected_exp_avg is not None else None
         if moment_norm is not None and diagnostics is not None:
@@ -533,6 +567,25 @@ class SumoTrack(Optimizer):
             diagnostics["fallback_update_norm_sq"] = update_norm_sq if diagnostics["fallback_update_norm_sq"] is None else diagnostics["fallback_update_norm_sq"] + update_norm_sq
             diagnostics["fallback_params"] += p.numel()
 
+    @staticmethod
+    def _accumulate_tangent(projector: SubspaceProjector, grad: Tensor, state: dict) -> None:
+        """Roll this step's canon tangent into the accumulation buffer.
+
+        Buffers the tangent (``[dim, rank]``), not the full gradient (``[m, n]``) --
+        SubTrack accumulates full grads because it tracks with rank 1, but a
+        full-size buffer here would violate SumoTrack's no-full-size-state
+        invariant. Pure tensor ops only (no data-dependent branching on tensor
+        values) so this stays compile-friendly under the per-step accumulation path.
+        """
+
+        tangent = projector.compute_tangent(grad)
+        accum = state.get("tangent_accum")
+        if accum is None:
+            accum = torch.zeros_like(tangent)
+        accum.add_(tangent)
+        state["tangent_accum"] = accum
+        state["tangent_accum_count"] = state.get("tangent_accum_count", 0) + 1
+
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None) -> None:
         old_projected_exp_avg = state.get("projected_exp_avg")
         old_projector = None
@@ -541,14 +594,43 @@ class SumoTrack(Optimizer):
             old_projector.basis = projector.basis
             old_projector.resolved_side = projector.resolved_side
 
-        if not projector.is_initialized:
+        accumulate = group["grassmann_accumulate"]
+        did_fit = not projector.is_initialized
+        if did_fit:
             projector.fit(grad)
+        elif accumulate:
+            count = state.get("tangent_accum_count", 0)
+            tangent_accum = state.get("tangent_accum")
+            if tangent_accum is None or count < 1:
+                # State-dict-migration fallback: a buffer can be missing if state was
+                # loaded mid-window from before this flag existed (or between the
+                # accumulate call above and here, which never happens on the live
+                # path but guards a corrupted/partial checkpoint). Fall back to the
+                # single-grad refresh for this one boundary rather than crashing.
+                projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+            else:
+                # True count, not the fixed interval: SubTrack divides by
+                # subspace_update_interval but its accumulator actually holds
+                # interval+1 tangents (it adds the boundary grad before tracking,
+                # same as our accumulate-before-refresh order) -- an off-by-one in
+                # the reference we deliberately do not reproduce.
+                projector.update_grassmann_from_tangent(
+                    tangent_accum / count,
+                    step_size=group["grassmann_step_size"],
+                )
         else:
-            projector.update_grassmann(
-                grad,
-                step_size=group["grassmann_step_size"],
-                sigma_clip=group["grassmann_sigma_clip"],
-            )
+            projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+
+        if accumulate:
+            # The buffer is only valid at the Q it was computed against -- any basis
+            # change (fit or retract) invalidates it, so reset unconditionally here.
+            state["tangent_accum"] = None
+            state["tangent_accum_count"] = 0
+            if did_fit:
+                # Seed the new window with the current grad's tangent at the fresh
+                # basis, mirroring SubTrack's iter==0 branch (which adds the first
+                # grad to the accumulator right after the initial fit).
+                self._accumulate_tangent(projector, grad, state)
 
         if old_projector is not None and diagnostics is not None and self.diagnostics_basis_enabled:
             self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle, projector.last_tangent_sigma_max)

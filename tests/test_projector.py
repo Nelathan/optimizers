@@ -162,45 +162,6 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), tuple(old_basis.shape))
         self.assertLess(float(projector.orthonormality_error()), 1e-5)
 
-    def test_grassmann_update_sigma_clip_bounds_rotation_but_reports_raw_sigma(self):
-        """The sigma clip caps the *rotation angle* (a noisy batch can spike sigma and
-        fling the basis too far), but the reported ``last_tangent_sigma_max`` stays
-        RAW -- a clipped readout would hide whether the clip fired or how big the spike
-        was. So: both clipped and unclipped report the same (large) raw sigma, but the
-        clipped update rotates the basis LESS. Guards both properties: the cap fires
-        (basis moves less) and the diagnostic is honest (raw, not clipped).
-        """
-        torch.manual_seed(0)
-        grad = torch.randn(64, 256) * 50.0  # large magnitude -> big sigma
-        base = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
-        base.fit_eigh(grad)
-        original_basis = base.basis.clone()
-        refresh_grad = grad + 0.1 * torch.randn_like(grad)
-        # step_size chosen so the UNCLIPPED angle is large but the CLIPPED angle small.
-        step_size = 1.0
-
-        unclipped = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
-        unclipped.basis = original_basis.clone()
-        unclipped.resolved_side = base.resolved_side
-        unclipped.update_grassmann(refresh_grad.clone(), step_size=step_size, sigma_clip=None)
-
-        clipped = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
-        clipped.basis = original_basis.clone()
-        clipped.resolved_side = base.resolved_side
-        clipped.update_grassmann(refresh_grad.clone(), step_size=step_size, sigma_clip=0.1)
-
-        # Reported sigma is RAW and identical -- the clip does not touch the readout.
-        self.assertGreater(unclipped.last_tangent_sigma_max, 0.1)
-        self.assertAlmostEqual(
-            clipped.last_tangent_sigma_max, unclipped.last_tangent_sigma_max, places=6
-        )
-        # But the clipped update rotated the basis LESS (sign-invariant overlap).
-        unclipped_move = (unclipped.basis @ original_basis.mT).abs()
-        clipped_move = (clipped.basis @ original_basis.mT).abs()
-        unclipped_off = (unclipped_move - torch.diag(unclipped_move.diagonal())).abs().max()
-        clipped_off = (clipped_move - torch.diag(clipped_move.diagonal())).abs().max()
-        self.assertGreater(float(unclipped_off), float(clipped_off))
-
     def test_grassmann_update_matches_geodesic_formula_rank_one(self):
         """Pin our rank-r retraction against the rank-1 geodesic formula (cos/sin
         rotation of the (Q@V, U) principal-angle frame). This guards against
@@ -224,7 +185,7 @@ class SubspaceProjectorTest(unittest.TestCase):
         projector = SubspaceProjector(rank=1, side=ProjectionSide.RIGHT)
         projector.fit_eigh(grad)
         basis = projector.basis.clone()  # [rank, n] row-orthonormal (storage layout)
-        projector.update_grassmann(refresh_grad, step_size=step_size, sigma_clip=None)
+        projector.update_grassmann(refresh_grad, step_size=step_size)
 
         # Reproduce the geodesic in SubTrack's canonical column-orthonormal frame:
         # transpose the RIGHT basis and gradient into [dim, rank] / [dim, cols] form,
@@ -266,7 +227,7 @@ class SubspaceProjectorTest(unittest.TestCase):
         projector = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
         projector.fit_eigh(grad)
         basis = projector.basis.clone()  # [rank, n] row-orthonormal
-        projector.update_grassmann(refresh_grad, step_size=step_size, sigma_clip=None)
+        projector.update_grassmann(refresh_grad, step_size=step_size)
 
         canon_basis = basis.mT  # [n, rank]
         canon_grad = refresh_grad.mT
@@ -316,12 +277,12 @@ class SubspaceProjectorTest(unittest.TestCase):
         small_step = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
         small_step.basis = original_basis.clone()
         small_step.resolved_side = base.resolved_side
-        small_step.update_grassmann(refresh_grad.clone(), step_size=1e-5, sigma_clip=None)
+        small_step.update_grassmann(refresh_grad.clone(), step_size=1e-5)
 
         large_step = SubspaceProjector(rank=32, side=ProjectionSide.RIGHT)
         large_step.basis = original_basis.clone()
         large_step.resolved_side = base.resolved_side
-        large_step.update_grassmann(refresh_grad.clone(), step_size=5e-3, sigma_clip=None)
+        large_step.update_grassmann(refresh_grad.clone(), step_size=5e-3)
 
         # Sign-invariant subspace overlap: off-diagonal gram entries measure
         # real rotation, unlike raw basis diffs which are confounded by QR/SVD
@@ -354,8 +315,8 @@ class SubspaceProjectorTest(unittest.TestCase):
         second.basis = first.basis.clone()
         second.resolved_side = first.resolved_side
 
-        first.update_grassmann(refresh_grad, step_size=0.01, sigma_clip=None)
-        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01, sigma_clip=None)
+        first.update_grassmann(refresh_grad, step_size=0.01)
+        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01)
 
         self.assertAlmostEqual(
             second.last_tangent_sigma_max / first.last_tangent_sigma_max, 1000000.0, delta=2000.0
@@ -374,12 +335,36 @@ class SubspaceProjectorTest(unittest.TestCase):
         second.basis = first.basis.clone()
         second.resolved_side = first.resolved_side
 
-        first.update_grassmann(refresh_grad, step_size=0.01, sigma_clip=None)
-        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01, sigma_clip=None)
+        first.update_grassmann(refresh_grad, step_size=0.01)
+        second.update_grassmann(refresh_grad * 1000.0, step_size=0.01)
 
         self.assertAlmostEqual(
             second.last_tangent_sigma_max / first.last_tangent_sigma_max, 1000000.0, delta=2000.0
         )
+
+    def test_compute_tangent_and_update_from_tangent_match_update_grassmann(self):
+        """compute_tangent + update_grassmann_from_tangent, composed, must be
+        bit-exact against the single-call update_grassmann -- the split is a
+        refactor for windowed accumulation, not a behavior change.
+        """
+
+        torch.manual_seed(0)
+        grad = torch.randn(9, 5)
+        refresh_grad = torch.randn_like(grad)
+
+        composed = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
+        composed.fit_eigh(grad)
+        whole = SubspaceProjector(rank=3, side=ProjectionSide.RIGHT)
+        whole.basis = composed.basis.clone()
+        whole.resolved_side = composed.resolved_side
+
+        tangent = composed.compute_tangent(refresh_grad)
+        composed.update_grassmann_from_tangent(tangent, step_size=0.05)
+        whole.update_grassmann(refresh_grad, step_size=0.05)
+
+        self.assertTrue(torch.allclose(composed.basis, whole.basis, atol=1e-6))
+        self.assertAlmostEqual(composed.last_tangent_sigma_max, whole.last_tangent_sigma_max, places=5)
+        self.assertAlmostEqual(composed.last_rotation_angle, whole.last_rotation_angle, places=5)
 
 
 if __name__ == "__main__":

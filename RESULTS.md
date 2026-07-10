@@ -983,3 +983,43 @@ Notes:
 - The practical no-grad-accum ceiling at `seq_len=1024` is `batch_size=8` / `8192` tokens per optimizer step on the current card state.
 - OOMs happen during the model forward MLP path before optimizer state matters. Activation checkpointing did not rescue `batch_size=16`, consistent with a forward temporary/activation wall rather than a backward-only saved-activation wall.
 - SumoTrack state is ~48.5 MB total at this 350M broad-no-embeddings topology: ~48.0 MB matrix state and ~0.5 MB fallback state.
+
+## 2026-07-10 — C1 tangent accumulation arc (implement, calibrate, stress, verdict)
+
+Why: single-batch tangents made the tracker's aim noisy (slow erank/alignment
+decay). C1 = buffer the full tangent per step at the frozen basis, retract once
+per interval from the mean. Full detail and question-ledger updates in
+`SUBSPACE_TRACKING.md`; this is the run record.
+
+What changed in code: C1 implemented and defaulted (`grassmann_accumulate=True`,
+fp32 `[dim,rank]` buffer in optimizer state, divide by true count);
+`compute_tangent`/`update_grassmann_from_tangent` split (per-step path sync-free);
+sync-free `nan_to_num` raw-grad guard + `nonfinite_grad_tensors` diagnostic;
+`basis_capture` (fit) diagnostic; σ-clip DELETED; defaults: bs16, interval 10,
+activation checkpointing ON, raw grad clip 2.5 per tensor, log-every 10,
+`grassmann_step_size` 1.0. All 200-step LFM2.5-350M SYNTH pairs, eager, eval on.
+
+Measured (details in SUBSPACE_TRACKING.md):
+- Accumulation removes the σ noise wall: floor drops ~√window (0.054→0.014 at
+  interval 10); grad/moment coherence up; eval loss unchanged vs single-grad.
+- Random-init stress: acquisition is dead in both regimes — step 5 limit-cycles
+  (clip pinned rotation at step×clip), step 0.5 starves (no persistent residual
+  to accumulate; capture stuck ~0.22 ≈ chance). Tracking is maintenance-only.
+- In-vitro (fixed grad): update math verified correct; converges capture
+  0.25→0.87 at step 0.5; step 5 freezes at 0.60 (limit cycle). σ-clip was the
+  masking mechanism → deleted.
+- Audit: SubTrack's published code never tracks tall/square matrices (its
+  right-branch tangent projector is identically zero, `eye(r)−QQᵀ=0` for a
+  row-orthonormal basis). Our port is side-correct; their empirical support for
+  transformer shapes is weaker than assumed.
+- σ is contact, not fit: exactly 0 at the eigh basis of the same grad; same
+  numeric value can mean well-fit, no-contact, or churn-dominated window. Read
+  it only next to `basis_capture`.
+- Basis quality binds on loss when the gap is big: random vs eigh init costs
+  ~0.12 nats at 200 steps. Frozen-basis control: tracked beats frozen on capture
+  AND loss (first positive tracking payoff); frozen wins erank/alignment (those
+  metrics penalize any rotation — do not read them alone).
+
+Next (new session): arm A′ — decomposition-aimed rank-1 (eigh target frame,
+principal-angle rank-1 geodesic step). Open design: what the eigh sees without
+full-size Gram state.

@@ -780,6 +780,15 @@ def train_step(
         (loss / grad_accum_steps).backward()
         losses.append(loss.detach().float())
     grad_norm = gradient_norm(trainable) if collect_norms else float("nan")
+    # The optimizer clips PER TENSOR at grad_clip_norm; the global norm above sums
+    # over ~all tensors and so cannot be read against that rail (and it scales with
+    # batch noise, e.g. ~2x higher at bs4 than bs16). Log the max per-tensor norm
+    # too so "is the clip firing" is answerable from the curves.
+    grad_norm_max_tensor = (
+        max(param.grad.detach().float().norm() for param in trainable if param.grad is not None)
+        if collect_norms
+        else float("nan")
+    )
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
@@ -787,6 +796,7 @@ def train_step(
     projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
     tangent_sigma_max = optimizer_diagnostic(optimizer, "mean_tangent_sigma_max") if collect_basis else float("nan")
+    basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
     aurora_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
@@ -795,6 +805,7 @@ def train_step(
     return {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
+        "grad_norm_max_tensor": grad_norm_max_tensor,
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
@@ -802,6 +813,7 @@ def train_step(
         "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
         "rotation_angle": rotation_angle,
         "tangent_sigma_max": tangent_sigma_max,
+        "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
         "aurora_erank": aurora_erank,
         "aurora_erank_pct": aurora_erank_pct,
@@ -892,7 +904,7 @@ def run_optimizer(
             adafactor_beta2=args.adafactor_beta2,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
             grassmann_step_size=args.grassmann_step_size,
-            grassmann_sigma_clip=args.grassmann_sigma_clip,
+            grassmann_accumulate=not args.no_grassmann_accumulate,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
@@ -966,10 +978,12 @@ def run_optimizer(
             train_metrics = {
                 f"{optimizer_name}/train_loss": train_loss,
                 f"{optimizer_name}/grad_norm": scalar(step_result["grad_norm"]),
+                f"{optimizer_name}/grad_norm_max_tensor": scalar(step_result["grad_norm_max_tensor"]),
                 f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
                 f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
                 f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
                 f"{optimizer_name}/projected_grad_p90_to_moment_ratio": scalar(step_result["projected_grad_p90_to_moment_ratio"]),
+                f"{optimizer_name}/basis_capture": scalar(step_result["basis_capture"]),
                 f"{optimizer_name}/aurora_alignment": scalar(step_result["aurora_alignment"]),
                 f"{optimizer_name}/aurora_erank": scalar(step_result["aurora_erank"]),
                 f"{optimizer_name}/aurora_erank_pct": scalar(step_result["aurora_erank_pct"]),
@@ -1046,6 +1060,7 @@ def run_optimizer(
     measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
     measured_rotation_angle = [step["rotation_angle"] for step in measured_steps]
     measured_tangent_sigma_max = [step["tangent_sigma_max"] for step in measured_steps]
+    measured_basis_capture = [step["basis_capture"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
     measured_aurora_erank_pct = [step["aurora_erank_pct"] for step in measured_steps]
@@ -1102,6 +1117,7 @@ def run_optimizer(
         # than mixing in NaN gaps.
         "last_logged_rotation_angle": last_finite_scalar(measured_rotation_angle),
         "last_logged_tangent_sigma_max": last_finite_scalar(measured_tangent_sigma_max),
+        "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
         "last_logged_aurora_erank": last_finite_scalar(measured_aurora_erank),
         "last_logged_aurora_erank_pct": last_finite_scalar(measured_aurora_erank_pct),
@@ -1136,7 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=3, help="ceiling on measured optimizer steps; clamped down with a warning if the dataset can't supply this many rows")
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-blocks", type=int, default=8, help="number of validation batches/blocks to build")
     parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of source validation batches/blocks to build")
@@ -1161,10 +1177,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis refresh and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
-    parser.add_argument("--grad-clip-norm", type=float, default=10.0, help="clip the RAW gradient to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 10 sits just above the post-warmup grad body (mostly <10) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=5.0, help="TEMPORARY default: best current estimate, NOT recalibrated for the fixed sigma scale (sigma dropped ~10x after the normalization/adafactor fixes). Recalibrate before trusting. See SUBSPACE_TRACKING.md.")
-    parser.add_argument("--grassmann-sigma-clip", type=float, default=0.1, help="cap on the tangent singular value used for the rotation angle; bounds how far a single noisy batch can rotate the basis, letting step_size be raised. Surgical to the tracker (adafactor/moment path sees the raw grad). Safety cap, not denoising -- that is the accumulation lattice's job.")
-    parser.add_argument("--basis-refresh-interval", type=int, default=100)
+    parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
+    parser.add_argument("--grassmann-step-size", type=float, default=1.0, help="geodesic rotation = step_size * sigma. Stability-bounded: step 5 limit-cycles/orbits at acquisition-scale sigma (measured in vitro); 0.5 converged in vitro; 1 is the live maintenance default. No sigma clip exists anymore -- blip safety is the upstream per-tensor raw-grad clip.")
+    parser.add_argument("--no-grassmann-accumulate", action="store_true", help="ablation arm: disable windowed tangent accumulation and refresh from the boundary step's single grad (the pre-accumulation path). Default is accumulate ON.")
+    parser.add_argument("--basis-refresh-interval", type=int, default=10)
     parser.add_argument(
         "--basis-refresh-schedule",
         choices=("burst", "layer-staggered"),
@@ -1175,7 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--polar-ns-steps", type=int, default=5)
     parser.add_argument("--projected-grad-clip-norm", type=float, default=0.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. OFF now: raw-grad clipping (--grad-clip-norm) bounds the gradient upstream of adafactor/projection, which makes this downstream moment-only clip redundant (and it could not stop a blip from poisoning adafactor's second moment anyway -- that damage is upstream). Re-enable only if a specific moment-scale failure reappears.")
     parser.add_argument("--projected-grad-clip-ratio", type=float, default=0.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables. adafactor_ema's projected-grad norm is stable so this rail is unnecessary there; --moment-mode ema needs it re-enabled, e.g. 6.0")
-    parser.add_argument("--activation-checkpointing", action="store_true", help="enable model gradient checkpointing before training")
+    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="model gradient checkpointing; default ON (bs16@seq1024 OOMs a 12GB card without it); --no-activation-checkpointing to disable")
     parser.add_argument(
         "--torch-compile",
         action="store_true",
@@ -1197,7 +1213,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="sumotrack")
-    parser.add_argument("--wandb-log-every", type=int, default=20, help="log train loss and core grad/update norms every N measured steps")
+    parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and core grad/update norms every N measured steps; 10 aligns with the default basis_refresh_interval=10 so every retraction's rotation/sigma is captured")
     return parser
 
 

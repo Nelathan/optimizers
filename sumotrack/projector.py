@@ -165,28 +165,25 @@ class SubspaceProjector:
         return self.project_back(self.project(matrix))
 
     @torch.no_grad()
-    def update_grassmann(self, matrix: Tensor, step_size: float, sigma_clip: float | None = 0.1) -> Tensor:
-        """Refresh the basis with a Grassmann geodesic tangent step.
+    def compute_tangent(self, matrix: Tensor) -> Tensor:
+        """Canonical-layout Grassmann tangent of ``matrix`` at the current basis.
 
-        Port of SubTrack's ``track_the_subspace``: project the least-squares
-        residual onto the tangent space at the current (column-orthonormal) basis,
-        take its top-``rank`` singular triple, and retract along the exact geodesic
-        (``cos``/``sin`` rotation of the ``[Q@V, U]`` principal-angle frame) rather
-        than a first-order QR retraction. SubTrack calls this with ``k=1``; ``k=rank``
-        here is the direct spectral generalization to a rank-``r`` tracked subspace.
+        Returns the tangent in SubTrack's column-orthonormal canonical frame,
+        shape ``[dim, rank]`` (RIGHT bases are transposed into this frame; LEFT
+        bases already are it -- see the layout note in ``update_grassmann``).
 
-        The rotation is ``step_size * sigma`` with raw singular values (self-annealing:
-        big residual -> big step, well-fit -> small step, so the tracker settles).
-        The one storage-layout adaptation: RIGHT-side bases are stored row-orthonormal
-        and are transposed into SubTrack's column-orthonormal convention before the
-        shared geodesic and transposed back after.
+        Called every optimizer step under the accumulation path, so this must
+        stay free of device->host syncs: no ``.item()``, ``.cpu()``, or the
+        ``torch.isfinite(...).all()`` check from ``_spectral_input`` (that check
+        is itself a hidden sync). Finite validation stays confined to ``fit_*``.
         """
 
-        if step_size <= 0:
-            raise ValueError(f"step_size must be positive, got {step_size}")
-        basis = self._basis_for(matrix)
+        if self.basis is None:
+            raise RuntimeError("cannot compute a Grassmann tangent before fitting a basis")
+        self._check_basis_matches(matrix)
+        basis = self.basis
         side = self._basis_side()
-        work_matrix = self._spectral_input(matrix)
+        work_matrix = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
         # NO Frobenius normalization. We previously divided the gradient by its global
         # norm here for gradient-scale invariance, but that made the tangent sigma a
         # scale-free ratio -- structurally blind to residual *magnitude*, so it could
@@ -218,7 +215,34 @@ class SubspaceProjector:
         estimated_w = canon_basis.mT @ canon_grad
         residual = canon_grad - canon_basis @ estimated_w
         partial = -2.0 * (residual @ estimated_w.mT)
-        tangent = partial - canon_basis @ (canon_basis.mT @ partial)
+        return partial - canon_basis @ (canon_basis.mT @ partial)
+
+    @torch.no_grad()
+    def update_grassmann_from_tangent(self, tangent: Tensor, step_size: float) -> Tensor:
+        """Retract along the exact Grassmann geodesic from a precomputed canon tangent.
+
+        Port of SubTrack's ``track_the_subspace`` retraction half: take the
+        tangent's top-``rank`` singular triple and retract along the exact
+        geodesic (``cos``/``sin`` rotation of the ``[Q@V, U]`` principal-angle
+        frame) rather than a first-order QR retraction. SubTrack calls this with
+        ``k=1``; ``k=rank`` here is the direct spectral generalization to a
+        rank-``r`` tracked subspace.
+
+        The rotation is ``step_size * sigma`` with raw singular values (self-annealing:
+        big residual -> big step, well-fit -> small step, so the tracker settles).
+        The one storage-layout adaptation: RIGHT-side bases are stored row-orthonormal
+        and are transposed into SubTrack's column-orthonormal convention before the
+        shared geodesic and transposed back after -- ``tangent`` is expected already
+        in that canonical ``[dim, rank]`` layout (see ``compute_tangent``).
+        """
+
+        if step_size <= 0:
+            raise ValueError(f"step_size must be positive, got {step_size}")
+        if self.basis is None:
+            raise RuntimeError("cannot retract a Grassmann geodesic before fitting a basis")
+        side = self._basis_side()
+        work_basis = self.basis.float() if self.basis.dtype in (torch.float16, torch.bfloat16) else self.basis
+        canon_basis = work_basis.mT if side is ProjectionSide.RIGHT else work_basis
 
         # Rank-1 rotation, faithful to SubTrack (``rank_k_matrix_estimation(..., k=1)``):
         # rotate the *single* dominant tangent direction and carry the rest of the
@@ -230,20 +254,13 @@ class SubspaceProjector:
         # motion across refreshes rather than tracked. Full-spectrum rotation is a
         # parked idea, not the heading.
         singular_u, singular_values, singular_v = self._rank_k_svd(tangent, 1)
-        # Record the RAW (unclipped) sigma into the diagnostic -- it is the honest
-        # residual-magnitude measurement, and a clipped readout would hide whether the
-        # clip is firing or how big a spike actually was. The clip below affects only
-        # the values fed to the rotation, not this readout.
         self.last_tangent_sigma_max = float(singular_values.max().detach().cpu()) if singular_values.numel() else float("nan")
-        # Clip sigma to bound the rotation angle. sigma carries residual magnitude
-        # (self-annealing, good), but a single noisy batch can spike it and fling the
-        # basis too far in one step. Capping sigma protects the *step size* without
-        # touching the moment/projection path (adafactor still sees the raw noise,
-        # which the user wants -- the clip is surgical to the tracker). This is a
-        # safety cap, NOT denoising: it bounds how far a noisy direction rotates, it
-        # does not improve the *aim* (that is the accumulation lattice's job).
-        if sigma_clip is not None and singular_values.numel():
-            singular_values = singular_values.clamp_max(sigma_clip)
+        # No sigma clip. A clip existed as blip safety, but whenever sigma sat above
+        # it the rotation became a CONSTANT angle (step*clip) -- self-annealing died
+        # and the geodesic limit-cycled instead of converging (measured in vitro:
+        # capture froze at 0.60 with rotation pinned at 0.5 rad; removing the clip
+        # in the stable step regime converged to 0.87). Blip protection lives
+        # upstream in the per-tensor raw-grad clip, which also guards adafactor.
 
         # Self-annealing geodesic retraction, faithful to SubTrack: rotate each
         # principal direction by ``step_size * sigma_i`` (raw singular values, not
@@ -276,9 +293,21 @@ class SubspaceProjector:
         # Back to storage layout: RIGHT is stored row-orthonormal, LEFT column-orthonormal.
         new_basis = canon_new.mT if side is ProjectionSide.RIGHT else canon_new
 
-        self.basis = new_basis.to(device=matrix.device, dtype=matrix.dtype).contiguous()
+        self.basis = new_basis.to(device=self.basis.device, dtype=self.basis.dtype).contiguous()
         self.resolved_side = side
         return self.basis
+
+    @torch.no_grad()
+    def update_grassmann(self, matrix: Tensor, step_size: float) -> Tensor:
+        """Refresh the basis with a Grassmann geodesic tangent step from ``matrix``.
+
+        Composition of ``compute_tangent`` (tangent at the current basis) and
+        ``update_grassmann_from_tangent`` (rank-1 SVD + geodesic retraction). Kept
+        as a single entry point for callers that do not need windowed tangent
+        accumulation (e.g. ``grassmann_accumulate=False``).
+        """
+
+        return self.update_grassmann_from_tangent(self.compute_tangent(matrix), step_size=step_size)
 
     @staticmethod
     def _rank_k_svd(matrix: Tensor, k: int) -> tuple[Tensor, Tensor, Tensor]:

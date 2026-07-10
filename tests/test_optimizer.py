@@ -40,6 +40,9 @@ class SumoTrackTest(unittest.TestCase):
         self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["fallback_update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["projected_grad_max_norm"], 0.0)
+        capture = opt.last_step_diagnostics["mean_basis_capture"]
+        self.assertGreater(capture, 0.0)
+        self.assertLessEqual(capture, 1.0 + 1e-5)
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -105,8 +108,11 @@ class SumoTrackTest(unittest.TestCase):
         step_grad = torch.randn_like(base)
         full_weight = torch.nn.Parameter(base.clone())
         queued_weight = torch.nn.Parameter(base.clone())
-        full_opt = SumoTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema")
-        queued_opt = SumoTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema")
+        # grad_clip_norm=None: the raw-grad clip lives upstream of projection, so the
+        # full-grad path clips while the queued-projected path structurally cannot --
+        # this test asserts the projection equivalence, so keep the clip out of it.
+        full_opt = SumoTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None)
+        queued_opt = SumoTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None)
 
         full_weight.grad = warm_grad.clone()
         queued_weight.grad = warm_grad.clone()
@@ -469,6 +475,10 @@ class SumoTrackTest(unittest.TestCase):
             grassmann_step_size=0.01,
             basis_refresh_interval=1,
             moment_mode="ema",
+            # This test asserts exact moment math against the raw grad; keep the
+            # per-tensor clip out of the way (a randn(8,5) grad's norm ~6 exceeds
+            # the 2.5 default rail).
+            grad_clip_norm=None,
         )
 
         weight.grad = torch.randn_like(weight)
@@ -486,6 +496,154 @@ class SumoTrackTest(unittest.TestCase):
         transported = old_lifted_moment @ new_basis.mT
         self.assertTrue(torch.allclose(state["projected_exp_avg"], 0.9 * transported + 0.1 * (second_grad @ new_basis.mT), atol=1e-5))
         self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
+
+    def test_grassmann_accumulate_same_grad_matches_single_grad_refresh_at_boundary(self):
+        """Mean of identical tangents equals the tangent itself, so feeding the SAME
+        grad every step across a full window must land the accumulate=True basis on
+        exactly the same place as accumulate=False fed that grad once at the
+        boundary. This is the core equivalence the accumulation lattice rests on.
+        """
+
+        torch.manual_seed(0)
+        init_weight = torch.randn(8, 5)
+        grad = torch.randn(8, 5)
+        interval = 4
+
+        accum_weight = torch.nn.Parameter(init_weight.clone())
+        accum_opt = SumoTrack(
+            [accum_weight],
+            lr=0.01,
+            rank=2,
+            grassmann_step_size=0.05,
+            basis_refresh_interval=interval,
+            moment_mode="ema",
+            grassmann_accumulate=True,
+        )
+        plain_weight = torch.nn.Parameter(init_weight.clone())
+        plain_opt = SumoTrack(
+            [plain_weight],
+            lr=0.01,
+            rank=2,
+            grassmann_step_size=0.05,
+            basis_refresh_interval=interval,
+            moment_mode="ema",
+            grassmann_accumulate=False,
+        )
+
+        for step in range(interval + 1):
+            accum_weight.grad = grad.clone()
+            accum_opt.step()
+            plain_weight.grad = grad.clone()
+            plain_opt.step()
+
+        self.assertTrue(torch.allclose(accum_opt.state[accum_weight]["basis"], plain_opt.state[plain_weight]["basis"], atol=1e-5))
+
+    def test_grassmann_accumulate_buffer_resets_after_refresh_and_seeds_after_init(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack(
+            [weight],
+            lr=0.01,
+            rank=2,
+            basis_refresh_interval=3,
+            grassmann_accumulate=True,
+        )
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        state = opt.state[weight]
+        # init step: fit, then seed the window with the first grad's tangent.
+        self.assertEqual(state["tangent_accum_count"], 1)
+        self.assertIsNotNone(state["tangent_accum"])
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        self.assertEqual(state["tangent_accum_count"], 2)
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        # count 3 here: init step seeded 1, then two more steps accumulated without
+        # refreshing (basis_refresh_interval=3 refreshes at internal step counter 3,
+        # i.e. the 4th call to .step()).
+        self.assertEqual(state["tangent_accum_count"], 3)
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        # 4th call hits the refresh boundary: buffer resets after retraction.
+        self.assertEqual(state["tangent_accum_count"], 0)
+        self.assertIsNone(state.get("tangent_accum"))
+
+    def test_grassmann_accumulate_state_dict_round_trip_preserves_buffer(self):
+        weight = torch.nn.Parameter(torch.randn(8, 5))
+        opt = SumoTrack(
+            [weight],
+            lr=0.01,
+            rank=2,
+            basis_refresh_interval=5,
+            grassmann_accumulate=True,
+        )
+
+        for _ in range(3):
+            weight.grad = torch.randn_like(weight)
+            opt.step()
+        saved = opt.state_dict()
+        saved_accum = opt.state[weight]["tangent_accum"].clone()
+        saved_count = opt.state[weight]["tangent_accum_count"]
+
+        new_weight = torch.nn.Parameter(weight.detach().clone())
+        new_opt = SumoTrack([new_weight], lr=0.01, rank=2, basis_refresh_interval=5, grassmann_accumulate=True)
+        new_opt.load_state_dict(saved)
+
+        new_state = new_opt.state[new_weight]
+        self.assertEqual(new_state["tangent_accum_count"], saved_count)
+        self.assertTrue(torch.equal(new_state["tangent_accum"], saved_accum))
+
+        new_weight.grad = torch.randn_like(new_weight)
+        new_opt.step()
+        self.assertEqual(new_opt.state[new_weight]["tangent_accum_count"], saved_count + 1)
+
+    def test_grassmann_accumulate_buffer_is_canon_rank_shaped_not_full_size(self):
+        weight = torch.nn.Parameter(torch.randn(9, 5))
+        opt = SumoTrack([weight], lr=0.01, rank=3, basis_refresh_interval=4, grassmann_accumulate=True)
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        tangent_accum = opt.state[weight]["tangent_accum"]
+        # RIGHT-side default (9x5 is tall -> right basis [rank, n]); canon tangent
+        # lives at [n, rank] = [5, 3], never the full [9, 5] gradient shape.
+        self.assertEqual(tuple(tangent_accum.shape), (5, 3))
+        self.assertLess(tangent_accum.numel(), weight.numel())
+
+    def test_nonfinite_grad_is_zeroed_not_propagated(self):
+        weight = torch.nn.Parameter(torch.randn(8, 4))
+        opt = SumoTrack([weight], lr=0.01, rank=2, basis_refresh_interval=3, grassmann_accumulate=True)
+        opt.diagnostics_enabled = True
+
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        self.assertEqual(opt.last_step_diagnostics["nonfinite_grad_tensors"], 0.0)
+
+        poisoned = torch.randn_like(weight)
+        poisoned[0, 0] = float("nan")
+        poisoned[1, 1] = float("inf")
+        weight.grad = poisoned
+        opt.step()
+
+        self.assertEqual(opt.last_step_diagnostics["nonfinite_grad_tensors"], 1.0)
+        self.assertTrue(torch.isfinite(weight).all())
+        state = opt.state[weight]
+        self.assertTrue(torch.isfinite(state["tangent_accum"]).all())
+        self.assertTrue(torch.isfinite(state["projected_exp_avg"]).all())
+        self.assertTrue(torch.isfinite(state["adafactor_row_var"]).all())
+
+        # Ride through a refresh boundary on clean grads: retraction from a buffer
+        # that once contained a sanitized batch must stay finite and orthonormal.
+        for _ in range(3):
+            weight.grad = torch.randn_like(weight)
+            opt.step()
+        projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
+        self.assertTrue(torch.isfinite(projector.basis).all())
+        self.assertLess(float(projector.orthonormality_error()), 1e-4)
 
 
 if __name__ == "__main__":
