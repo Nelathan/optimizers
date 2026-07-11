@@ -696,6 +696,127 @@ within a runnable horizon?** 🔴 — now THE payoff question
   walls there while the accumulated arm keeps annealing. Accumulation is the fix,
   and the floor scales as √window.
 
+**Q10 — How noisy is a single-batch eigh target?** 🟢 (answered 2026-07-11:
+churn, exactly at the cutoff, exactly as predicted — but *benign* churn)
+- *Answer:* consecutive T1 targets disagree by ~90° at the top principal angle
+  (`eigh_target_self_angle` = 1.562 rad ≈ 89.5° at the end of the A′1 run) and
+  the cutoff is degenerate (`eigh_target_cutoff_ratio` = 0.976 — the dropped
+  33rd eigenvalue is 97.6% of the kept 32nd). T1's largest-angle aim is pure
+  rank-cutoff membership churn; `tangent_sigma_max` = 1.561 confirms the basis
+  fully snapped a ~90° swap *every boundary*. The mitigating nuance: the churn
+  is energy-degenerate, so each swap trades a direction for a near-equivalent
+  one — capture landed at 0.438, *between* C1 rank-1 (0.429) and full-spectrum
+  (0.442), despite the musical chairs. The prediction on record (stable core,
+  churning cutoff) is confirmed on the cutoff half; the "stable core" half is
+  untested — the top-1 probe only sees the largest angle, which churn saturates.
+- *Consequence for the fork:* T1+R1+largest-angle is aimed at noise. But
+  cutoff_ratio ≈ 0.98 also caps the upside of fixing it: when the spectrum is
+  that flat at r, boundary membership is genuinely arbitrary and even a
+  denoised T2 target must make an arbitrary cutoff call. Denoising stabilizes
+  *which* arbitrary call gets made (fewer wasted rotations), it does not create
+  a signal that isn't there. Eigenvalue-weighted angle selection has the same
+  ceiling.
+- *Evaluate:* the gating probe in the A′ design-space section — boundary logs of
+  Q-vs-target angle, consecutive-target angle, cutoff eigengap.
+
+**Q11 — Does decomposition aim beat residual-persistence aim on maintenance?** 🟡
+(first evidence 2026-07-11: not under T1 — but T1's aim was churn, so the clean
+form of the question is still open, with capped upside)
+- *Why:* the A′ premise. Tangent tracking needs a persistent residual and drift
+  outruns it; eigh aim needs no persistence. If A′ holds capture under drift
+  better than C1 and frozen, decomposition-aim becomes the forward path.
+- *Evidence (A′1 = T1+R1, step 1.0, rank 32, 200 steps, vs the Q13 pair):*
+  final val 2.0267 vs C1 rank-1 2.0253 vs C1 full-spectrum 2.0212; capture
+  0.438 vs 0.429 vs 0.442; grad p90/moment ratio worse (2.97); alignment/erank
+  a touch higher (0.746 / 24.3) but those are rotation-biased reads. Every
+  margin within run-to-run noise. Frozen control confirmed clearly worse
+  (drift result replicated). User read, concurring: leans original algo.
+- *Interpretation:* this run does not test a *clean* decomposition aim — Q10
+  shows every A′1 rotation was a full-snap 90° cutoff swap, and the arm still
+  tied C1. That is oddly robust (energy-degenerate swaps are cheap), but it
+  means the honest comparison needs A′2 (windowed target) or
+  eigenvalue-weighted selection — and Q10's cutoff_ratio ≈ 0.98 says the
+  achievable margin over C1 is small.
+- *Correction (user, 2026-07-11):* the comparison above crosses state classes.
+  C1 carries a persistent fp32 `[d,r]` accumulator per matrix; A′1 carries
+  nothing. **Within the zero-state class, decomposition aim wins:** A′1 (capture
+  0.438) clearly beats the unbuffered single-grad tangent rank-1-per-10 arm
+  that drift outran last arc. The honest statement: decomposition aim matches
+  buffered tangent tracking *without the buffer*, while snap-rotating pure
+  churn. The open question is whether smoothing it (Q14) beats buffered C1
+  outright — which would delete C1's `[d,r]` state from the product path.
+- *Evaluate (next):* Q14 (stateless manifold EMA) first; A′2 only if Q14 stalls.
+
+**Q14 — Does fractional full-spectrum eigh aim (stateless manifold EMA) beat
+both A′1-snap and buffered C1?** 🔴 — the Karcher lead, followed with zero state
+- *Why:* `Q ← geodesic(Q, α, target_t)` at each boundary is stochastic gradient
+  descent on the Grassmann sum-of-squared-distances to the target stream — an
+  *incremental Karcher mean* whose accumulator is the basis itself (GROUSE uses
+  exactly this fractional-step mechanism against noisy observations). This is
+  the temporal smoothing A′1 lacked, with no `[d,r]` buffer, no `k×k` state,
+  and no new code: `--grassmann-aim eigh --grassmann-rotate-rank 32
+  --grassmann-step-size α`. Note a `k×k` buffer could never substitute: the aim
+  lives in `(I−QQᵀ)`-space, which Q-coordinates cannot express — stateless
+  manifold EMA is the *only* smoothing shape that fits the no-big-state
+  constraint, not a compromise.
+- *Prediction on record:* the churn angle (~90° at the cutoff, Q10) bounces —
+  α·90° toward an arbitrary energy-degenerate direction each boundary,
+  capture-neutral, so `rotation_angle` stays ≈ α·π/2 and should NOT be read as
+  progress. The other 31 angles are the signal: persistent drift directions get
+  consistently closed while churn averages out on the manifold. Expect capture
+  ≥ A′1-snap; the interesting outcome is capture ≥ buffered C1, which would
+  delete C1's fp32 `[d,r]` state from the product path.
+- *Evaluate:* eigh aim, rotate_rank 32, α ∈ {0.5, 0.25}, standard contract
+  (rank 32, bs16, interval 10, 200 steps, eval on) vs A′1-snap and the Q13
+  pair. Q10 probe stays on — self-angle should be unchanged (~90°, it measures
+  the targets, not the basis); Q-vs-target σ_max at steady state is the new
+  read: lower than π/2 means the basis found a stable center the targets orbit.
+- *Evidence:* none.
+
+**Q13 — Does full-spectrum rotation of the MEAN tangent beat rank-1 drift?** 🟢
+(soft-positive, 2026-07-11) — the pre-A′ baseline
+- *Answer:* full-spectrum (rotate_rank 32) modestly beats rank-1 on every axis
+  that matters, and is stable: capture 0.442 vs 0.429, final val 2.0212 vs
+  2.0253, σ_max LOWER (0.0150 vs 0.0166 — converging better), alignment 0.734
+  vs 0.730, erank 24.0 vs 23.9. Total rotation 0.099 vs 0.017 rad — but that is
+  ~0.003 rad *per plane*: the mean tangent turns "spin" into 32 gentle
+  corrections. **The old spin verdict was about single-batch tail noise, not
+  about multi-rank rotation per se; C1's window denoises the tail and makes
+  full-spectrum rotation safe and mildly better.** Margins are small (0.004
+  val, 0.013 capture) and the pair is unseeded — soft, but coherent across all
+  metrics in the same direction.
+- *Consequences:* (1) rank-1-only is no longer a discipline, it was a noise
+  guard — on denoised signals, rotate more; (2) A′'s "largest principal angle
+  only" should be evaluated against multi-angle rotation toward the eigh target
+  (the `grassmann_rotate_rank` knob applies to A′'s synthesized tangent for
+  free); (3) default stays rotate_rank=1 pending the user's call — this was one
+  soft pair, not a promotion.
+- *Why:* the spin verdict (drift-vs-spin, rank 64) was passed on *single-batch*
+  tangents, before C1 and before `basis_capture` existed. Spin thrashed because
+  the single-batch tail is isotropic noise — but the window-mean tangent is
+  precisely the object whose tail is denoised, so the verdict does not
+  automatically transfer. SubTrack averaged ~100 grads and still rotated only
+  rank 1; if full-spectrum rotation of a 10-window mean wins on capture, that
+  measures how much structure the window actually recovers (and would reshape
+  A′'s rank-1-only discipline too).
+- *Evaluate:* `--grassmann-rotate-rank {1, 32}` pair (new flag, threaded through
+  `update_grassmann_from_tangent`), eigh init, rank 32, bs16, interval 10,
+  200 steps, eval on. Read basis_capture primary, eval loss; erank/alignment
+  secondary (frozen-biased). Fresh rank-1 arm in the same pair — the harness has
+  no seed control, so cross-session curve comparison is not matched.
+- *Evidence:* none under the mean tangent. Historical spin evidence (single
+  batch): 30× rotation energy, no loss gain, marginally higher erank/alignment.
+
+**Q12 — Rotations vs signal: is averaging rotations (closed-form chordal mean,
+C6/R3) better than averaging the signal before one rotation?** 🔴
+- *Why:* the only form that never averages across frames *and* never averages
+  the signal; the Markley/Moakher closed form removes C6's cost excuse (no
+  Karcher iteration — mean of skew logs in one frozen frame, one small SVD).
+- *Evaluate:* A′3 vs A′2 at matched window; per-step eigh cost makes this a
+  diagnostic-tier run, not a default candidate.
+- *Evidence:* none. Subsumes Q4's practical half; Q4 stays open only for the
+  cross-frame (transport-paying) variant.
+
 ### Drift is real and tracking pays (frozen-basis control, 2026-07-10)
 Eigh-init rank-32, 200 steps, step 1, no clip: tracked capture fell 0.60→0.43 —
 but the frozen-basis control (interval 100000, no refresh ever) is **worse on
@@ -725,6 +846,116 @@ the eigh sees — boundary grad is free but single-batch noisy; a window Gram is
 denoised but side-Gram is `[n,n]` (full-size state, forbidden); sketch/low-rank
 alternatives to be designed. Evaluate against: C1 tangent tracking (this arc's
 default) and frozen basis, on capture + eval loss.
+
+### Arm A′ design space (mapped 2026-07-10 — evaluate, do not collapse)
+
+**Shared mechanics (all arms).** Given current canon basis `Q:[d,r]` and a
+target frame `Q_t:[d,r]` (both in the canon column-orthonormal frame; canon
+ambient `d` = the smaller matrix side), the principal-angle decomposition is
+`SVD(Qᵀ Q_t) = U cosΘ Vᵀ` — an `[r,r]` SVD, genuinely cheap. The largest
+principal angle `θ` pairs `u = Q U[:,i]` (our most-disagreeing direction) with
+`w = normalize((I − QQᵀ) Q_t V[:,i])` (where the target says it should be).
+Synthesizing the rank-1 canon tangent **`T = θ · w uᵀ`** and feeding it to the
+existing `update_grassmann_from_tangent` reproduces exactly the rank-1 geodesic
+toward the target: its top singular triple is `(w, θ, u)`, rotation
+`step_size·θ`. **No new retraction code; A′ is a new tangent *source*, and the
+whole C1 boundary plumbing is reusable.** Two semantic shifts vs the tangent
+path, both structural wins: (1) the "σ" is now a true angle in radians —
+scale-free by construction, the entire σ-units saga does not apply; (2)
+self-annealing is geometric (`Q → Q_t ⟹ θ → 0`) rather than
+residual-magnitude-driven. The noise floor moves from σ into the *target*: if
+`Q_t` jitters batch-to-batch, θ floors at target-noise level. Same disease, new
+thermometer — which is why the target-source fork is load-bearing.
+
+**Transient vs state, clarified.** `fit_eigh` already builds an `[n,n]` Gram
+*transiently* at every fit; the invariant forbids full-size **state**, not
+full-size transient compute. So a boundary eigh target costs one extra
+fit-sized computation (`m·n²` Gram + `n³` eigh) per matrix per interval —
+amortized over interval 10 that is real but acceptable. What stays forbidden is
+a *persistent* window Gram (`Σ gᵢᵀgᵢ` as state).
+
+**`step_size` semantics change.** `step_size` becomes a fraction of the angle
+to the target: 1.0 = snap the top disagreement direction fully onto the target.
+Under a noisy target (T1 below), fractional step is the *only* noise filter the
+arm has — step_size is load-bearing there, an implicit EMA on aim. Under a
+denoised target it is nearly free. Calibrate per target source; do not carry 1.0
+across sources on faith.
+
+**Axis 1 — what the eigh sees (the target source):**
+
+| src | signal | state | per-step cost | boundary cost | persistence needed |
+|---|---|---|---|---|---|
+| T1 | boundary single grad | none | none | Gram `m·n²` + eigh `n³` | none |
+| T2 | **sketched window-mean grad**: fixed `Ω:[k,m]`, accumulate `S += Ω@gᵢ`, state `[k,n]`, `k ≈ r+8` | `[k,n]` ≈ 1.25× basis | `k·m·n` ≈ 0.4× tangent path | SVD of `[k,n]` (`k²n`, cheaper than eigh) → top-r right-singular vectors | within-window (same as C1) |
+| T3 | per-step eigh target (each batch grad → its own `Q_t`) | none (rotations buffered, see R3) | Gram+eigh **every step** ≈ `n/(3r)`× tangent (~10× at n=1024, r=32) | tiny | none — each target is instantaneous |
+| T4 | persistent Gram / second-moment EMA `[n,n]` | **forbidden state** | — | — | ⚫ dead on arrival |
+
+T2 notes: sketching is *exact* for the averaging (`Σ Ωgᵢ = Ω Σgᵢ` — sketch of
+sum is sum of sketches); only the range-finding is approximate
+(Halko–Martinsson–Tropp randomized range finder, good for decaying spectra).
+Design details to decide at build time: redraw `Ω` per window vs fixed (fixed
+has a permanent blind spot), and optionally Q-augmented sketch `[Q; Ω]` to
+guarantee the current subspace stays visible to the target.
+
+T1↔T2 is also a *conceptual* trade, not just noise: window-averaging
+reintroduces a within-window persistence requirement — the very thing
+decomposition-aim was meant to escape. But the requirement is much weaker than
+the tangent path's: eigh ranks by **magnitude over the whole grad** (dominated
+by captured signal, which is batch-stable), while the tangent sees only the
+residual (churn-dominated at convergence). Expectation, to be measured, is that
+even T1's target is far more stable than a single-batch tangent.
+
+**Axis 2 — how the rotation is smoothed:**
+
+| rot | form | frame legality | gates |
+|---|---|---|---|
+| R1 | one rank-1 rotation per boundary, `step_size·θ` | single frame, clean | none |
+| R2 | cross-boundary rotation EMA: keep a running mean of plane-rotation logs `θ(wuᵀ − uwᵀ)` across boundaries, apply its top plane | **spans frames — transport sin** | Q1 |
+| R3 | within-window rotation mean at frozen Q (C6 instantiated): per-step target (T3) → per-step plane triple `(uᵢ, wᵢ, θᵢ)` all computed at the SAME Q → boundary **closed-form chordal mean** (mean of skew logs = mean skew, top singular plane of a `[d,2N]` structured stack; Markley/Moakher lineage — no Karcher iteration needed at small angles) → one rank-1 retraction | one frame, clean — the frozen-frame trick that made C1 legal makes this legal too | needs T3's per-step targets (hot) |
+
+R3 *is* lattice row C6 made concrete, with the closed form replacing Riemannian
+iteration: within one tangent frame the chordal mean of small rotations is just
+the arithmetic mean of their skew logs projected back to a single plane —
+"accumulate a linear object, solve back to the manifold once with a small
+eigh/SVD" (Markley's quaternion averaging is the SO(3) special case; Moakher's
+projected-arithmetic-mean is the general statement). Note the deep symmetry: R3
+averages *rotations-to-target*, C1 averages *tangents* — same reset-buffer
+geometry, different signal. R2 is the rotation-space mirror of C2 (tangent EMA)
+and inherits exactly Q1's transport question.
+
+**Predicted hazard — rank-cutoff churn (measure before trusting T1).**
+*[MEASURED 2026-07-11: fired. Self-angle ≈ 89.5°, cutoff ratio 0.976 — see Q10.]* The
+largest principal angle between Q and a fresh eigh target likely lives at the
+rank cutoff: when the grad spectrum is near-degenerate around eigenvalue r, the
+target's membership at the boundary swaps batch-to-batch, producing spurious
+~90° principal angles of pure churn — and rank-1-largest-angle selection aims
+at *precisely* that direction. Mitigations live in the space (windowed target
+T2 stabilizes the cutoff; selection weighted by target eigenvalue instead of
+raw angle), but measure first. Gating probe (diagnostic-only, one extra
+`[r,n]` buffer per matrix to hold the previous target): at each boundary log
+(a) top principal angle Q vs target, (b) top principal angle between
+*consecutive* targets (target self-consistency — the direct noise read),
+(c) the eigengap at the rank cutoff. If (b) sits near 90°, T1's aim is
+cutoff churn and the fork resolves toward T2/T3 selection-weighting.
+
+**Arms and what each answers** (controls: C1 tangent tracking = this arc's
+default, and frozen basis):
+- **A′1 = T1+R1** (zero state, boundary-only cost): does decomposition aim beat
+  residual-persistence aim at all? (vs C1 on capture + eval loss)
+  *[RUN 2026-07-11: tied C1 within noise while snap-rotating pure cutoff churn
+  — see Q10 (probe fired) and Q11 (evidence). Built as `--grassmann-aim eigh`.]*
+- **A′2 = T2+R1** (~C1's cost class): does denoising the target pay? (vs A′1)
+- **A′3 = T3+R3** (hot, diagnostic-tier): is averaging *rotations* better than
+  averaging the *signal*? (C6/Q4's question, now concretely answerable)
+- **A′4 = R2 on any source**: per-step-drift mirror; gated on Q1, do not build
+  before Q1's transport probe runs.
+
+**Evaluation contract** (per the standing next-step): eigh init, rank 32, bs16,
+interval 10, 200 steps, eval on; primary reads **basis_capture** (does the arm
+hold capture against drift better than frozen, and than C1?) and **eval loss**;
+erank/aurora-alignment secondary only (both known biased toward frozen — every
+rotation perturbs the moment spectrum). A′ needs its own small step_size
+calibration ({0.25, 0.5, 1.0} on T1) since the knob's meaning changed.
 
 ---
 

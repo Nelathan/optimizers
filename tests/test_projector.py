@@ -162,6 +162,88 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertEqual(tuple(projector.basis.shape), tuple(old_basis.shape))
         self.assertLess(float(projector.orthonormality_error()), 1e-5)
 
+    def test_grassmann_full_spectrum_rotation_preserves_orthonormality_both_sides(self):
+        """rotate_rank > 1 (the full-spectrum ablation arm) must hold orthonormality
+        under a REAL rotation -- the no-op regime is exactly where the old frame bug
+        hid, and multi-rank rotation exercises every (Q@V_i, U_i) plane at once."""
+
+        torch.manual_seed(3)
+        for shape in ((24, 7), (7, 24)):  # right and left branches
+            projector = SubspaceProjector(rank=4)
+            projector.fit_eigh(torch.randn(*shape))
+
+            rank1 = SubspaceProjector(rank=4)
+            rank1.basis = projector.basis.clone()
+            rank1.resolved_side = projector.resolved_side
+
+            refresh = torch.randn(*shape) * 5.0
+            projector.update_grassmann(refresh, step_size=1.0, rotate_rank=4)
+            rank1.update_grassmann(refresh, step_size=1.0, rotate_rank=1)
+
+            # fp32 error compounds across the rotated planes (~2e-5 for 4 planes at
+            # violent angles vs ~1e-6 for rank-1); 1e-4 pins "orthonormal" while
+            # leaving room for that accumulation.
+            self.assertLess(float(projector.orthonormality_error()), 1e-4, msg=f"shape={shape}")
+            # Full-spectrum turns the basis at least as far as drift (total radians).
+            self.assertGreaterEqual(projector.last_rotation_angle, rank1.last_rotation_angle, msg=f"shape={shape}")
+
+    @staticmethod
+    def _canon_basis(projector: SubspaceProjector) -> torch.Tensor:
+        from sumotrack.projector import ProjectionSide
+
+        basis = projector.basis
+        return basis.mT if projector._basis_side() is ProjectionSide.RIGHT else basis
+
+    def test_eigh_target_full_snap_lands_on_target(self):
+        """Retracting the toward-target log-map tangent with step 1 and all angles
+        rotated must land the basis exactly on the target subspace. This pins the
+        sign convention (tangent is a cost gradient; retraction steps along -U)
+        and that tangent_toward is the true inverse of the geodesic exp map."""
+
+        torch.manual_seed(7)
+        for shape in ((24, 7), (7, 24)):  # right and left branches
+            projector = SubspaceProjector(rank=4)
+            projector.fit_eigh(torch.randn(*shape))
+            target_frame, eigenvalues = projector.eigh_target_frame(torch.randn(*shape))
+            self.assertEqual(tuple(target_frame.shape), (min(shape), 4))
+            self.assertEqual(eigenvalues.shape[0], min(shape))
+
+            tangent = projector.tangent_toward(target_frame, top_k=4)
+            projector.update_grassmann_from_tangent(tangent, step_size=1.0, rotate_rank=4)
+
+            # Sine-based gap (residual of projecting the target into the new basis):
+            # arccos-based principal angles saturate at ~1e-3 rad in fp32 near s=1,
+            # so they cannot certify a landing; the sine metric is exact there.
+            canon = self._canon_basis(projector)
+            sine_gap = torch.linalg.svdvals(target_frame - canon @ (canon.mT @ target_frame)).max()
+            self.assertLess(float(sine_gap), 1e-4, msg=f"shape={shape}")
+            self.assertLess(float(projector.orthonormality_error()), 1e-4, msg=f"shape={shape}")
+
+    def test_eigh_target_rank1_closes_the_largest_angle_only(self):
+        """top_k=1 with a full snap closes the largest principal angle toward the
+        target while leaving the rest of the frame carried, so the remaining gap
+        equals the previous SECOND-largest angle."""
+
+        torch.manual_seed(11)
+        projector = SubspaceProjector(rank=4)
+        projector.fit_eigh(torch.randn(24, 7))
+        target_frame, _ = projector.eigh_target_frame(torch.randn(24, 7))
+
+        overlap = self._canon_basis(projector).mT @ target_frame
+        angles_before = torch.arccos(torch.linalg.svdvals(overlap).clamp(-1.0, 1.0))
+        second_largest = float(angles_before[-2])
+
+        tangent = projector.tangent_toward(target_frame, top_k=1)
+        # sigma of the log-map tangent IS the principal angle (a true radian).
+        self.assertAlmostEqual(
+            float(torch.linalg.svdvals(tangent).max()), float(angles_before[-1]), places=5
+        )
+        projector.update_grassmann_from_tangent(tangent, step_size=1.0, rotate_rank=1)
+
+        gap_after = float(SubspaceProjector.top_principal_angle(self._canon_basis(projector), target_frame))
+        self.assertLess(gap_after, second_largest + 1e-4)
+        self.assertLess(float(projector.orthonormality_error()), 1e-4)
+
     def test_grassmann_update_matches_geodesic_formula_rank_one(self):
         """Pin our rank-r retraction against the rank-1 geodesic formula (cos/sin
         rotation of the (Q@V, U) principal-angle frame). This guards against

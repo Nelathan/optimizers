@@ -796,6 +796,8 @@ def train_step(
     projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
     tangent_sigma_max = optimizer_diagnostic(optimizer, "mean_tangent_sigma_max") if collect_basis else float("nan")
+    eigh_target_self_angle = optimizer_diagnostic(optimizer, "mean_eigh_target_self_angle") if collect_basis else float("nan")
+    eigh_target_cutoff_ratio = optimizer_diagnostic(optimizer, "mean_eigh_target_cutoff_ratio") if collect_basis else float("nan")
     basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
@@ -813,6 +815,8 @@ def train_step(
         "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
         "rotation_angle": rotation_angle,
         "tangent_sigma_max": tangent_sigma_max,
+        "eigh_target_self_angle": eigh_target_self_angle,
+        "eigh_target_cutoff_ratio": eigh_target_cutoff_ratio,
         "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
         "aurora_erank": aurora_erank,
@@ -904,6 +908,8 @@ def run_optimizer(
             adafactor_beta2=args.adafactor_beta2,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
             grassmann_step_size=args.grassmann_step_size,
+            grassmann_rotate_rank=args.grassmann_rotate_rank,
+            grassmann_aim=args.grassmann_aim,
             grassmann_accumulate=not args.no_grassmann_accumulate,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
@@ -1000,6 +1006,14 @@ def run_optimizer(
             tangent_sigma_max = scalar(step_result["tangent_sigma_max"])
             if tangent_sigma_max == tangent_sigma_max:
                 train_metrics[f"{optimizer_name}/tangent_sigma_max"] = tangent_sigma_max
+            # Q10 probe metrics exist only under --grassmann-aim eigh, and only on
+            # refresh steps; same omit-NaN policy as rotation_angle.
+            eigh_target_self_angle = scalar(step_result["eigh_target_self_angle"])
+            if eigh_target_self_angle == eigh_target_self_angle:
+                train_metrics[f"{optimizer_name}/eigh_target_self_angle"] = eigh_target_self_angle
+            eigh_target_cutoff_ratio = scalar(step_result["eigh_target_cutoff_ratio"])
+            if eigh_target_cutoff_ratio == eigh_target_cutoff_ratio:
+                train_metrics[f"{optimizer_name}/eigh_target_cutoff_ratio"] = eigh_target_cutoff_ratio
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1060,6 +1074,8 @@ def run_optimizer(
     measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
     measured_rotation_angle = [step["rotation_angle"] for step in measured_steps]
     measured_tangent_sigma_max = [step["tangent_sigma_max"] for step in measured_steps]
+    measured_eigh_target_self_angle = [step["eigh_target_self_angle"] for step in measured_steps]
+    measured_eigh_target_cutoff_ratio = [step["eigh_target_cutoff_ratio"] for step in measured_steps]
     measured_basis_capture = [step["basis_capture"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
@@ -1117,6 +1133,8 @@ def run_optimizer(
         # than mixing in NaN gaps.
         "last_logged_rotation_angle": last_finite_scalar(measured_rotation_angle),
         "last_logged_tangent_sigma_max": last_finite_scalar(measured_tangent_sigma_max),
+        "last_logged_eigh_target_self_angle": last_finite_scalar(measured_eigh_target_self_angle),
+        "last_logged_eigh_target_cutoff_ratio": last_finite_scalar(measured_eigh_target_cutoff_ratio),
         "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
         "last_logged_aurora_erank": last_finite_scalar(measured_aurora_erank),
@@ -1180,6 +1198,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
     parser.add_argument("--grassmann-step-size", type=float, default=1.0, help="geodesic rotation = step_size * sigma. Stability-bounded: step 5 limit-cycles/orbits at acquisition-scale sigma (measured in vitro); 0.5 converged in vitro; 1 is the live maintenance default. No sigma clip exists anymore -- blip safety is the upstream per-tensor raw-grad clip.")
     parser.add_argument("--no-grassmann-accumulate", action="store_true", help="ablation arm: disable windowed tangent accumulation and refresh from the boundary step's single grad (the pre-accumulation path). Default is accumulate ON.")
+    parser.add_argument("--grassmann-rotate-rank", type=int, default=1, help="ablation arm: how many tangent singular directions the geodesic rotates per refresh. Default 1 (SubTrack-faithful drift). Values > effective rank are clamped by the SVD; use the projector rank for full-spectrum rotation of the window-mean tangent.")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh"), default="tangent", help="A' arm: what steers the basis at each refresh. 'tangent' = residual-persistence aim (C1 window-mean tangent, the default); 'eigh' = decomposition aim (eigh target frame from the boundary grad, rotate the --grassmann-rotate-rank largest principal angles toward it; needs no persistent residual). eigh aim also logs the Q10 probe: eigh_target_self_angle (consecutive-target top principal angle -- the target-noise read) and eigh_target_cutoff_ratio (Gram spectrum ratio at the rank cutoff; near 1 = degenerate cutoff, membership churn).")
     parser.add_argument("--basis-refresh-interval", type=int, default=10)
     parser.add_argument(
         "--basis-refresh-schedule",

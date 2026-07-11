@@ -58,6 +58,8 @@ class SumoTrack(Optimizer):
         adafactor_eps: float = 1e-30,
         grad_clip_norm: float | None = 2.5,
         grassmann_step_size: float = 1.0,
+        grassmann_rotate_rank: int = 1,
+        grassmann_aim: str = "tangent",
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -97,6 +99,10 @@ class SumoTrack(Optimizer):
             raise ValueError(f"grad_clip_norm must be positive when set, got {grad_clip_norm}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
+        if grassmann_rotate_rank < 1:
+            raise ValueError(f"grassmann_rotate_rank must be >= 1, got {grassmann_rotate_rank}")
+        if grassmann_aim not in ("tangent", "eigh"):
+            raise ValueError(f"grassmann_aim must be one of 'tangent', 'eigh', got {grassmann_aim!r}")
         if basis_refresh_interval <= 0:
             raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
         if aurora_pp_iterations <= 0:
@@ -122,6 +128,8 @@ class SumoTrack(Optimizer):
             adafactor_eps=adafactor_eps,
             grad_clip_norm=grad_clip_norm,
             grassmann_step_size=grassmann_step_size,
+            grassmann_rotate_rank=grassmann_rotate_rank,
+            grassmann_aim=grassmann_aim,
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
@@ -237,6 +245,10 @@ class SumoTrack(Optimizer):
             "rotation_angle_sum": 0.0,
             "tangent_sigma_max_sum": 0.0,
             "basis_refresh_tensors": 0,
+            "eigh_target_self_angle_sum": 0.0,
+            "eigh_target_probe_tensors": 0,
+            "eigh_target_cutoff_ratio_sum": 0.0,
+            "eigh_target_cutoff_tensors": 0,
             "basis_capture_sum": None,
             "basis_capture_tensors": 0,
             "aurora_alignment_sum": 0.0,
@@ -280,6 +292,10 @@ class SumoTrack(Optimizer):
         diagnostics["mean_rotation_angle"] = diagnostics["rotation_angle_sum"] / basis_count if basis_count else float("nan")
         diagnostics["mean_tangent_sigma_max"] = diagnostics["tangent_sigma_max_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
+        probe_count = diagnostics.pop("eigh_target_probe_tensors")
+        diagnostics["mean_eigh_target_self_angle"] = diagnostics.pop("eigh_target_self_angle_sum") / probe_count if probe_count else float("nan")
+        cutoff_count = diagnostics.pop("eigh_target_cutoff_tensors")
+        diagnostics["mean_eigh_target_cutoff_ratio"] = diagnostics.pop("eigh_target_cutoff_ratio_sum") / cutoff_count if cutoff_count else float("nan")
         aurora_count = diagnostics["aurora_health_tensors"]
         diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
@@ -368,7 +384,9 @@ class SumoTrack(Optimizer):
             # track_the_subspace). The buffer only makes sense at the basis it was
             # computed against, so it must never straddle a basis change -- hence
             # accumulate first, then let _refresh_projector reset/reseed it.
-            if group["grassmann_accumulate"] and projector.is_initialized:
+            # The eigh aim (A') needs no per-step tangent work: its target is a
+            # boundary-time decomposition, so skip the accumulation hot path.
+            if group["grassmann_accumulate"] and group["grassmann_aim"] == "tangent" and projector.is_initialized:
                 self._accumulate_tangent(projector, grad, state)
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
@@ -595,9 +613,41 @@ class SumoTrack(Optimizer):
             old_projector.resolved_side = projector.resolved_side
 
         accumulate = group["grassmann_accumulate"]
+        aim = group["grassmann_aim"]
         did_fit = not projector.is_initialized
         if did_fit:
             projector.fit(grad)
+        elif aim == "eigh":
+            # A' (decomposition-aimed tracking): eigh target frame from the boundary
+            # grad, rotate the top principal angles toward it. No persistence
+            # requirement -- the aim comes from instantaneous gradient structure,
+            # not from residual persisting across a window.
+            target_frame, gram_eigenvalues = projector.eigh_target_frame(grad)
+            tangent = projector.tangent_toward(target_frame, top_k=group["grassmann_rotate_rank"])
+            projector.update_grassmann_from_tangent(
+                tangent,
+                step_size=group["grassmann_step_size"],
+                rotate_rank=group["grassmann_rotate_rank"],
+            )
+            if diagnostics is not None and self.diagnostics_basis_enabled:
+                # Q10 probe: target self-consistency (top principal angle between
+                # consecutive boundary targets -- the direct target-noise read) and
+                # the Gram spectrum ratio at the rank cutoff (near 1 = degenerate
+                # cutoff, membership churn). prev-target buffer is diagnostic-only
+                # state, gated on the basis diagnostics flag.
+                prev_target = state.get("prev_eigh_target")
+                if prev_target is not None:
+                    self_angle = SubspaceProjector.top_principal_angle(prev_target, target_frame)
+                    diagnostics["eigh_target_self_angle_sum"] += float(self_angle.detach().cpu())
+                    diagnostics["eigh_target_probe_tensors"] += 1
+                state["prev_eigh_target"] = target_frame
+                rank = target_frame.shape[1]
+                if gram_eigenvalues.shape[0] > rank:
+                    kept_min = gram_eigenvalues[-rank]
+                    dropped_max = gram_eigenvalues[-rank - 1]
+                    ratio = (dropped_max / kept_min.clamp_min(1e-30)).clamp(0.0, 1.0)
+                    diagnostics["eigh_target_cutoff_ratio_sum"] += float(ratio.detach().cpu())
+                    diagnostics["eigh_target_cutoff_tensors"] += 1
         elif accumulate:
             count = state.get("tangent_accum_count", 0)
             tangent_accum = state.get("tangent_accum")
@@ -607,7 +657,7 @@ class SumoTrack(Optimizer):
                 # accumulate call above and here, which never happens on the live
                 # path but guards a corrupted/partial checkpoint). Fall back to the
                 # single-grad refresh for this one boundary rather than crashing.
-                projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+                projector.update_grassmann(grad, step_size=group["grassmann_step_size"], rotate_rank=group["grassmann_rotate_rank"])
             else:
                 # True count, not the fixed interval: SubTrack divides by
                 # subspace_update_interval but its accumulator actually holds
@@ -617,11 +667,12 @@ class SumoTrack(Optimizer):
                 projector.update_grassmann_from_tangent(
                     tangent_accum / count,
                     step_size=group["grassmann_step_size"],
+                    rotate_rank=group["grassmann_rotate_rank"],
                 )
         else:
-            projector.update_grassmann(grad, step_size=group["grassmann_step_size"])
+            projector.update_grassmann(grad, step_size=group["grassmann_step_size"], rotate_rank=group["grassmann_rotate_rank"])
 
-        if accumulate:
+        if accumulate and aim == "tangent":
             # The buffer is only valid at the Q it was computed against -- any basis
             # change (fit or retract) invalidates it, so reset unconditionally here.
             state["tangent_accum"] = None

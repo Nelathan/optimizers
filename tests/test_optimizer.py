@@ -44,6 +44,35 @@ class SumoTrackTest(unittest.TestCase):
         self.assertGreater(capture, 0.0)
         self.assertLessEqual(capture, 1.0 + 1e-5)
 
+    def test_eigh_aim_refresh_rotates_and_logs_the_q10_probe(self):
+        torch.manual_seed(0)
+        weight = torch.nn.Parameter(torch.randn(12, 6))
+        opt = SumoTrack([weight], lr=0.01, rank=3, basis_refresh_interval=2, grassmann_aim="eigh")
+        opt.diagnostics_enabled = True
+        opt.diagnostics_basis_enabled = True
+
+        for _ in range(5):  # two refresh boundaries after the init fit
+            opt.zero_grad()
+            (weight @ torch.randn(6, 6)).square().mean().backward()
+            opt.step()
+
+        diagnostics = opt.last_step_diagnostics
+        self.assertGreater(diagnostics["basis_refresh_tensors"], 0.0)
+        # sigma is a true principal angle under the eigh aim.
+        self.assertGreater(diagnostics["mean_tangent_sigma_max"], 0.0)
+        self.assertLessEqual(diagnostics["mean_tangent_sigma_max"], torch.pi / 2 + 1e-5)
+        # Probe fields: self-angle needs two boundary targets, so it must be
+        # populated by the second boundary; cutoff ratio needs Gram spectrum
+        # beyond the rank, which 6 > 3 provides.
+        self.assertGreater(diagnostics["mean_eigh_target_self_angle"], 0.0)
+        self.assertLessEqual(diagnostics["mean_eigh_target_self_angle"], torch.pi / 2 + 1e-5)
+        self.assertGreaterEqual(diagnostics["mean_eigh_target_cutoff_ratio"], 0.0)
+        self.assertLessEqual(diagnostics["mean_eigh_target_cutoff_ratio"], 1.0)
+        # No tangent-accumulation state under the eigh aim; probe buffer present.
+        state = opt.state[weight]
+        self.assertIsNone(state.get("tangent_accum"))
+        self.assertIn("prev_eigh_target", state)
+
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
         opt = SumoTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100, moment_mode="ema")

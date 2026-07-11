@@ -1023,3 +1023,39 @@ Measured (details in SUBSPACE_TRACKING.md):
 Next (new session): arm A′ — decomposition-aimed rank-1 (eigh target frame,
 principal-angle rank-1 geodesic step). Open design: what the eigh sees without
 full-size Gram state.
+
+## 2026-07-11 — Q13 rotate-rank pair + arm A′1 (eigh aim) with Q10 probe
+
+Why: two pre-registered questions from the A′ design space. Q13: does
+full-spectrum rotation of the C1 window-mean tangent beat rank-1? A′1/Q10/Q11:
+does a zero-state boundary-eigh target (rotate along the largest principal
+angle toward SVD(QᵀQ_target)) beat tangent tracking, and how noisy is a
+single-batch target? Full detail in `SUBSPACE_TRACKING.md`.
+
+What changed in code: `grassmann_rotate_rank` threaded through the retraction;
+`grassmann_aim {tangent,eigh}` with `eigh_target_frame` + `tangent_toward`
+(exact log map, atan2-conditioned angles — arccos is ~3e-4 rad wrong near 0 in
+fp32); Q10 probe (`eigh_target_self_angle`, `eigh_target_cutoff_ratio`,
+diagnostics-gated prev-target buffer); tests pinning full-snap landing and
+rank-1 largest-angle selection. All arms: LFM2.5-350M SYNTH, rank 32, bs16,
+interval 10, 200 steps, eval on.
+
+Measured:
+- Q13 soft-positive: full-spectrum beats rank-1 on every axis, mildly (capture
+  0.442 vs 0.429, val 2.0212 vs 2.0253, σ_max lower). ~0.003 rad/plane — the
+  window-mean tangent makes multi-rank rotation safe; the old spin verdict was
+  a single-batch artifact. Default stays rotate_rank=1 pending promotion call.
+- Q10 answered: T1 targets churn at the rank cutoff exactly as predicted —
+  consecutive-target top angle ≈ 89.5°, cutoff eigenvalue ratio 0.976. A′1 at
+  step 1.0 full-snapped a ~90° membership swap every boundary.
+- Q11 first evidence: A′1 tied C1 within noise anyway (val 2.0267, capture
+  0.438 — churn swaps are energy-degenerate, so cheap). But cutoff_ratio ≈ 0.98
+  caps what a denoised target (A′2) could add. Decomposition aim not falsified,
+  no longer the promising branch; C1 stays ahead on evidence and headroom.
+- Frozen control replicated: clearly worse. Drift result holds.
+
+Correction (user): that Q11 read crossed state classes — C1 carries a fp32
+[d,r] buffer, A′1 carries nothing, and A′1 beats the *unbuffered* tangent arm.
+Next: Q14 — fractional full-spectrum eigh aim (step {0.5, 0.25}, rotate_rank
+32) = streaming Karcher mean with the basis as its own accumulator; zero new
+code, zero new state. If it matches buffered C1, the [d,r] buffer dies.
