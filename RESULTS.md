@@ -1059,3 +1059,85 @@ Correction (user): that Q11 read crossed state classes — C1 carries a fp32
 Next: Q14 — fractional full-spectrum eigh aim (step {0.5, 0.25}, rotate_rank
 32) = streaming Karcher mean with the basis as its own accumulator; zero new
 code, zero new state. If it matches buffered C1, the [d,r] buffer dies.
+
+## 2026-07-11 — Q14: stateless manifold EMA (fractional full-spectrum eigh aim)
+
+Why: A′1 snap-chased churn with zero state and still tied buffered C1; the
+missing piece was temporal smoothing without a fp32 [d,r] buffer. Fractional
+rotation toward each boundary eigh target = streaming Karcher mean, basis as
+its own accumulator. No new code — existing --grassmann-aim eigh,
+--grassmann-rotate-rank 32, --grassmann-step-size α.
+
+Measured (LFM2.5-350M SYNTH, rank 32, bs16, interval 10, 200 steps):
+- α=0.5: val 2.0126, capture 0.621, grad/moment p90 4.25 (hot).
+- α=0.25: val 2.0103, capture 0.554, grad/moment 3.35, alignment 0.764 and
+  erank 25.1 (both best of the arc).
+- Anchors: C1 full-spectrum 2.0212/0.442, A′1 snap 2.0267/0.438. First
+  non-noise-level win: −0.011 nats, +0.11–0.18 capture, zero persistent state.
+- Q10 probe unchanged across α (~89.5° target self-angle, 0.976 cutoff ratio)
+  — confirms it measures target churn, and the EMA basis centers it.
+- α tension: higher α = higher instantaneous capture but rotation violence
+  taxes adafactor moment validity; lower α wins loss/alignment/erank.
+
+Q11 flips to answered-yes (decomposition aim wins once smoothed). Open: α
+floor (0.125), interval 5 at matched time constant, default promotion (would
+delete C1's [d,r] accumulator).
+
+Addendum: α=0.125 worse (val 2.0128, capture 0.517) — knee at α≈0.25.
+rotation_angle cannot converge under churning targets (floor = α·Σθ noise);
+flat = stable orbit, rising (α=0.5) = self-inflated orbit. Record correction:
+the eigh target always saw the adafactor-DAMPENED grad (SNR-ranked) — a chat
+report claimed raw; code was right, no rerun. Q10 probe demoted: cutoff
+steepness reads carry no further decision value; basis_capture is the fit read.
+
+Interval axis: α=0.5@20 loses (val 2.0139) vs 0.5@10 and 0.25@10; capture /
+grad-moment / rotation_angle clone 0.5@10 — α sets violence, interval only
+sets sample count. Eigh aim has no buffer, so longer intervals denoise
+nothing; the single-boundary noise floor caps α, more boundaries feed the
+manifold EMA more samples. Counter-tax confirmed in code: moment transfer is
+exact re-expression, each rotated plane drops sin(αθ) of its moment (50% of
+the churn plane at α=0.5) — the mechanism behind alignment ordering against α.
+Added refresh-only `moment_transfer_retained` metric; harness log-every
+default 10→5 (logging at refresh cadence hid the capture sawtooth).
+
+## 2026-07-11 — Design cut: position control promoted, transport-by-identity, convergence metric
+
+Why: the arc's synthesis (user-approved). Eigh aim is closed-loop POSITION
+control — target noise decays geometrically instead of integrating — while
+tangent tracking is open-loop velocity control whose noise random-walks; that
+asymmetry, not step tuning, is why fractional eigh aim beat every buffered
+arm. Full rationale in SUBSPACE_TRACKING.md (centerpiece section).
+
+What changed in code:
+- Defaults promoted: grassmann_aim=eigh, rotate_rank=None (all planes),
+  step_size=0.25 (measured knee), interval 10. C1 tangent accumulator DELETED
+  (fp32 [d,r] buffer, per-step launches, accumulate flag, reset/seed logic);
+  tangent aim kept only as the SubTrack-faithful single-grad ablation.
+- Moment transfer replaced by parallel transport = identity in projected
+  coordinates: the retraction is a rigid frame rotation (Q_new = R Q_old,
+  pinned by new projector test), so the honest transfer is a no-op and nothing
+  is dropped. The old projection transfer cos-taxed every rotated plane and
+  fed Aurora's polar map noise-dominated directions that NS re-amplified —
+  the measured alignment degradation at hot α. moment_transfer_retained
+  metric removed (1.0 by construction now).
+- Convergence metric added: basis_lag_mean_angle / basis_lag_top_angle —
+  principal angles (sine-based) between the basis and its own snapshot 5
+  refreshes back. Mean = settling, top = orbit radius. The missing instrument:
+  rotation_angle and target self-angle are noise-floored by construction and
+  cannot show convergence.
+- 90 tests green (4 accumulate tests deleted with the machinery; frame-
+  rotation transport test added).
+
+Open: Q17 — α schedule ("how much to turn when"): watch basis_lag_angle
+open-loop on a longer run before building any controller.
+
+Open-loop watch (500 steps, bare defaults = the promoted config): val 2.297 →
+1.896, best-yet trajectory. basis_lag decays slowly/noisily (mean 0.474, top
+0.802 rad at lag-50 — still moving, not settled). aurora_alignment and erank
+rose MONOTONICALLY (0.828 / 27.4 = 86% of rank) — first run where constant
+rotation and monotone moment health coexist; the transport dividend. Target
+thermometers unchanged (~89.5°, 0.978): rank starvation is the problem's
+property, not the tracker's. Q17 verdict at this horizon: partial
+self-annealing, no controller needed yet; user's mature-EMA schedule
+(α = 1/n to a ~0.1 floor = running Karcher mean, then track) is the
+registered next arm if a longer run plateaus with stalled loss.

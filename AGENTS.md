@@ -50,6 +50,15 @@ Nearly every session has produced at least one argument about me being unaligned
 
 - **He is technically strong.** No pity, no ego-stroking, no vague politeness, no option-sprawl to avoid committing to a view. Give a real point of view and defend it or drop it on contact with better reasoning.
 
+### What the best session so far looked like (2026-07-11 — position control)
+
+The arc that produced the biggest win ran like this; reproduce the shape, not the content:
+
+- **His "why" questions are the main event, not interruptions.** "Why can eigh turn 14.6% without thrashing? why was σ converging while capture stalled?" — answering those with a *mechanism* (position vs velocity control, noise decaying vs integrating) did more than ten ablation arms. When he asks why, do not answer with a metric or a restatement; find the causal story and commit to it.
+- **His mid-flight interjections are reframes, not noise.** "We don't have a buffer, so interval 20 buffers nothing"; "any step has noise, the noise floor limits step size" — each one corrected a wrong frame within minutes. Integrate immediately and out loud; the fastest sessions are the ones where his corrections land while the terrain is still warm.
+- **Measure → mechanism → ONE design cut, then stop for review.** The session's shape was: run cheap probes, extract the causal story, synthesize a single coherent cut (promotion + transport + metric), present it, wait for his 1-2-3-4 approval, then build it whole. Not arm-spam, not question-answering as an end in itself. "We must follow the goal" — the ledger serves the product, not the other way around.
+- **The best fix may be a deletion.** The honest moment transport turned out to be *removing* the transfer code (rigid frame rotation ⇒ identity coordinates). Derive first, then look for what the math says should not exist.
+
 ## Current optimizer invariants
 
 - Public optimizer name: **SumoTrack**.
@@ -60,7 +69,8 @@ Nearly every session has produced at least one argument about me being unaligned
 - Orthogonalization happens in projected space.
 - Aurora with Muon scale semantics is the forward projected direction.
 - HeavyBall Newton-Schulz is the internal polar primitive inside Aurora.
-- Grassmann tracking is the forward basis-update path after initialization.
+- Position control is the forward basis-update path after initialization: eigh target frame from the dampened boundary grad, full-spectrum fractional geodesic toward it (`grassmann_aim="eigh"`, all planes, step 0.25 = the EMA constant). Tangent aim survives only as the SubTrack-faithful single-grad ablation; the C1 window accumulator was deleted (see `SUBSPACE_TRACKING.md`, position vs velocity control).
+- The projected first moment parallel-transports through every geodesic refresh as the identity in projected coordinates (the retraction is a rigid frame rotation; pinned by test). Do not reintroduce project-back/re-project transfer — its cos-tax feeds Aurora's polar map shrunken, noise-dominated directions that NS re-amplifies.
 - Burst refresh is the basis schedule; round-robin was removed as complexity rent.
 - Two-sided square-core projection was removed from the active path.
 - Unsupported ECC/param-ECC fails loudly.

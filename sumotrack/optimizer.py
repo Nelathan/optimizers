@@ -57,9 +57,9 @@ class SumoTrack(Optimizer):
         adafactor_beta2: float = 0.99,
         adafactor_eps: float = 1e-30,
         grad_clip_norm: float | None = 2.5,
-        grassmann_step_size: float = 1.0,
-        grassmann_rotate_rank: int = 1,
-        grassmann_aim: str = "tangent",
+        grassmann_step_size: float = 0.25,
+        grassmann_rotate_rank: int | None = None,
+        grassmann_aim: str = "eigh",
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -69,7 +69,6 @@ class SumoTrack(Optimizer):
         compile_tensor_kernels: bool = False,
         ecc: str | None = None,
         param_ecc: str | None = None,
-        grassmann_accumulate: bool = True,  # TEMPORARY ablation flag: False reproduces the pre-accumulation single-grad refresh path exactly; retire after the A/B.
     ) -> None:
         if ecc is not None or param_ecc is not None:
             raise NotImplementedError(
@@ -99,8 +98,8 @@ class SumoTrack(Optimizer):
             raise ValueError(f"grad_clip_norm must be positive when set, got {grad_clip_norm}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
-        if grassmann_rotate_rank < 1:
-            raise ValueError(f"grassmann_rotate_rank must be >= 1, got {grassmann_rotate_rank}")
+        if grassmann_rotate_rank is not None and grassmann_rotate_rank < 1:
+            raise ValueError(f"grassmann_rotate_rank must be None (all planes) or >= 1, got {grassmann_rotate_rank}")
         if grassmann_aim not in ("tangent", "eigh"):
             raise ValueError(f"grassmann_aim must be one of 'tangent', 'eigh', got {grassmann_aim!r}")
         if basis_refresh_interval <= 0:
@@ -138,7 +137,6 @@ class SumoTrack(Optimizer):
             consume_grad=consume_grad,
             compile_tensor_kernels=compile_tensor_kernels,
             basis_refresh_step=0,
-            grassmann_accumulate=grassmann_accumulate,
         )
         super().__init__(params, defaults)
         self.diagnostics_enabled = False
@@ -249,6 +247,9 @@ class SumoTrack(Optimizer):
             "eigh_target_probe_tensors": 0,
             "eigh_target_cutoff_ratio_sum": 0.0,
             "eigh_target_cutoff_tensors": 0,
+            "basis_lag_mean_angle_sum": 0.0,
+            "basis_lag_top_angle_sum": 0.0,
+            "basis_lag_tensors": 0,
             "basis_capture_sum": None,
             "basis_capture_tensors": 0,
             "aurora_alignment_sum": 0.0,
@@ -296,6 +297,9 @@ class SumoTrack(Optimizer):
         diagnostics["mean_eigh_target_self_angle"] = diagnostics.pop("eigh_target_self_angle_sum") / probe_count if probe_count else float("nan")
         cutoff_count = diagnostics.pop("eigh_target_cutoff_tensors")
         diagnostics["mean_eigh_target_cutoff_ratio"] = diagnostics.pop("eigh_target_cutoff_ratio_sum") / cutoff_count if cutoff_count else float("nan")
+        lag_count = diagnostics.pop("basis_lag_tensors")
+        diagnostics["mean_basis_lag_angle"] = diagnostics.pop("basis_lag_mean_angle_sum") / lag_count if lag_count else float("nan")
+        diagnostics["mean_basis_lag_top_angle"] = diagnostics.pop("basis_lag_top_angle_sum") / lag_count if lag_count else float("nan")
         aurora_count = diagnostics["aurora_health_tensors"]
         diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
@@ -379,15 +383,6 @@ class SumoTrack(Optimizer):
             moment_mode = group["moment_mode"]
             if moment_mode == "adafactor_ema":
                 grad = self._adafactor_dampen_full_grad(grad, group, state)
-            # Accumulate this step's tangent BEFORE any refresh, mirroring SubTrack
-            # (which adds the boundary grad to accumulated_grad before calling
-            # track_the_subspace). The buffer only makes sense at the basis it was
-            # computed against, so it must never straddle a basis change -- hence
-            # accumulate first, then let _refresh_projector reset/reseed it.
-            # The eigh aim (A') needs no per-step tangent work: its target is a
-            # boundary-time decomposition, so skip the accumulation hot path.
-            if group["grassmann_accumulate"] and group["grassmann_aim"] == "tangent" and projector.is_initialized:
-                self._accumulate_tangent(projector, grad, state)
             if not projector.is_initialized or refresh_basis:
                 self._refresh_projector(projector, grad, group, state, diagnostics)
             projected_grad = projector.project(grad)
@@ -585,56 +580,38 @@ class SumoTrack(Optimizer):
             diagnostics["fallback_update_norm_sq"] = update_norm_sq if diagnostics["fallback_update_norm_sq"] is None else diagnostics["fallback_update_norm_sq"] + update_norm_sq
             diagnostics["fallback_params"] += p.numel()
 
-    @staticmethod
-    def _accumulate_tangent(projector: SubspaceProjector, grad: Tensor, state: dict) -> None:
-        """Roll this step's canon tangent into the accumulation buffer.
-
-        Buffers the tangent (``[dim, rank]``), not the full gradient (``[m, n]``) --
-        SubTrack accumulates full grads because it tracks with rank 1, but a
-        full-size buffer here would violate SumoTrack's no-full-size-state
-        invariant. Pure tensor ops only (no data-dependent branching on tensor
-        values) so this stays compile-friendly under the per-step accumulation path.
-        """
-
-        tangent = projector.compute_tangent(grad)
-        accum = state.get("tangent_accum")
-        if accum is None:
-            accum = torch.zeros_like(tangent)
-        accum.add_(tangent)
-        state["tangent_accum"] = accum
-        state["tangent_accum_count"] = state.get("tangent_accum_count", 0) + 1
+    # Lag between basis snapshots for the convergence metric, in refresh events
+    # (5 refreshes = 50 steps at the default interval 10). The instantaneous
+    # angles (rotation_angle, target self-angle) are floored by target noise and
+    # structurally cannot show convergence; the angle of the basis against its
+    # own past can: decaying lag-angle = settling, plateau = stable orbit radius.
+    BASIS_LAG_REFRESHES = 5
 
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None) -> None:
-        old_projected_exp_avg = state.get("projected_exp_avg")
-        old_projector = None
-        if projector.is_initialized and old_projected_exp_avg is not None:
-            old_projector = SubspaceProjector(rank=projector.rank, side=projector.side, init_method=projector.init_method)
-            old_projector.basis = projector.basis
-            old_projector.resolved_side = projector.resolved_side
-
-        accumulate = group["grassmann_accumulate"]
+        was_initialized = projector.is_initialized
         aim = group["grassmann_aim"]
-        did_fit = not projector.is_initialized
-        if did_fit:
+        if not was_initialized:
             projector.fit(grad)
         elif aim == "eigh":
-            # A' (decomposition-aimed tracking): eigh target frame from the boundary
-            # grad, rotate the top principal angles toward it. No persistence
-            # requirement -- the aim comes from instantaneous gradient structure,
-            # not from residual persisting across a window.
+            # Position control (the default path): eigh target frame from the
+            # dampened boundary grad names WHERE the signal subspace is; the
+            # geodesic contracts a fraction step_size of every principal angle
+            # toward it. Target noise decays geometrically instead of integrating
+            # -- the basis is a streaming Karcher mean of the target stream, its
+            # own accumulator, zero persistent state.
+            rotate_rank = self._resolve_rotate_rank(group, projector, grad)
             target_frame, gram_eigenvalues = projector.eigh_target_frame(grad)
-            tangent = projector.tangent_toward(target_frame, top_k=group["grassmann_rotate_rank"])
+            tangent = projector.tangent_toward(target_frame, top_k=rotate_rank)
             projector.update_grassmann_from_tangent(
                 tangent,
                 step_size=group["grassmann_step_size"],
-                rotate_rank=group["grassmann_rotate_rank"],
+                rotate_rank=rotate_rank,
             )
             if diagnostics is not None and self.diagnostics_basis_enabled:
-                # Q10 probe: target self-consistency (top principal angle between
-                # consecutive boundary targets -- the direct target-noise read) and
-                # the Gram spectrum ratio at the rank cutoff (near 1 = degenerate
-                # cutoff, membership churn). prev-target buffer is diagnostic-only
-                # state, gated on the basis diagnostics flag.
+                # Q10 probe (demoted to background): target self-consistency and the
+                # Gram spectrum ratio at the rank cutoff. Both measure the target
+                # stream, not the basis -- they are rank-starvation thermometers,
+                # not convergence reads (that is the basis lag angle below).
                 prev_target = state.get("prev_eigh_target")
                 if prev_target is not None:
                     self_angle = SubspaceProjector.top_principal_angle(prev_target, target_frame)
@@ -648,55 +625,67 @@ class SumoTrack(Optimizer):
                     ratio = (dropped_max / kept_min.clamp_min(1e-30)).clamp(0.0, 1.0)
                     diagnostics["eigh_target_cutoff_ratio_sum"] += float(ratio.detach().cpu())
                     diagnostics["eigh_target_cutoff_tensors"] += 1
-        elif accumulate:
-            count = state.get("tangent_accum_count", 0)
-            tangent_accum = state.get("tangent_accum")
-            if tangent_accum is None or count < 1:
-                # State-dict-migration fallback: a buffer can be missing if state was
-                # loaded mid-window from before this flag existed (or between the
-                # accumulate call above and here, which never happens on the live
-                # path but guards a corrupted/partial checkpoint). Fall back to the
-                # single-grad refresh for this one boundary rather than crashing.
-                projector.update_grassmann(grad, step_size=group["grassmann_step_size"], rotate_rank=group["grassmann_rotate_rank"])
-            else:
-                # True count, not the fixed interval: SubTrack divides by
-                # subspace_update_interval but its accumulator actually holds
-                # interval+1 tangents (it adds the boundary grad before tracking,
-                # same as our accumulate-before-refresh order) -- an off-by-one in
-                # the reference we deliberately do not reproduce.
-                projector.update_grassmann_from_tangent(
-                    tangent_accum / count,
-                    step_size=group["grassmann_step_size"],
-                    rotate_rank=group["grassmann_rotate_rank"],
-                )
         else:
-            projector.update_grassmann(grad, step_size=group["grassmann_step_size"], rotate_rank=group["grassmann_rotate_rank"])
+            # Velocity control (SubTrack-faithful single-grad tangent step): kept as
+            # the reference/ablation arm. The C1 window accumulator was deleted when
+            # position control beat it with zero state -- noise in a velocity command
+            # integrates as a random walk with no restoring force, which is why this
+            # path needed milliradian steps and lost to drift (see ledger).
+            projector.update_grassmann(
+                grad,
+                step_size=group["grassmann_step_size"],
+                rotate_rank=self._resolve_rotate_rank(group, projector, grad),
+            )
 
-        if accumulate and aim == "tangent":
-            # The buffer is only valid at the Q it was computed against -- any basis
-            # change (fit or retract) invalidates it, so reset unconditionally here.
-            state["tangent_accum"] = None
-            state["tangent_accum_count"] = 0
-            if did_fit:
-                # Seed the new window with the current grad's tangent at the fresh
-                # basis, mirroring SubTrack's iter==0 branch (which adds the first
-                # grad to the accumulator right after the initial fit).
-                self._accumulate_tangent(projector, grad, state)
-
-        if old_projector is not None and diagnostics is not None and self.diagnostics_basis_enabled:
+        if was_initialized and diagnostics is not None and self.diagnostics_basis_enabled:
             self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle, projector.last_tangent_sigma_max)
+            # Convergence metric: principal angles between the basis and its own
+            # snapshot from BASIS_LAG_REFRESHES boundaries ago. Mean angle is the
+            # settling read (-> 0 iff every plane stops moving); top angle is the
+            # orbit-radius read (churn planes keep it elevated). Snapshot buffer is
+            # diagnostic-only state, gated like the Q10 probe buffer.
+            snapshot = state.get("basis_lag_snapshot")
+            lag_count = state.get("basis_lag_refreshes", 0) + 1
+            if snapshot is None:
+                state["basis_lag_snapshot"] = projector.canonical_basis().detach().clone()
+                state["basis_lag_refreshes"] = 0
+            elif lag_count >= self.BASIS_LAG_REFRESHES:
+                current = projector.canonical_basis()
+                lag_angles = SubspaceProjector.principal_angles_sine(snapshot, current)
+                diagnostics["basis_lag_mean_angle_sum"] += float(lag_angles.mean().detach().cpu())
+                diagnostics["basis_lag_top_angle_sum"] += float(lag_angles.max().detach().cpu())
+                diagnostics["basis_lag_tensors"] += 1
+                state["basis_lag_snapshot"] = current.detach().clone()
+                state["basis_lag_refreshes"] = 0
+            else:
+                state["basis_lag_refreshes"] = lag_count
 
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
         state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
 
-        if old_projector is not None:
-            lifted_moment = old_projector.project_back(old_projected_exp_avg)
-            state["projected_exp_avg"] = projector.project(lifted_moment)
-        elif old_projected_exp_avg is not None:
+        # Moment across a geodesic refresh: parallel transport, which is the
+        # IDENTITY in projected coordinates. The retraction is a rigid frame
+        # rotation (Q_new = R @ Q_old with R rotating the [Q@V, U] planes; pinned
+        # by test), so rotating the lifted moment with the frame and re-reading its
+        # coordinates returns them unchanged -- the honest transfer is a no-op, and
+        # nothing is dropped. The previous project-back/re-project transfer was
+        # orthogonal projection instead: it lost sin(angle) of every rotated
+        # plane's moment, and Aurora's polar map then re-amplified those shrunken,
+        # noise-dominated directions back to full strength (the alignment
+        # degradation measured at hot step sizes). Only a fresh fit (no geodesic)
+        # has no transport; there the stale coordinates are dropped on shape
+        # mismatch and otherwise kept as the least-wrong option.
+        old_projected_exp_avg = state.get("projected_exp_avg")
+        if not was_initialized and old_projected_exp_avg is not None:
             projected_shape = tuple(projector.project(grad).shape)
             if tuple(old_projected_exp_avg.shape) != projected_shape:
                 state.pop("projected_exp_avg", None)
+
+    @staticmethod
+    def _resolve_rotate_rank(group: dict, projector: SubspaceProjector, grad: Tensor) -> int:
+        configured = group["grassmann_rotate_rank"]
+        return configured if configured is not None else projector.effective_rank(grad)
 
     @staticmethod
     def _expected_projected_grad_shape(p: Tensor, projector: SubspaceProjector) -> tuple[int, int]:

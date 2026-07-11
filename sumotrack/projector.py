@@ -180,6 +180,32 @@ class SubspaceProjector:
         s = torch.linalg.svdvals(frame_a.mT @ frame_b)
         return torch.arccos(s.min().clamp(-1.0, 1.0))
 
+    @staticmethod
+    @torch.no_grad()
+    def principal_angles_sine(frame_a: Tensor, frame_b: Tensor) -> Tensor:
+        """All principal angles (radians) between two column-orthonormal frames,
+        computed from the projection residual's singular values (= the sines).
+
+        Sine-based on purpose: this feeds the basis-convergence read, where the
+        interesting regime is angles decaying toward zero -- exactly where
+        arccos(cos) loses ~sqrt(fp32 eps) ~ 3e-4 rad. asin(sin) is
+        well-conditioned there and only saturates near pi/2, where the metric
+        has already said "still orbiting" and precision is irrelevant.
+        """
+
+        residual = frame_b - frame_a @ (frame_a.mT @ frame_b)
+        sines = torch.linalg.svdvals(residual)
+        return torch.asin(sines.clamp(0.0, 1.0))
+
+    @torch.no_grad()
+    def canonical_basis(self) -> Tensor:
+        """Current basis in the canon column-orthonormal ``[dim, rank]`` layout."""
+
+        if self.basis is None:
+            raise RuntimeError("cannot read a canonical basis before fitting")
+        work = self.basis.float() if self.basis.dtype in (torch.float16, torch.bfloat16) else self.basis
+        return work.mT if self._basis_side() is ProjectionSide.RIGHT else work
+
     @torch.no_grad()
     def fit_random(self, matrix: Tensor) -> Tensor:
         """Initialize the basis with QR-orthonormalized random vectors."""
@@ -326,14 +352,14 @@ class SubspaceProjector:
         work_basis = self.basis.float() if self.basis.dtype in (torch.float16, torch.bfloat16) else self.basis
         canon_basis = work_basis.mT if side is ProjectionSide.RIGHT else work_basis
 
-        # Default rank-1 rotation, faithful to SubTrack (``rank_k_matrix_estimation(..., k=1)``):
-        # rotate the *single* dominant tangent direction and carry the rest of the
-        # frame unrotated via the ``(I - V V.T)`` term below. This is deliberate --
-        # a single-batch residual tail is near-isotropic noise, so rotating the whole
-        # spectrum spins the basis on that noise and thrashes (measured; see the
-        # drift-vs-spin record). ``rotate_rank > 1`` is an explicit ablation arm:
-        # with a window-MEAN tangent the tail is denoised, which re-opens whether
-        # multi-rank rotation helps -- that is a run flag, never a silent default.
+        # The signature default k=1 keeps this primitive faithful to SubTrack
+        # (``rank_k_matrix_estimation(..., k=1)``), whose single-batch residual
+        # tail is near-isotropic noise -- rotating the full spectrum of a raw
+        # tangent spins the basis on that noise (measured; drift-vs-spin record).
+        # The optimizer-level default is full-spectrum, because its default aim is
+        # a DENOISED object (eigh target under fractional-step position control,
+        # Q13/Q14): every principal angle carries signal there, and rotating them
+        # all measured better than rank-1 on capture and loss.
         singular_u, singular_values, singular_v = self._rank_k_svd(tangent, rotate_rank)
         self.last_tangent_sigma_max = float(singular_values.max().detach().cpu()) if singular_values.numel() else float("nan")
         # No sigma clip. A clip existed as blip safety, but whenever sigma sat above
@@ -383,9 +409,8 @@ class SubspaceProjector:
         """Refresh the basis with a Grassmann geodesic tangent step from ``matrix``.
 
         Composition of ``compute_tangent`` (tangent at the current basis) and
-        ``update_grassmann_from_tangent`` (rank-1 SVD + geodesic retraction). Kept
-        as a single entry point for callers that do not need windowed tangent
-        accumulation (e.g. ``grassmann_accumulate=False``).
+        ``update_grassmann_from_tangent`` (rank-k SVD + geodesic retraction).
+        Single entry point for the SubTrack-faithful single-grad tangent path.
         """
 
         return self.update_grassmann_from_tangent(self.compute_tangent(matrix), step_size=step_size, rotate_rank=rotate_rank)

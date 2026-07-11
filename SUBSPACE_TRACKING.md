@@ -716,12 +716,25 @@ churn, exactly at the cutoff, exactly as predicted — but *benign* churn)
   *which* arbitrary call gets made (fewer wasted rotations), it does not create
   a signal that isn't there. Eigenvalue-weighted angle selection has the same
   ceiling.
+- *Record correction (2026-07-11):* the target frame is built from the
+  **adafactor-dampened** boundary grad, not the raw grad — dampening runs
+  before `_refresh_projector` by design ("same dampened gradient feeds both
+  consumers"). A chat report claimed raw; the code was right. So the flat
+  cutoff is flatness of the *SNR-normalized* spectrum: at rank 32 many
+  directions carry near-equal signal-to-noise. Rank-starved in the strongest
+  sense — consistent with what we already knew, no rerun needed.
+- *Probe demotion (user, 2026-07-11):* worst-case-angle and #33/#32 are
+  steepness-at-cutoff reads (one in angle, one in magnitude) and carry little
+  ongoing value; overall fit (`basis_capture`) is the read that matters. The
+  probe stays wired but is no longer a decision input; do not extend it with
+  spectrum plots unless a question demands one.
 - *Evaluate:* the gating probe in the A′ design-space section — boundary logs of
   Q-vs-target angle, consecutive-target angle, cutoff eigengap.
 
-**Q11 — Does decomposition aim beat residual-persistence aim on maintenance?** 🟡
-(first evidence 2026-07-11: not under T1 — but T1's aim was churn, so the clean
-form of the question is still open, with capped upside)
+**Q11 — Does decomposition aim beat residual-persistence aim on maintenance?** 🟢
+(answered 2026-07-11 via Q14: YES, once smoothed — fractional full-spectrum eigh
+aim beats buffered tangent tracking on loss and capture with zero state. The 🟡
+history below records how the first A/B misled and was corrected.)
 - *Why:* the A′ premise. Tangent tracking needs a persistent residual and drift
   outruns it; eigh aim needs no persistence. If A′ holds capture under drift
   better than C1 and frozen, decomposition-aim becomes the forward path.
@@ -748,7 +761,151 @@ form of the question is still open, with capped upside)
 - *Evaluate (next):* Q14 (stateless manifold EMA) first; A′2 only if Q14 stalls.
 
 **Q14 — Does fractional full-spectrum eigh aim (stateless manifold EMA) beat
-both A′1-snap and buffered C1?** 🔴 — the Karcher lead, followed with zero state
+both A′1-snap and buffered C1?** 🟢 (answered 2026-07-11: YES, decisively — the
+first non-noise-level win of the arc)
+- *Answer:* both α beat every anchor on loss AND capture with zero persistent
+  state. α=0.5: val 2.0126, capture 0.621, p90 grad/moment 4.25 (hot),
+  alignment 0.742, erank 24.2. α=0.25: val **2.0103**, capture 0.554,
+  grad/moment 3.35, alignment **0.764**, erank **25.1** (both best-ever).
+  Anchors: C1 full-spectrum 2.0212/0.442, C1 rank-1 2.0253/0.429, A′1 snap
+  2.0267/0.438. That is −0.011 nats and +0.11–0.18 capture over the best
+  *buffered* arm. Both pre-registered predictions held: probe values identical
+  across α (~89.5°, 0.976 — they measure the targets; the basis found a stable
+  center the target stream orbits), and rotation_angle scales with α
+  (16.1 vs 7.8 rad summed over 32 planes ≈ 0.50/0.24 rad per plane) without
+  instability (σ_max churn-pinned at ~π/2 in both).
+- *The α tension:* higher α chases the current target harder → higher
+  instantaneous capture (0.621) but hotter grad/moment ratio (4.25) — rotation
+  violence taxes adafactor's second-moment validity. Lower α wins where it
+  counts: loss, alignment, erank, calmer moments. Bias–variance in the EMA
+  constant, and variance is the binding side.
+- *α floor located (2026-07-11):* α=0.125 is worse — val 2.0128, capture 0.517
+  (alignment/erank kept rising, 0.769/25.2, but loss is the boss). **Knee at
+  α≈0.25.** The rotation_angle trends across the sweep are the orbit read:
+  flat = the basis orbits the target stream at a stable radius (it can NOT
+  converge to zero while targets churn — the floor is α·Σθ(target noise), so
+  flat is healthy, not stuck); *rising* (α=0.5, mildly α=0.25) = the basis is
+  being kicked hard enough that its displacement grows, self-inflated orbit.
+  α=0.125 flat, α=0.5 rising brackets the same knee the loss found.
+- *Interval axis measured (α=0.5 @ interval 20, 2026-07-11):* loses — val
+  2.0139 vs 2.0126 (same α @ 10) and 2.0103 (matched EMA rate, 0.25@10).
+  Capture (0.622), grad/moment (4.24), and rotation_angle (16.2) are clones of
+  0.5@10: **α alone sets the rotation violence; the interval sets nothing but
+  the sample count.** User's corrected mechanism: the eigh aim has no buffer,
+  so a longer interval denoises nothing — every boundary target carries the
+  same single-batch noise, that noise floor is what caps usable α, and more
+  boundaries per horizon simply feed the manifold EMA more samples to average.
+  The counter-tax on *more* boundaries is the moment-transfer loss (below);
+  interval 10 is where those currently balance. Note the earlier "fewer,
+  bolder, buffered corrections" framing was wrong for this aim precisely
+  because nothing buffers between boundaries.
+- *Moment tax of a rotation (mechanism confirmed in code):* on every non-fit
+  refresh the first moment is transferred exactly — lifted through the old
+  basis, re-projected onto the new (`project(project_back(m))`). Each rotated
+  plane keeps cos(αθ) of its moment component; sin(αθ) is dropped
+  irrecoverably. For the churned ~90° plane: α=0.5 drops sin²(45°) = 50% of
+  that plane's moment energy per boundary, α=0.25 drops 14.6%, C1's mrad
+  rotations ~1e-5. This is the mechanism behind aurora_alignment ordering
+  monotonically against α (0.769/0.764/0.742). Adafactor row/col state is
+  full-size and basis-free — untouched by rotation. New refresh-only metric
+  `moment_transfer_retained` (= ||m_after||/||m_before||, 1.0 lossless)
+  measures the *total* tax, which code alone cannot predict (depends on how
+  much moment lives in the rotated planes).
+- *Logging cadence (user, 2026-07-11):* logging at the refresh interval sampled
+  basis_capture at a fixed phase of the rotation cycle and hid its sawtooth.
+  Harness default `--wandb-log-every` now 5; keep it at ≤ half the refresh
+  interval.
+- *Still open inside Q14:* does the win hold over a longer horizon (1k steps —
+  drift slows after adafactor settles ~100 steps, the knee may move). Default
+  promotion: RESOLVED — approved and shipped 2026-07-11 (see the design cut
+  below); the C1 accumulator is deleted.
+
+### Position control vs velocity control — the arc's centerpiece (2026-07-11)
+
+Why eigh aim can rotate 22.5° planes every 10 steps without thrashing while
+tangent tracking crawled at milliradians and still lost to drift. The two aims
+are different control systems:
+
+- **Tangent tracking is open-loop velocity control.** Each boundary applies a
+  displacement derived from a gradient — a velocity command. Noise in velocity
+  *integrates*: the basis random-walks with no restoring force when a step was
+  wrong. The only defense is tiny steps, which is why the honest tangent
+  step_size landed at milliradians and drift outran it. Velocities sampled at
+  different times point different ways; their average cancels toward zero
+  (the user's "all paths lead to Rome, average them and you go nowhere").
+- **Eigh aim is closed-loop position control.** Each boundary names a
+  *position* (the target frame) and the geodesic contracts toward it by factor
+  α. Errors *decay geometrically* instead of integrating: overshoot toward a
+  noisy target is pulled back by the next rotation, because targets scatter
+  around the same attractor. Positions average to their mean; velocities
+  average to nothing. The noise floor limits α but never accumulates.
+
+Corollaries now explained rather than mysterious: C1's σ "converged" because
+window-averaging killed tangent *noise* (√N), not because the basis approached
+anything — σ measured the thermometer, not the patient (second confirmed
+instance of "σ is contact, not fit"). And the Karcher/rotation-averaging lead
+is subsumed: the manifold EMA *is* streaming Karcher averaging of positions,
+which is the form of averaging that converges.
+
+### Approved design cut (user-approved and shipped 2026-07-11)
+
+1. **Position control promoted to default**: `grassmann_aim="eigh"`,
+   `grassmann_rotate_rank=None` (all planes), `grassmann_step_size=0.25`,
+   interval 10. The C1 tangent accumulator is DELETED (fp32 `[d,r]` buffer,
+   per-step launches, reset/seed logic, `grassmann_accumulate` flag).
+   `aim="tangent"` survives only as the SubTrack-faithful single-grad
+   reference/ablation arm.
+2. **Moment transport is exact and free**: the retraction is a rigid frame
+   rotation (`Q_new = R @ Q_old`, pinned by test), so parallel transport of the
+   projected moment is the IDENTITY in projected coordinates — the honest
+   transfer is a no-op. The old project-back/re-project transfer (orthogonal
+   projection, cos-tax) is deleted along with the one-session
+   `moment_transfer_retained` metric it motivated. This matters specifically
+   for Aurora: NS re-amplifies cos-shrunken moment directions to full strength
+   with noise-dominated direction estimates — the sin-drop was worse under
+   polar orthogonalization than it would be under plain momentum.
+3. **Convergence metric added** (`basis_lag_mean_angle` / `basis_lag_top_angle`):
+   principal angles between the basis and its own snapshot 5 refreshes back
+   (sine-based, well-conditioned at small angles). Mean = settling read (→0 iff
+   every plane stops), top = orbit-radius read (churn planes hold it up).
+   Neither rotation_angle nor target self-angle can show convergence — both are
+   floored by target noise by construction. The lag angle is also the future
+   signal for adaptive intervals: on a 10k run the basis should settle and
+   SubTrack's interval-100 becomes legitimate *after* the decay, not before.
+
+**Q17 — How much to turn, when: is there a step size that is both stable and
+fast self-decaying?** 🔴 — the open question the cut leaves behind
+- *Why:* α=0.25 is the measured knee for THIS drift rate (early adaptation,
+  adafactor still settling, rank-starved SYNTH). A fixed α cannot be right at
+  both step 10 (fast drift, want big α) and step 10k (settled, want tiny α and
+  long intervals). Stochastic-approximation theory wants a decaying schedule;
+  the basis_lag_angle decay is the natural controller input.
+- *Candidate mechanisms (user, on record):* (a) "mature EMA" schedule — after
+  init the boundaries take α = 1/2, 1/3, 1/4, ... down to a floor (~0.1): the
+  basis becomes the TRUE running Karcher mean of all targets during the decay,
+  then the floor keeps it tracking drift. Polyak-style averaging on the
+  manifold, zero state (α derived from the refresh count). (b) Steady α may
+  still win when drift is fast — the schedule trades tracking speed for noise
+  averaging exactly like any EMA warmup. (c) Prefer deriving α from a
+  stateless signal over lag-state feedback if possible.
+- *Evaluate:* first just WATCH basis_lag_angle on a longer run at fixed α=0.25
+  — if it decays on its own (self-annealing via shrinking target angles), no
+  schedule is needed; if it plateaus while loss stalls, the mature-EMA schedule
+  is the next arm. Do not build the controller before the open-loop trace.
+- *Evidence (open-loop watch, 500 steps, defaults, 2026-07-11):* val 2.2968 →
+  1.8956, best-yet loss trajectory (already best at step 200). basis_lag decays
+  but slowly and noisily: mean angle ~halved over the run to 0.474 rad, top to
+  0.802 — the basis is still moving substantially at step 500, not settled;
+  consistent with churn planes orbiting while signal planes drift. Target
+  thermometers unchanged (self-angle 1.561, cutoff 0.978 — rank starvation is
+  a property of the problem, not the tracker). **aurora_alignment and erank
+  rose MONOTONICALLY all run (0.828 / 27.4 = 86% of rank at step 500)** —
+  under the old projection transfer, alignment degraded with rotation; with
+  transport the moment survives every boundary. Not a controlled A/B, but the
+  first run where constant rotation and monotone moment health coexist. The
+  capture sawtooth is now visible at log-every 5, confirming the aliasing fix.
+  Verdict: partial self-annealing, no plateau-with-stalled-loss yet — no
+  controller needed at this horizon; revisit at 1k+ or on a real drift task.
 - *Why:* `Q ← geodesic(Q, α, target_t)` at each boundary is stochastic gradient
   descent on the Grassmann sum-of-squared-distances to the target stream — an
   *incremental Karcher mean* whose accumulator is the basis itself (GROUSE uses

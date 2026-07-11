@@ -194,6 +194,47 @@ class SubspaceProjectorTest(unittest.TestCase):
         basis = projector.basis
         return basis.mT if projector._basis_side() is ProjectionSide.RIGHT else basis
 
+    def test_geodesic_retraction_is_a_rigid_frame_rotation(self):
+        """Q_new == R @ Q_old with R the plane rotation built from the tangent's
+        SVD triple. This is the fact that makes parallel transport of the
+        projected moment the IDENTITY in projected coordinates: R Q_old = Q_new
+        implies Q_new^T (R (Q_old @ m)) = m, so the optimizer's transport-by-no-op
+        across a geodesic refresh is exact, not an approximation."""
+
+        torch.manual_seed(11)
+        for shape in ((24, 7), (7, 24)):  # right and left branches
+            projector = SubspaceProjector(rank=4)
+            projector.fit_eigh(torch.randn(*shape))
+            canon_old = self._canon_basis(projector).clone()
+
+            tangent = projector.compute_tangent(torch.randn(*shape))
+            step_size = 0.3
+            rotate_rank = 3
+            projector.update_grassmann_from_tangent(tangent, step_size=step_size, rotate_rank=rotate_rank)
+            canon_new = self._canon_basis(projector)
+
+            u, s, vh = torch.linalg.svd(tangent, full_matrices=False)
+            u_k, v_k = u[:, :rotate_rank], vh.mT[:, :rotate_rank]
+            theta = step_size * s[:rotate_rank]
+            a = canon_old @ v_k  # in-span plane axes Q@v_i
+            b = u_k  # out-of-span plane axes u_i (Q-orthogonal by construction)
+            cos1 = torch.diag(torch.cos(theta) - 1.0)
+            sin = torch.diag(torch.sin(theta))
+            dim = canon_old.shape[0]
+            rotation = (
+                torch.eye(dim)
+                + a @ cos1 @ a.mT
+                + b @ cos1 @ b.mT
+                - b @ sin @ a.mT
+                + a @ sin @ b.mT
+            )
+            self.assertTrue(torch.allclose(canon_new, rotation @ canon_old, atol=1e-5), msg=f"shape={shape}")
+            # The transport consequence, stated directly: rotating a lifted moment
+            # with the frame and re-reading its coordinates returns them unchanged.
+            moment = torch.randn(4, 3)
+            transported_coords = canon_new.mT @ (rotation @ (canon_old @ moment))
+            self.assertTrue(torch.allclose(transported_coords, moment, atol=1e-5), msg=f"shape={shape}")
+
     def test_eigh_target_full_snap_lands_on_target(self):
         """Retracting the toward-target log-map tangent with step 1 and all angles
         rotated must land the basis exactly on the target subspace. This pins the

@@ -116,10 +116,17 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.projected_grad_clip_norm, 0.0)
         self.assertEqual(args.projected_grad_clip_ratio, 0.0)
         self.assertEqual(args.grad_clip_norm, 2.5)
-        self.assertEqual(args.grassmann_step_size, 1.0)
+        # Position-control defaults (Q14 promotion): eigh aim, full-spectrum
+        # rotation, EMA constant at the measured knee.
+        self.assertEqual(args.grassmann_aim, "eigh")
+        self.assertIsNone(args.grassmann_rotate_rank)
+        self.assertEqual(args.grassmann_step_size, 0.25)
+        self.assertFalse(hasattr(args, "no_grassmann_accumulate"))
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
-        self.assertEqual(args.wandb_log_every, 10)
+        # Half the refresh interval: logging at the refresh cadence aliases
+        # basis_capture to a fixed phase of the rotation cycle.
+        self.assertEqual(args.wandb_log_every, 5)
         self.assertEqual(args.aurora_pp_iterations, 2)
         self.assertEqual(args.polar_ns_steps, 5)
         self.assertEqual(args.basis_init, "eigh")
