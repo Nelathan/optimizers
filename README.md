@@ -6,17 +6,23 @@ SumoTrack's product target is distribution adaptation under memory pressure: mov
 
 ## Documentation
 
-- `SPEC.md` — concise mathematical specification of the current SumoTrack update.
-- `PLAN.md` — current direction, active invariants, next cuts, and durable empirical facts.
-- `RESULTS.md` — brief experiment records: question, setup, run links, metrics, interpretation.
+- `SPEC.md` — canonical mathematical specification of the current update.
+- `PLAN.md` — live product direction, evidence, research map, and release gates.
+- `SUBSPACE_TRACKING.md` — live geometry ledger and open questions.
+- `LEGEND.md` — the design's anthropomorphic story; evocative, not normative.
 - `AGENTS.md` — operating contract for agents working in this repo.
-- `whiteflow/README.md` and `muonfactor/README.md` — historical optimizer sketches, not active specs.
+- `archive/` — complete superseded run and design histories. Use for provenance,
+  never to infer current defaults.
+- `whiteflow/README.md` and `muonfactor/README.md` — older optimizer sketches.
 
 ## Current mainline
 
 The active optimizer class is `SumoTrack`.
 
-Current quality/diagnostic harness defaults are broad no-embedding training, uniform rank `64`, stable side-Gram `eigh` basis initialization, residual-facing one-sided projection, faithful SYNTH right-padded no-mask batches, CCE loss, Transformers `sdpa` attention, Grassmann burst basis refresh, and Aurora/Muon projected update geometry.
+Current quality/diagnostic harness defaults are broad no-embedding training,
+uniform rank `64`, stable side-Gram `eigh` basis initialization, residual-facing
+one-sided projection, faithful SYNTH right-padded no-mask batches, CCE loss,
+position-controlled Grassmann burst refresh, and Aurora/Muon update geometry.
 
-For the optimizer itself, read `SPEC.md`. For current work and stop conditions,
-read `PLAN.md`.
+Read in this order: `SPEC.md`, `PLAN.md`, then the specialized live ledger. Enter
+`archive/` only when the provenance of a decision matters.

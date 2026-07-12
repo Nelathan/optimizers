@@ -1,7 +1,7 @@
 # SumoTrack specification
 
-Current matrix-update design. History, evidence, and unresolved questions live in
-`SUBSPACE_TRACKING.md`, `RESULTS.md`, and `PLAN.md`.
+Current matrix-update design. Direction and unresolved questions live in
+`PLAN.md` and `SUBSPACE_TRACKING.md`; superseded evidence lives under `archive/`.
 
 ## Read these traps first
 

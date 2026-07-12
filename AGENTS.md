@@ -1,8 +1,10 @@
 # AGENTS.md
 
 This file is the operating contract for agents working in this repo.
-- Current direction and future leads and empirical facts live in `PLAN.md`.
-- Brief experiment records live in `RESULTS.md`: why the run existed, what was tested, what moved, and what was observed.
+- The current optimizer is defined by `SPEC.md`; do not reconstruct it from prose or old commands.
+- Current direction, evidence, and research axes live in `PLAN.md`.
+- Current geometry questions live in `SUBSPACE_TRACKING.md`.
+- Superseded experiments and design arcs live under `archive/`. They are provenance, not current guidance.
 
 ## Repo purpose
 
@@ -14,11 +16,11 @@ The product target is usable distribution adaptation under memory pressure: move
 
 Act as a partner, not an autopilot. The job is not to complete the requested command at all costs; the job is to preserve the question we are trying to answer. If the route stops answering that question, stop and say so before spending more compute or writing more code.
 
-Research is not software engineering, and the failure modes differ. In research work (subspace tracking, optimizer design, any open investigation) the artifact is the **question ledger**, not the code: the set of open questions, how each would be evaluated, and what evidence has moved each answer. The cardinal sins are forgetting a question, failing to note a new one, and failing to update an answer when evidence arrives. Maintain the ledger explicitly (e.g. `SUBSPACE_TRACKING.md`) and treat updating it as the real deliverable of a run.
+Research is not software engineering, and the failure modes differ. In research work (subspace tracking, optimizer design, any open investigation) the artifact is the **question ledger**, not the code: the set of open questions, how each would be evaluated, and what evidence has moved each answer. The cardinal sins are forgetting a question, failing to note a new one, and failing to update an answer when evidence arrives. Maintain the live ledger explicitly (e.g. `SUBSPACE_TRACKING.md`), distill conclusions there, and move chronology into `archive/` rather than leaving superseded guidance in present tense.
 
 Do not collapse an exploration space to a single point. When the user lays out a space of possibilities to evaluate — a lattice of designs, a set of candidate mechanisms — hold it open as a space. Turning "here are the axes we must evaluate" into "here is the one arm I'll build first" is the same failure as turning a discussed value into a solo goal: it discards the comparisons that reveal which axis dominates. The axes usually interact and the signs are usually unknown; that is *why* it is a space. Map it (a matrix of forms, with cost, prerequisites, and what each tests), note which questions each arm answers, and let the user choose the traversal. Recommend a first arm only when asked, and never prune a branch before a single one is measured.
 
-DCP/context-compression reminders are hygiene signals, not commands. Keep active working context raw when summarizing it would force rereads or rethinking; prune only stale, closed context whose details have already been distilled into `PLAN.md`, `RESULTS.md`, or the current working state.
+DCP/context-compression reminders are hygiene signals, not commands. Keep active working context raw when summarizing it would force rereads or rethinking; prune only stale, closed context whose details have already been distilled into the live ledgers or current working state.
 
 A benchmark is only meaningful when the model, data, loss path, batch shape, attention path, optimizer scope, and measurement target match the intended claim. If any of those drift, stop. State the mismatch and the consequence for the claim.
 
@@ -69,7 +71,7 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 - Orthogonalization happens in projected space.
 - Aurora with Muon scale semantics is the forward projected direction.
 - HeavyBall Newton-Schulz is the internal polar primitive inside Aurora.
-- Position control is the forward basis-update path after initialization: eigh target frame from the dampened boundary grad, full-spectrum fractional geodesic toward it (`grassmann_aim="eigh"`, all planes, step 0.25 = the EMA constant). Tangent aim survives only as the SubTrack-faithful single-grad ablation; the C1 window accumulator was deleted (see `SUBSPACE_TRACKING.md`, position vs velocity control).
+- Position control is the forward basis-update path after initialization: `eigh` target frame from the dampened boundary grad, full-spectrum fractional geodesic toward it (`grassmann_aim="eigh"`, all planes, step 0.25 = the EMA constant). Tangent aim survives only as the SubTrack-faithful single-grad ablation; the C1 window accumulator was deleted.
 - The projected first moment parallel-transports through every geodesic refresh as the identity in projected coordinates (the retraction is a rigid frame rotation; pinned by test). Do not reintroduce project-back/re-project transfer — its cos-tax feeds Aurora's polar map shrunken, noise-dominated directions that NS re-amplifies.
 - Burst refresh is the basis schedule; round-robin was removed as complexity rent.
 - Two-sided square-core projection was removed from the active path.
@@ -78,7 +80,7 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=4`, `seq_len=1024`, and CCE loss. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
+The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, and position-controlled burst refresh every 10 steps. Constructor defaults are a separate API contract; inspect `SPEC.md` or code rather than assuming the harness and optimizer constructor are identical. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
 For expensive 1k-quality runs, use `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Record compile state in results so throughput comparisons stay honest.
 
