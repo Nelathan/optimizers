@@ -873,6 +873,75 @@ which is the form of averaging that converges.
    signal for adaptive intervals: on a 10k run the basis should settle and
    SubTrack's interval-100 becomes legitimate *after* the decay, not before.
 
+### Moment transport audit — what the no-op does and does not mean
+
+The no-op is mathematically supported, but the precise statement matters. The
+projected first moment is not a Grassmann tangent; it is a vector (one per matrix
+row/column) in the **tautological rank-r bundle** over the Grassmannian. Let the
+canonical column frame be `Q:[d,r]`, and write one lifted moment vector as `Qm`.
+For a geodesic with tangent SVD `U Σ Vᵀ`, the retraction used here has the
+horizontal frame lift
+
+```text
+Q(t) = (Q V cos(tΣ) - U sin(tΣ)) Vᵀ + Q(I - VVᵀ).
+```
+
+Equivalently, there is a specific minimal ambient plane rotation `R(t)` in the
+`[QV,U]` planes such that `Q(t)=R(t)Q`; this is pinned for both projection sides
+by `test_geodesic_retraction_is_a_rigid_frame_rotation`. Transporting the bundle
+vector by that same lift gives `R(t)(Qm)=Q(t)m`. Therefore its coordinates in the
+moving horizontal frame are exactly unchanged. The optimizer no-op is not “the
+old ambient vector happens to have the same coordinates”; it is the explicit
+covariant update `Qm -> R(Qm)`, represented without materializing either lifted
+vector or `R`.
+
+This also answers the Aurora-specific concern. With a right basis, the physical
+update is `polar(M) Qᵀ` in canonical notation (and symmetrically on the left).
+Leaving `M` unchanged and rotating `Q` transports the entire Stiefel/polar update
+by `R`, preserving its singular spectrum, orientation inside the rank-r fiber,
+and norm. Reprojection instead uses the overlap
+`C = Q_newᵀ Q_old = V cos(Θ) Vᵀ + (I-VVᵀ)` and replaces `M` by `M C` (side
+transposed as appropriate). `C` is a contraction, not a coordinate change:
+unless it commutes with `MᵀM`, `polar(MC) != polar(M) C`, so it changes not only
+magnitude but the Stiefel direction Aurora returns. Near a large principal angle
+it can make a column noise-dominated before NS restores unit polar scale. This is
+the formal version of the measured cos-tax/alignment mechanism.
+
+There are two different contracts which must not be conflated:
+
+- **Fixed-ambient-history semantics:** keep the old full-space EMA vector fixed
+  and find its least-squares coordinates in the new subspace. Reprojection is
+  correct; the component outside the new subspace is necessarily discarded.
+- **Moving-fiber momentum semantics:** momentum belongs to the selected rank-r
+  manifold and follows that manifold by the geodesic's canonical (horizontal)
+  lift. Identity coordinates are exact parallel transport. This is SumoTrack's
+  contract: Aurora acts on the projected manifold, full steps make its direction
+  rather than its pre-polar magnitude load-bearing, and the basis update itself
+  declares how that manifold moved.
+
+The second contract is not derivable from the first; it is a modeling choice.
+It is nevertheless the coherent choice for SumoTrack, and the observed
+alignment/loss improvement is evidence in the same direction. There is no more
+accurate transport to implement for the chosen geodesic: any extra overlap,
+projection, or renormalization would cease to be parallel transport. A future
+empirical challenge would have to compare the two *semantics* (ambient history
+versus moving-fiber history), not search for a more exact version of the no-op.
+
+Why SubTrack reprojects does not refute this. Its overlap rule is shared with
+GaLore-style abrupt SVD refits, where only two endpoint subspaces exist and no
+geodesic/path supplies a transport; preserving the old ambient EMA by
+least-squares projection is the obvious generic fallback. In the published
+`adamw.py`, that generic transfer is gated on a non-`None` newly fitted `matrix`,
+but `subtrack_projector` returns `matrix=None` on tracking refreshes, so the main
+SubTrack path does **not** actually execute that transfer for its geodesic. Its
+separate `adaptive_optimizer` overlap path attempts to rotate first/second moments,
+but `prev_ortho_matrix` updates are commented out in `track_the_subspace`, so it
+does not establish a clean consecutive-frame parallel-transport contract either.
+The reference is useful evidence for the geodesic aim; it is not a trustworthy
+authority on moment transport. (Its tall/right tracking tangent is already known
+to be identically zero, another reason not to infer geometric intent from that
+code path.)
+
 **Q17 — How much to turn, when: is there a step size that is both stable and
 fast self-decaying?** 🔴 — the open question the cut leaves behind
 - *Why:* α=0.25 is the measured knee for THIS drift rate (early adaptation,
@@ -1113,6 +1182,169 @@ hold capture against drift better than frozen, and than C1?) and **eval loss**;
 erank/aurora-alignment secondary only (both known biased toward frozen — every
 rotation perturbs the moment spectrum). A′ needs its own small step_size
 calibration ({0.25, 0.5, 1.0} on T1) since the knob's meaning changed.
+
+## Post-arc research map
+
+Position control and horizontal moment transport are now a coherent default. The
+tracking work should shift from mechanism generation to attempts to falsify or
+simplify that default. These directions are deliberately a map, not a queue.
+
+### First: falsify the geometry, then guard its implementation
+
+Do not treat the arc's conceptual convergence as design proof. An exact differential
+suite can show that code implements a formula while the formula answers the wrong
+question. Before another tracking experiment, define the rival semantics and the
+worlds that separate them:
+
+```text
+stationary signal + noise       should tracking move at all?
+smoothly rotating signal        which controller follows without integrating noise?
+abrupt regime change            which history semantics adapts or misleads?
+eigenvalue crossing at cutoff   does full-spectrum motion chase gauge/churn?
+near-orthogonal replacement     is the selected path stable and useful?
+```
+
+For each world, write the prediction of frozen, tangent, position, reset,
+fixed-ambient reprojection, and moving-fiber transport before running it. Observe
+principal-angle motion, capture, lifted history, pre-Aurora spectrum, and lifted
+update—not just terminal loss. This is the design test.
+
+Only then pin the surviving formulas with fp64 tests over right/left orientation,
+rank limits, gauge changes, large angles, explicit ambient lifts, and repeated
+refreshes. Reintroducing historical bugs must turn those guards red, but that proves
+only regression sensitivity. It does not claim coverage of future design errors.
+
+### R1 — can tracking be deleted for ordinary runs?
+
+The most valuable simplification result would be that stable `eigh` initialization
+lasts for the useful training horizon. Compare:
+
+```text
+frozen eigh
+current fractional full-spectrum eigh position control
+```
+
+Use a horizon where the frozen arm's capture actually decays; a 200-step tie says
+nothing. Primary reads are capture, target eval, and source eval. If tracking does
+not buy one of them before the run's useful stopping point, defaulting to frozen
+removes boundary eigensolves, geodesic work, refresh spikes, and every transport
+question. If it does buy them, the experiment becomes the clean release evidence
+that tracking earns its complexity.
+
+### R2 — transport semantics, not transport accuracy
+
+The no-op is exact parallel transport for the moving-fiber contract. The remaining
+question is whether that is the best optimizer model of history. Hold the basis
+path fixed and compare:
+
+```text
+moving fiber:      keep projected coordinates unchanged
+fixed ambient:     old coordinates = overlap(new_basis, old_basis) * old_coordinates
+forget at refresh: old coordinates = 0
+```
+
+First use a deterministic matrix stream with a known rotating signal subspace.
+Measure the angle between the desired lifted polar update and the update each arm
+actually emits. Then run only the surviving distinction on SYNTH. This separates
+geometry from model quality cheaply and prevents another round of interpreting
+moment norm as direction fidelity.
+
+### R3 — gauge and near-orthogonal target stress
+
+The horizontal lift is invariant to harmless target-frame sign and within-subspace
+gauge changes, but near-90-degree principal planes have non-unique shortest paths.
+Rank-cutoff churn puts the implementation near exactly that regime. A property
+test should rotate/sign-flip the target frame without changing its subspace and
+assert the same new projector and lifted Aurora update. A second deterministic
+test should approach 90 degrees from both sides and check continuity or explicitly
+record the unavoidable branch ambiguity. This is cheap honesty work: no training
+run, but it guards the hardest geometry in the default path.
+
+### R4 — adaptive cadence only if the fixed cadence wastes measured time
+
+`basis_lag` is already the right sensor. Do not add a controller because it looks
+elegant. On a long run, first record:
+
+```text
+refresh walltime fraction
+basis_lag mean/top angle
+capture gained immediately after refresh
+loss progress over the same window
+```
+
+If lag settles while refresh cost remains material, compare a small schedule
+space rather than inventing a feedback system immediately:
+
+```text
+fixed interval 10
+fixed interval 100
+monotone schedule: 10 -> 20 -> 50 -> 100
+```
+
+The schedule can be derived from refresh count and has no state or synchronization.
+Only if those arms show that different tensors settle at materially different
+rates does per-tensor lag feedback earn its complexity.
+
+### R5 — cheaper target decomposition
+
+Boundary side-Gram plus `eigh` is faithful but creates burst cost. If profiling
+shows refresh decomposition is significant, hold open these replacement classes:
+
+| target form | saved work | main risk | decisive check |
+|---|---|---|---|
+| exact side-Gram `eigh` | none; reference | burst latency | baseline |
+| warm-started block/subspace iteration | avoids full decomposition | misses changing cutoff; iteration tuning | principal-angle and capture agreement at lower walltime |
+| randomized range finder | cheaper when ambient side is large | stochastic target noise and extra matmuls | same loss/capture with lower refresh cost |
+| low-rank update of prior decomposition | exploits slow drift | boundary gradient Gram is not a low-rank perturbation in general | measured residual rank before design |
+| less frequent exact target | simplest | stale position control | R4 cadence result |
+
+Do not implement all rows. Profile first, then run the cheapest probe that can
+falsify the premise of each candidate. In particular, measure whether consecutive
+Gram changes are actually low effective rank before building an incremental
+eigensolver.
+
+### R6 — distinguish signal planes from cutoff-churn planes
+
+Full-spectrum fractional motion won despite a nearly degenerate cutoff. That may
+mean the stable interior planes carry the gain while the last few planes merely
+orbit. A diagnostic-only decomposition can bucket principal planes by target
+eigenvalue separation and report how much capture change each bucket contributes.
+If almost all gain comes from a stable prefix, rotating only that prefix could
+reduce target noise, geodesic FLOPs, and moment-frame motion without reverting to
+the failed largest-angle rank-1 rule. If gains are distributed, full-spectrum is
+already the simpler honest answer. This is curiosity with a deletion prize; do
+not promote eigenvalue-weighted rotation without that measurement.
+
+### R7 — compile boundary and synchronization audit
+
+Tracking currently records rotation and singular-value diagnostics by converting
+device tensors to Python floats inside the projector. That can synchronize every
+refresh even when the user did not request basis diagnostics. Refactor the
+contract conceptually as:
+
+```text
+projector math returns device tensors
+optimizer accumulates device diagnostics only when enabled
+logging boundary performs the one host transfer
+```
+
+This is likely worth more walltime than a custom geodesic kernel. The geodesic
+itself is a handful of small matrix products around an SVD and should stay in
+PyTorch unless a profiler proves it launch-bound after synchronization removal.
+The basis-target Gram is a GEMM and `eigh` is a vendor-library call; neither is a
+sensible first Triton implementation.
+
+### Tracking stop condition
+
+The sidequest is successful enough to stop expanding. New tracking work must pay
+one of four rents:
+
+- delete tracking or state;
+- reduce measured refresh walltime;
+- repair a demonstrated faithfulness failure;
+- improve capture and eval loss under actual drift.
+
+Anything else belongs in the question ledger as curiosity, not in the optimizer.
 
 ---
 

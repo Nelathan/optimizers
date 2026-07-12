@@ -115,3 +115,243 @@ Everything else (`param-scope`, `seq-len`, `lr-warmup-steps`, `beta`, `moment-mo
 - **SYNTH remains the clean product-shaped dataset lane.** Do not replace it because it is “synthetic.” It already demonstrated target-format adoption across ranks, with rank256 changing language and structure more deeply than low-rank style-cover behavior. New product data can be useful later, but it is not the next optimizer lead.
 - **HeavyBall-native final shape.** SumoTrack does **not** currently use HeavyBall ECC/param-ECC. The next engineering task is migrating the final fast implementation into `../HeavyBall` for compiled transforms, ECC/param-ECC, clipping, chainable optimizer machinery, and API compatibility. This repo remains the accessible experiment/testbed lane.
 - **Matched-memory comparators are release evidence, not the next local optimization task.** Compare against alternatives users would actually run under the same memory pressure: LoRA/Unsloth-style adapters, GaLore/SubTrack-like low-rank-gradient routes, and AdamW only as a quality anchor where it fits. A serious Unsloth/LoRA comparator is non-trivial because the harness and memory contract must be comparable; it matters near the end because if LoRA reaches much lower target loss at the same memory/time, users will judge accordingly. The expected SumoTrack advantage is full-parameter distribution movement without LoRA's adapter-rank ceiling/forgetting tradeoff, closer to GaLore capacity but with cleaner projected/Aurora updates.
+
+## Path to a trustworthy implementation (publication later)
+
+Do not optimize for publication yet. The last two days exposed design errors, not
+ordinary implementation errors: internally consistent formulas answered the wrong
+geometric question, normalization hid poisoned magnitudes, and mechanisms that
+looked active had no useful control authority. A reference implementation of those
+designs would have reproduced the bugs perfectly.
+
+The current product is therefore **design confidence**, not test coverage. No
+finite campaign can promise that future work will reveal no new conceptual error.
+The honest goal is to make each assumption explicit, derive its consequences, and
+try to falsify it through an observation that is not defined by the same assumption.
+
+### P-1 — design falsification campaign
+
+Build this before performance work or comparator runs. For every load-bearing
+mechanism, keep a short contract with five fields:
+
+```text
+purpose       what product problem this mechanism solves
+assumption    the geometric/statistical claim that makes it plausible
+intervention  what can be changed while holding neighbors fixed
+observable    what must move if the mechanism has useful control authority
+rival         the simplest competing explanation or design
+```
+
+Then attack the design from four directions.
+
+**1. Coordinate, unit, and limiting-case derivation.** Before a run, derive both
+projection sides separately and follow scale through the entire chain—not merely
+through the local function. Ask what happens at zero angle, full rank, rank one,
+90-degree rotation, constant gradients, pure noise, and multiplication of the raw
+gradient by a scalar. These checks would have exposed wrong-frame inactivity and
+the sigma/Adafactor scale path without relying on training loss. They do not choose
+between valid momentum semantics; that still requires a product-level argument.
+
+**2. Intervention with mechanism-local telemetry.** A knob or mechanism earns its
+name only if changing it causes the predicted intermediate quantity to move:
+
+```text
+tracking step       -> principal-angle motion, not merely final capture
+dampening           -> boundary-gradient scale and target stability
+transport choice    -> lifted ambient history and pre-Aurora singular spectrum
+clipping            -> the exact tensor and stage it claims to bound
+Aurora              -> input spectrum, polar residual, and lifted update direction
+```
+
+Use deliberately strong interventions first. If `0` versus `1` produces no local
+effect, the mechanism is inactive, cancelled downstream, or measured incorrectly.
+A final loss curve is a late and confounded sensor.
+
+**3. Rival designs in hostile synthetic worlds.** Construct tiny sequences where
+the desired behavior is defined independently of SumoTrack: a stationary signal
+plus noise, a smoothly rotating dominant subspace, an abrupt regime change, and
+cutoff-plane eigenvalue crossings. Compare position control, tangent control,
+frozen basis, reset, fixed-ambient reprojection, and moving-fiber transport only on
+the worlds that distinguish their assumptions. This cannot prove which semantics
+real language-model training wants; it can show where each design necessarily
+wins, loses, or becomes undefined.
+
+**4. Real-training falsification.** Promote only surviving distinctions into the
+faithful SYNTH lane. Measure both the mechanism's predicted intermediates and the
+product outcomes: capture, target loss, source retention, update/parameter ratio,
+state, and walltime. Prefer paired interventions around a causal claim over broad
+hyperparameter sweeps. If the local observable moves as predicted but the product
+outcome does not, the mechanism may be true and still not worth having.
+
+Implementation tests remain necessary but subordinate. Exact fp64 oracles,
+gauge/transpose properties, state-machine coverage, save/resume, and eager/compile
+parity protect a design after it survives scrutiny; they do not validate its
+premises. Historical bug mutations are useful regression tests, never evidence
+that the next unknown design error would have been caught.
+
+When a design error is found, record the failed assumption, the observation that
+falsified it, and the broader family of mechanisms sharing that assumption. The
+campaign has no magical “bug-free” exit. Publication becomes reasonable when a
+fresh adversarial review yields no unresolved contradiction in the main path and
+the remaining assumptions and support boundaries can be stated without bluffing.
+
+### P0 — make the generic PyTorch contract true
+
+The optimizer itself no longer depends on activation-projection wrappers, so the
+core should work with an ordinary training loop:
+
+```python
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+Only after P-1, build a compatibility matrix and test it. The minimum integration
+gate is:
+
+- arbitrary rectangular and square dense matrix parameters, both projection
+  sides, mixed matrix/non-matrix groups, tied parameters, missing gradients, and
+  multiple parameter groups;
+- fp32 and bf16 parameters, autocast/GradScaler usage, gradient accumulation,
+  closure semantics, save/resume across devices and dtypes, and deterministic
+  continuation after `state_dict` reload;
+- DDP as the first distributed boundary; explicitly mark sparse gradients,
+  FSDP/flattened parameters, differentiable/capturable optimizers, and exotic
+  tensor subclasses unsupported until tested;
+- a clear policy for embeddings and output heads. `p.ndim == 2` currently makes
+  them matrix-path parameters automatically, while the quality harness excludes
+  embeddings by policy. That difference must be visible in the public API and
+  README rather than hidden behind the word “automatic.”
+
+There is also an honest side-policy boundary. Shape-based `side="auto"` is generic
+and model-agnostic; the measured quality default, `residual-facing`, requires
+module-role knowledge supplied by the harness. Do not imply that a bare optimizer
+can infer transformer semantics from a tensor shape. A small optional parameter-
+group helper can make residual-facing setup convenient later; it should not be
+baked into the optimizer core.
+
+### P1 — one release-shaped evidence table, when confidence holds
+
+Do not reproduce a conference benchmark suite. Run one controlled table on the
+existing LFM-350M faithful SYNTH contract, with the same model, formatting, token
+budget, compile state, optimizer scope, and eval cadence. Report:
+
+- target eval loss and source retention;
+- peak allocated VRAM, optimizer-state bytes, tokens/sec, and walltime to the
+  named target loss;
+- SumoTrack current default, AdamW quality anchor where it fits, one credible
+  GaLore/SubTrack-class implementation, and one LoRA/Unsloth-style matched-memory
+  user alternative;
+- both “same token budget” and “same memory ceiling” views. Either view alone can
+  make the wrong optimizer look heroic.
+
+Three seeds are not the first use of this machine. First run one seed per arm and
+repeat only comparisons whose margin is close enough that variance changes the
+decision. Publish curves and exact commands. That is afternoon-scale rigor:
+selective replication, not ritual replication.
+
+Avoid an unsupported “state of the art” claim for orthogonalization. The honest
+claim today is “Aurora/Muon-family projected polar updates, selected by measured
+quality in this optimizer.” If runtime or approximation quality is compared
+against current polar methods, name the exact methods, shapes, dtype, error metric,
+and hardware; then strengthen the wording only as far as that table supports.
+
+### P2 — profile the optimizer step after correctness, then cut launches
+
+The model can compile while Python optimizer bookkeeping remains eager. Profile a
+real rank256 step with refresh and non-refresh iterations separated. Attribute
+walltime and launches to these stages:
+
+```text
+sanitize + raw clip
+adafactor row/column reduction and dampening
+gradient projection
+projected EMA
+Aurora / polar iterations
+project back + parameter update
+basis target Gram + eigh + geodesic refresh
+Python grouping, stacking, diagnostics, and device synchronizations
+```
+
+The first cheap audit target is synchronization, not Triton. Grassmann refresh
+currently converts `last_tangent_sigma_max` and `last_rotation_angle` to CPU
+floats inside the projector even when basis diagnostics are disabled. Keep those
+as device scalars or avoid producing them outside diagnostics. Search the entire
+ordinary step for the same pattern before writing kernels.
+
+Next, preserve bucket structure across steps rather than rebuilding Python shape
+maps, and measure the cost of `torch.stack`/`unbind` around same-shape Aurora
+batches. Transformer layers provide repeated shapes; a compiled tensor function
+over a stable bucket is the natural unit. Do not compile `optimizer.step()` as an
+object graph again—the earlier failure already showed that Parameter identity and
+fallback bookkeeping are the wrong compilation boundary.
+
+### Triton candidates — gated by a profiler
+
+Good candidates are memory-bound chains with several reads/writes, not GEMMs that
+cuBLAS already owns:
+
+1. **Adafactor preparation.** Fuse finite sanitization, raw-norm accumulation,
+   clipping, squared-gradient row/column reductions, and as much dampening setup
+   as the reduction dependency permits. This currently walks every full gradient
+   several times. A two-stage Triton reduction may earn its keep.
+2. **Projected EMA and small tensor bookkeeping.** Clip/EMA can fuse when enabled,
+   though the default rails are off and the likely prize is modest.
+3. **Project-back epilogue.** A custom low-rank matmul whose epilogue applies LR,
+   weight decay, and writes directly into the parameter could avoid materializing
+   a full update tensor. This is the most interesting memory-traffic candidate,
+   but it must beat cuBLAS plus `add_` on real transformer shapes before adoption.
+4. **Aurora elementwise polynomial stages.** Fuse normalization and polynomial
+   combinations between matrix multiplies. Do not replace the matrix multiplies
+   themselves with handwritten Triton unless the small projected dimensions leave
+   cuBLAS visibly launch-bound; HeavyBall's compiled kernels are the first bar.
+
+Basis Gram construction, projection, and most Newton–Schulz products are GEMMs;
+`eigh` is a library decomposition. They are poor first Triton targets. A custom
+kernel there would mostly become a slower numerical library maintained by one
+person, which is a grim hobby.
+
+### P3 — isolate the final semantic risks cheaply
+
+The geometry is now coherent, but two compact experiments would make the release
+more honest:
+
+- **Transport semantics:** deterministic rotating-subspace toy first, then a
+  narrow SYNTH comparison of identity parallel transport, fixed-ambient
+  reprojection, and moment reset at refresh. The toy must check the lifted Aurora
+  direction, not just moment norm. This tests which momentum contract helps the
+  optimizer; it is not another attempt to prove the already-exact no-op math.
+- **Tracking value:** current position control versus frozen-eigh on a horizon
+  long enough for drift to bite, reading capture, target loss, and source loss.
+  If position control wins there, stop tuning tracking. If it does not, static
+  eigh is a major simplification and should become a serious release candidate.
+
+The tracking sidequest has earned a stopping rule: no new aim, transport, or
+schedule mechanism without a failure in capture or loss that the current position
+controller cannot explain. Curiosity remains welcome; mechanism inventory does
+not belong in the default path.
+
+### P4 — package the small thing, archive the laboratory
+
+The public package should contain the optimizer, projector, tested defaults, and
+short examples. Harness-specific model surgery and the closed projected-activation
+lane should remain research artifacts, not dependencies or advertised fast paths.
+Keep advanced knobs—users really do have different ranks, drift rates, and memory
+ceilings—but classify them:
+
+- normal user controls: LR, rank, weight decay, refresh interval;
+- advanced geometry controls: side, aim, rotation fraction, Aurora iterations;
+- ablation/debug controls: tangent aim, random init, diagnostic probes.
+
+Many knobs are acceptable. An undifferentiated constructor is not. Stable defaults
+plus named tiers preserve experimentation without making every user reconstruct
+the lab's history.
+
+### What the project needs most
+
+The strongest next move is **not publication and not more optimizer invention**.
+It is the adversarial correctness campaign: exact tiny oracles, metamorphic tests,
+forced state transitions, and step-by-step differential trajectories. Only when
+those stop producing surprises should generic-PyTorch compatibility and compiled
+walltime become the main cuts. The matched-memory table is last; benchmarking a
+still-misunderstood optimizer only produces precise folklore.

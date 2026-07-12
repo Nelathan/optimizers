@@ -6,6 +6,7 @@ SumoTrack's product target is distribution adaptation under memory pressure: mov
 
 ## Documentation
 
+- `SPEC.md` — concise mathematical specification of the current SumoTrack update.
 - `PLAN.md` — current direction, active invariants, next cuts, and durable empirical facts.
 - `RESULTS.md` — brief experiment records: question, setup, run links, metrics, interpretation.
 - `AGENTS.md` — operating contract for agents working in this repo.
@@ -17,4 +18,5 @@ The active optimizer class is `SumoTrack`.
 
 Current quality/diagnostic harness defaults are broad no-embedding training, uniform rank `64`, stable side-Gram `eigh` basis initialization, residual-facing one-sided projection, faithful SYNTH right-padded no-mask batches, CCE loss, Transformers `sdpa` attention, Grassmann burst basis refresh, and Aurora/Muon projected update geometry.
 
-For the current working contract and stop conditions, read `PLAN.md` first.
+For the optimizer itself, read `SPEC.md`. For current work and stop conditions,
+read `PLAN.md`.
