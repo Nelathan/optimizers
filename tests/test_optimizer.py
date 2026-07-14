@@ -1,11 +1,12 @@
+import math
 import unittest
 from unittest import mock
 
 import torch
 
 import usuitrack
-from usuitrack import UsuiTrack, optimizer_state_bytes_by_category
-from usuitrack.optimizer import ORTHOGONALIZATION_SCALE_MODE
+from usuitrack import SubspaceProjector, UsuiTrack, optimizer_state_bytes_by_category
+from usuitrack.optimizer import MATURE_EMA_MIN_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
 
 
 class UsuiTrackTest(unittest.TestCase):
@@ -40,10 +41,35 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertGreater(opt.last_step_diagnostics["update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["matrix_update_norm"], 0.0)
         self.assertGreater(opt.last_step_diagnostics["fallback_update_norm"], 0.0)
-        self.assertGreater(opt.last_step_diagnostics["projected_grad_max_norm"], 0.0)
+        self.assertGreater(opt.last_step_diagnostics["mean_projected_grad_norm"], 0.0)
+        # Initialization has no held frame to measure. The next step's capture is
+        # deliberately taken before any refresh.
+        self.assertTrue(math.isnan(opt.last_step_diagnostics["mean_basis_capture"]))
+        (weight.square().mean() + bias.square().mean()).backward()
+        opt.step()
         capture = opt.last_step_diagnostics["mean_basis_capture"]
         self.assertGreater(capture, 0.0)
         self.assertLessEqual(capture, 1.0 + 1e-5)
+
+    def test_basis_capture_measures_the_held_frame_before_refresh(self):
+        weight = torch.nn.Parameter(torch.zeros(2, 2))
+        opt = UsuiTrack(
+            [weight],
+            lr=0.01,
+            rank=1,
+            side="left",
+            moment_mode="ema",
+            basis_refresh_interval=1,
+            grassmann_step_size=0.25,
+        )
+        opt.diagnostics_enabled = True
+
+        weight.grad = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+        opt.step()  # initializes to e1; no held-frame capture exists yet
+        weight.grad = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+        opt.step()  # refreshes toward e2, but capture is measured against e1
+
+        self.assertLess(opt.last_step_diagnostics["mean_basis_capture"], 1e-6)
 
     def test_eigh_aim_refresh_rotates_and_logs_the_q10_probe(self):
         torch.manual_seed(0)
@@ -52,7 +78,7 @@ class UsuiTrackTest(unittest.TestCase):
         opt.diagnostics_enabled = True
         opt.diagnostics_basis_enabled = True
 
-        lag_angle = float("nan")
+        lag_angle_mass = float("nan")
         diagnostics = {}
         # Enough boundaries for the probe AND one basis-lag reading: the snapshot
         # is taken at the first post-init refresh, the lag angle lands
@@ -65,29 +91,54 @@ class UsuiTrackTest(unittest.TestCase):
             opt.step()
             if opt.last_step_diagnostics["basis_refresh_tensors"] > 0.0:
                 diagnostics = opt.last_step_diagnostics
-            candidate = opt.last_step_diagnostics.get("mean_basis_lag_angle", float("nan"))
+            candidate = opt.last_step_diagnostics.get("mean_basis_lag_angle_mass", float("nan"))
             if candidate == candidate:
-                lag_angle = candidate
+                lag_angle_mass = candidate
         self.assertGreater(diagnostics["basis_refresh_tensors"], 0.0)
-        # sigma is a true principal angle under the eigh aim.
-        self.assertGreater(diagnostics["mean_tangent_sigma_max"], 0.0)
-        self.assertLessEqual(diagnostics["mean_tangent_sigma_max"], torch.pi / 2 + 1e-5)
-        # Probe fields: self-angle needs two boundary targets, so it must be
-        # populated by the second boundary; cutoff ratio needs Gram spectrum
-        # beyond the rank, which 6 > 3 provides.
-        self.assertGreater(diagnostics["mean_eigh_target_self_angle"], 0.0)
-        self.assertLessEqual(diagnostics["mean_eigh_target_self_angle"], torch.pi / 2 + 1e-5)
-        self.assertGreaterEqual(diagnostics["mean_eigh_target_cutoff_ratio"], 0.0)
-        self.assertLessEqual(diagnostics["mean_eigh_target_cutoff_ratio"], 1.0)
-        # The convergence metric fired once: basis vs its own snapshot 5 refreshes
-        # back, a real angle (the basis is rotating every boundary here).
-        self.assertGreater(lag_angle, 0.0)
-        self.assertLessEqual(lag_angle, torch.pi / 2 + 1e-5)
-        # No tangent-accumulation state under the eigh aim; probe buffer present.
+        self.assertGreater(diagnostics["mean_eigh_target_angle_mass"], 0.0)
+        self.assertGreater(diagnostics["mean_rotation_angle"], 0.0)
+        self.assertLessEqual(diagnostics["mean_rotation_angle"], diagnostics["mean_eigh_target_angle_mass"] + 1e-5)
+        # The convergence metric fired once: total principal-angle mass to the
+        # basis snapshot five refreshes ago.
+        self.assertGreater(lag_angle_mass, 0.0)
+        self.assertLessEqual(lag_angle_mass, 3 * torch.pi / 2 + 1e-5)
+        # No tangent-accumulation state or stale target stream under the eigh aim.
         state = opt.state[weight]
         self.assertIsNone(state.get("tangent_accum"))
-        self.assertIn("prev_eigh_target", state)
+        self.assertNotIn("prev_eigh_target", state)
         self.assertIn("basis_lag_snapshot", state)
+
+    def test_mature_ema_schedule_is_a_running_mean_then_tracks_at_floor(self):
+        self.assertEqual(UsuiTrack._mature_ema_step_size(1), 0.5)
+        self.assertEqual(UsuiTrack._mature_ema_step_size(2), 1 / 3)
+        self.assertEqual(UsuiTrack._mature_ema_step_size(9), MATURE_EMA_MIN_STEP_SIZE)
+        self.assertEqual(UsuiTrack._mature_ema_step_size(100), MATURE_EMA_MIN_STEP_SIZE)
+
+    def test_mature_ema_counts_initial_frame_as_first_target(self):
+        torch.manual_seed(9)
+        weight = torch.nn.Parameter(torch.randn(12, 6))
+        opt = UsuiTrack(
+            [weight],
+            lr=0.01,
+            rank=3,
+            basis_refresh_interval=1,
+            grassmann_step_schedule="mature_ema",
+        )
+
+        step_sizes = []
+        original_update = SubspaceProjector.update_grassmann_from_tangent
+
+        def observe_step_size(projector, tangent, *, step_size, rotate_rank: int):
+            step_sizes.append(step_size)
+            return original_update(projector, tangent, step_size=step_size, rotate_rank=rotate_rank)
+
+        with mock.patch.object(SubspaceProjector, "update_grassmann_from_tangent", new=observe_step_size):
+            for expected_target_count in (1, 2, 3):
+                weight.grad = torch.randn_like(weight)
+                opt.step()
+                self.assertEqual(opt.state[weight]["basis_target_count"], expected_target_count)
+
+        self.assertEqual(step_sizes, [0.5, 1 / 3])
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -103,7 +154,7 @@ class UsuiTrackTest(unittest.TestCase):
         opt.queue_projected_grad(weight, projected_grad.clone())
         opt.step()
 
-        self.assertAlmostEqual(opt.last_step_diagnostics["projected_grad_max_norm"], 10.0, places=4)
+        self.assertAlmostEqual(opt.last_step_diagnostics["mean_projected_grad_norm"], 10.0, places=4)
         self.assertLessEqual(float(opt.state[weight]["projected_exp_avg"].float().norm()), 1.0001)
 
     def test_projected_grad_ratio_clip_bounds_gradient_relative_to_moment(self):
@@ -122,8 +173,8 @@ class UsuiTrackTest(unittest.TestCase):
         opt.queue_projected_grad(weight, projected_grad.clone())
         opt.step()
 
-        self.assertAlmostEqual(opt.last_step_diagnostics["projected_grad_max_norm"], 5.0, places=4)
-        self.assertAlmostEqual(opt.last_step_diagnostics["projected_grad_p90_to_moment_ratio"], 10.0, places=4)
+        self.assertAlmostEqual(opt.last_step_diagnostics["mean_projected_grad_norm"], 5.0, places=4)
+        self.assertAlmostEqual(opt.last_step_diagnostics["mean_projected_grad_to_moment_ratio"], 10.0, places=4)
         self.assertLessEqual(float(opt.state[weight]["projected_exp_avg"].float().norm()), 1.0001)
 
     def test_step_consumes_grads_after_projection_by_default(self):

@@ -1,3 +1,4 @@
+import math
 import sys
 import types
 import unittest
@@ -6,7 +7,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -97,6 +98,24 @@ class TinyLfmForCausalLM(torch.nn.Module):
 
 
 class LlmHarnessParamScopeTest(unittest.TestCase):
+    def test_wandb_omits_unavailable_metrics_but_preserves_numeric_nan(self):
+        class Run:
+            def __init__(self):
+                self.calls = []
+
+            def log(self, data, *, step):
+                self.calls.append((data, step))
+
+        run = Run()
+        wandb_log(run, {"eval/target_loss": 1.0, "eval/source_loss": None, "opt/numeric_problem": float("nan")}, step=10)
+
+        self.assertEqual(len(run.calls), 1)
+        data, step = run.calls[0]
+        self.assertEqual(step, 10)
+        self.assertEqual(data["eval/target_loss"], 1.0)
+        self.assertNotIn("eval/source_loss", data)
+        self.assertTrue(math.isnan(data["opt/numeric_problem"]))
+
     def test_cli_defaults_encode_current_baseline(self):
         args = build_parser().parse_args([])
 
@@ -121,12 +140,11 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.grassmann_aim, "eigh")
         self.assertIsNone(args.grassmann_rotate_rank)
         self.assertEqual(args.grassmann_step_size, 0.25)
+        self.assertEqual(args.grassmann_step_schedule, "fixed")
         self.assertFalse(hasattr(args, "no_grassmann_accumulate"))
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
-        # Half the refresh interval: logging at the refresh cadence aliases
-        # basis_capture to a fixed phase of the rotation cycle.
-        self.assertEqual(args.wandb_log_every, 5)
+        self.assertEqual(args.wandb_log_every, 10)
         self.assertEqual(args.aurora_pp_iterations, 2)
         self.assertEqual(args.polar_ns_steps, 5)
         self.assertEqual(args.basis_init, "eigh")

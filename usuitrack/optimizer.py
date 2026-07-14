@@ -22,6 +22,7 @@ NEWTON_SCHULZ_COEFFICIENTS = (
     (2.8769, -3.1427, 1.2046),
     (2.8366, -3.0525, 1.2012),
 )
+MATURE_EMA_MIN_STEP_SIZE = 0.1
 
 
 @dataclass
@@ -58,6 +59,7 @@ class UsuiTrack(Optimizer):
         adafactor_eps: float = 1e-30,
         grad_clip_norm: float | None = 2.5,
         grassmann_step_size: float = 0.25,
+        grassmann_step_schedule: str = "fixed",
         grassmann_rotate_rank: int | None = None,
         grassmann_aim: str = "eigh",
         basis_refresh_interval: int = 100,
@@ -98,6 +100,8 @@ class UsuiTrack(Optimizer):
             raise ValueError(f"grad_clip_norm must be positive when set, got {grad_clip_norm}")
         if grassmann_step_size <= 0:
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
+        if grassmann_step_schedule not in ("fixed", "mature_ema"):
+            raise ValueError(f"grassmann_step_schedule must be one of 'fixed', 'mature_ema', got {grassmann_step_schedule!r}")
         if grassmann_rotate_rank is not None and grassmann_rotate_rank < 1:
             raise ValueError(f"grassmann_rotate_rank must be None (all planes) or >= 1, got {grassmann_rotate_rank}")
         if grassmann_aim not in ("tangent", "eigh"):
@@ -127,6 +131,7 @@ class UsuiTrack(Optimizer):
             adafactor_eps=adafactor_eps,
             grad_clip_norm=grad_clip_norm,
             grassmann_step_size=grassmann_step_size,
+            grassmann_step_schedule=grassmann_step_schedule,
             grassmann_rotate_rank=grassmann_rotate_rank,
             grassmann_aim=grassmann_aim,
             basis_refresh_interval=basis_refresh_interval,
@@ -232,8 +237,10 @@ class UsuiTrack(Optimizer):
             "matrix_update_norm_sq": None,
             "fallback_update_norm_sq": None,
             "nonfinite_grad_tensors": None,
-            "projected_grad_max_norm": None,
-            "projected_grad_ratio_values": [],
+            "projected_grad_norm_sum": None,
+            "projected_grad_norm_tensors": 0,
+            "projected_grad_to_moment_ratio_sum": None,
+            "projected_grad_to_moment_ratio_tensors": 0,
             "matrix_params": 0,
             "fallback_params": 0,
             "projected_leverage_cv_sum": 0.0,
@@ -241,14 +248,10 @@ class UsuiTrack(Optimizer):
             "projected_leverage_max_ratio_sum": 0.0,
             "projected_leverage_tensors": 0,
             "rotation_angle_sum": 0.0,
-            "tangent_sigma_max_sum": 0.0,
             "basis_refresh_tensors": 0,
-            "eigh_target_self_angle_sum": 0.0,
-            "eigh_target_probe_tensors": 0,
-            "eigh_target_cutoff_ratio_sum": 0.0,
-            "eigh_target_cutoff_tensors": 0,
-            "basis_lag_mean_angle_sum": 0.0,
-            "basis_lag_top_angle_sum": 0.0,
+            "eigh_target_angle_mass_sum": 0.0,
+            "eigh_target_angle_mass_tensors": 0,
+            "basis_lag_angle_mass_sum": 0.0,
             "basis_lag_tensors": 0,
             "basis_capture_sum": None,
             "basis_capture_tensors": 0,
@@ -272,34 +275,28 @@ class UsuiTrack(Optimizer):
         diagnostics["matrix_update_norm"] = float(matrix_norm_sq.sqrt().detach().cpu())
         diagnostics["fallback_update_norm"] = float(fallback_norm_sq.sqrt().detach().cpu())
         diagnostics["update_norm"] = float((matrix_norm_sq + fallback_norm_sq).sqrt().detach().cpu())
-        projected_grad_max_norm = diagnostics["projected_grad_max_norm"]
-        diagnostics["projected_grad_max_norm"] = float(projected_grad_max_norm.detach().cpu()) if projected_grad_max_norm is not None else float("nan")
+        projected_grad_norm_sum = diagnostics.pop("projected_grad_norm_sum")
+        projected_grad_norm_count = diagnostics.pop("projected_grad_norm_tensors")
+        diagnostics["mean_projected_grad_norm"] = float((projected_grad_norm_sum / projected_grad_norm_count).detach().cpu()) if projected_grad_norm_count else float("nan")
         nonfinite = diagnostics["nonfinite_grad_tensors"]
         diagnostics["nonfinite_grad_tensors"] = float(nonfinite.detach().cpu()) if nonfinite is not None else 0.0
         count = diagnostics["projected_leverage_tensors"]
         diagnostics["mean_projected_leverage_cv"] = diagnostics["projected_leverage_cv_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_min_ratio"] = diagnostics["projected_leverage_min_ratio_sum"] / count if count else float("nan")
         diagnostics["mean_projected_leverage_max_ratio"] = diagnostics["projected_leverage_max_ratio_sum"] / count if count else float("nan")
-        ratio_values = diagnostics.pop("projected_grad_ratio_values")
-        if ratio_values:
-            ratio_tensor = torch.stack(ratio_values)
-            diagnostics["projected_grad_p90_to_moment_ratio"] = float(torch.quantile(ratio_tensor.float(), 0.9).detach().cpu())
-        else:
-            diagnostics["projected_grad_p90_to_moment_ratio"] = float("nan")
+        ratio_sum = diagnostics.pop("projected_grad_to_moment_ratio_sum")
+        ratio_count = diagnostics.pop("projected_grad_to_moment_ratio_tensors")
+        diagnostics["mean_projected_grad_to_moment_ratio"] = float((ratio_sum / ratio_count).detach().cpu()) if ratio_count else float("nan")
         capture_sum = diagnostics.pop("basis_capture_sum")
         capture_count = diagnostics.pop("basis_capture_tensors")
         diagnostics["mean_basis_capture"] = float((capture_sum / capture_count).detach().cpu()) if capture_count else float("nan")
         basis_count = diagnostics["basis_refresh_tensors"]
         diagnostics["mean_rotation_angle"] = diagnostics["rotation_angle_sum"] / basis_count if basis_count else float("nan")
-        diagnostics["mean_tangent_sigma_max"] = diagnostics["tangent_sigma_max_sum"] / basis_count if basis_count else float("nan")
         diagnostics["basis_refresh_tensors"] = float(basis_count)
-        probe_count = diagnostics.pop("eigh_target_probe_tensors")
-        diagnostics["mean_eigh_target_self_angle"] = diagnostics.pop("eigh_target_self_angle_sum") / probe_count if probe_count else float("nan")
-        cutoff_count = diagnostics.pop("eigh_target_cutoff_tensors")
-        diagnostics["mean_eigh_target_cutoff_ratio"] = diagnostics.pop("eigh_target_cutoff_ratio_sum") / cutoff_count if cutoff_count else float("nan")
+        target_count = diagnostics.pop("eigh_target_angle_mass_tensors")
+        diagnostics["mean_eigh_target_angle_mass"] = diagnostics.pop("eigh_target_angle_mass_sum") / target_count if target_count else float("nan")
         lag_count = diagnostics.pop("basis_lag_tensors")
-        diagnostics["mean_basis_lag_angle"] = diagnostics.pop("basis_lag_mean_angle_sum") / lag_count if lag_count else float("nan")
-        diagnostics["mean_basis_lag_top_angle"] = diagnostics.pop("basis_lag_top_angle_sum") / lag_count if lag_count else float("nan")
+        diagnostics["mean_basis_lag_angle_mass"] = diagnostics.pop("basis_lag_angle_mass_sum") / lag_count if lag_count else float("nan")
         aurora_count = diagnostics["aurora_health_tensors"]
         diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
@@ -383,28 +380,32 @@ class UsuiTrack(Optimizer):
             moment_mode = group["moment_mode"]
             if moment_mode == "adafactor_ema":
                 grad = self._adafactor_dampen_full_grad(grad, group, state)
-            if not projector.is_initialized or refresh_basis:
-                self._refresh_projector(projector, grad, group, state, diagnostics)
-            projected_grad = projector.project(grad)
-
-        projected_grad_norm = projected_grad.float().norm().detach()
-        if diagnostics is not None:
-            current_max = diagnostics["projected_grad_max_norm"]
-            diagnostics["projected_grad_max_norm"] = projected_grad_norm if current_max is None else torch.maximum(current_max, projected_grad_norm)
-            # Fit/capture: fraction of the (dampened) gradient the basis captures,
-            # ||Q^T g|| / ||g||. This is the basis-QUALITY readout; sigma is only
-            # contact/steepness and is non-monotone in quality (sigma=0 both for a
-            # perfect basis and one orthogonal to the signal).
-            if grad is not None:
-                capture = projected_grad_norm / grad.float().norm().clamp_min(1e-12)
+            # Capture is the held-frame readout: measure before the refresh that
+            # this boundary gradient may trigger. This makes every logged step
+            # comparable instead of mixing post-refresh self-fit with later
+            # foreign-gradient capture.
+            held_projected_grad = projector.project(grad) if projector.is_initialized else None
+            if diagnostics is not None and held_projected_grad is not None:
+                capture = held_projected_grad.float().norm() / grad.float().norm().clamp_min(1e-12)
                 current_sum = diagnostics["basis_capture_sum"]
                 diagnostics["basis_capture_sum"] = capture if current_sum is None else current_sum + capture
                 diagnostics["basis_capture_tensors"] += 1
+            if not projector.is_initialized or refresh_basis:
+                self._refresh_projector(projector, grad, group, state, diagnostics)
+            projected_grad = projector.project(grad) if refresh_basis or held_projected_grad is None else held_projected_grad
+
+        projected_grad_norm = projected_grad.float().norm().detach()
+        if diagnostics is not None:
+            current_sum = diagnostics["projected_grad_norm_sum"]
+            diagnostics["projected_grad_norm_sum"] = projected_grad_norm if current_sum is None else current_sum + projected_grad_norm
+            diagnostics["projected_grad_norm_tensors"] += 1
         projected_exp_avg = state.get("projected_exp_avg")
         moment_norm = projected_exp_avg.float().norm().detach() if projected_exp_avg is not None else None
         if moment_norm is not None and diagnostics is not None:
             ratio = projected_grad_norm / moment_norm.clamp_min(1e-12)
-            diagnostics["projected_grad_ratio_values"].append(ratio.detach())
+            current_sum = diagnostics["projected_grad_to_moment_ratio_sum"]
+            diagnostics["projected_grad_to_moment_ratio_sum"] = ratio.detach() if current_sum is None else current_sum + ratio.detach()
+            diagnostics["projected_grad_to_moment_ratio_tensors"] += 1
         clip_norm = group.get("projected_grad_clip_norm")
         clip_ratio = group.get("projected_grad_clip_ratio")
         allowed_norm = None
@@ -587,11 +588,25 @@ class UsuiTrack(Optimizer):
     # own past can: decaying lag-angle = settling, plateau = stable orbit radius.
     BASIS_LAG_REFRESHES = 5
 
+    @staticmethod
+    def _mature_ema_step_size(target_count: int) -> float:
+        """Weight for the next target after ``target_count`` accepted targets.
+
+        The initialized frame is target one, so the first refresh receives weight
+        one half. This is the incremental Grassmann Karcher mean until the floor
+        intentionally resumes tracking a drifting target stream.
+        """
+
+        return max(MATURE_EMA_MIN_STEP_SIZE, 1.0 / (target_count + 1))
+
     def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None) -> None:
         was_initialized = projector.is_initialized
         aim = group["grassmann_aim"]
         if not was_initialized:
             projector.fit(grad)
+            if aim == "eigh" and group["grassmann_step_schedule"] == "mature_ema":
+                # The fitted frame is the first target in the streaming mean.
+                state["basis_target_count"] = 1
         elif aim == "eigh":
             # Position control (the default path): eigh target frame from the
             # dampened boundary grad names WHERE the signal subspace is; the
@@ -600,31 +615,24 @@ class UsuiTrack(Optimizer):
             # -- the basis is a streaming Karcher mean of the target stream, its
             # own accumulator, zero persistent state.
             rotate_rank = self._resolve_rotate_rank(group, projector, grad)
-            target_frame, gram_eigenvalues = projector.eigh_target_frame(grad)
+            target_frame, _gram_eigenvalues = projector.eigh_target_frame(grad)
+            current_frame = projector.canonical_basis()
+            if diagnostics is not None and self.diagnostics_basis_enabled:
+                target_angles = SubspaceProjector.principal_angles_sine(current_frame, target_frame)
+                diagnostics["eigh_target_angle_mass_sum"] += float(target_angles.sum().detach().cpu())
+                diagnostics["eigh_target_angle_mass_tensors"] += 1
             tangent = projector.tangent_toward(target_frame, top_k=rotate_rank)
+            if group["grassmann_step_schedule"] == "mature_ema":
+                target_count = state.get("basis_target_count", 1)
+                step_size = self._mature_ema_step_size(target_count)
+                state["basis_target_count"] = target_count + 1
+            else:
+                step_size = group["grassmann_step_size"]
             projector.update_grassmann_from_tangent(
                 tangent,
-                step_size=group["grassmann_step_size"],
+                step_size=step_size,
                 rotate_rank=rotate_rank,
             )
-            if diagnostics is not None and self.diagnostics_basis_enabled:
-                # Q10 probe (demoted to background): target self-consistency and the
-                # Gram spectrum ratio at the rank cutoff. Both measure the target
-                # stream, not the basis -- they are rank-starvation thermometers,
-                # not convergence reads (that is the basis lag angle below).
-                prev_target = state.get("prev_eigh_target")
-                if prev_target is not None:
-                    self_angle = SubspaceProjector.top_principal_angle(prev_target, target_frame)
-                    diagnostics["eigh_target_self_angle_sum"] += float(self_angle.detach().cpu())
-                    diagnostics["eigh_target_probe_tensors"] += 1
-                state["prev_eigh_target"] = target_frame
-                rank = target_frame.shape[1]
-                if gram_eigenvalues.shape[0] > rank:
-                    kept_min = gram_eigenvalues[-rank]
-                    dropped_max = gram_eigenvalues[-rank - 1]
-                    ratio = (dropped_max / kept_min.clamp_min(1e-30)).clamp(0.0, 1.0)
-                    diagnostics["eigh_target_cutoff_ratio_sum"] += float(ratio.detach().cpu())
-                    diagnostics["eigh_target_cutoff_tensors"] += 1
         else:
             # Velocity control (SubTrack-faithful single-grad tangent step): kept as
             # the reference/ablation arm. The C1 window accumulator was deleted when
@@ -638,12 +646,10 @@ class UsuiTrack(Optimizer):
             )
 
         if was_initialized and diagnostics is not None and self.diagnostics_basis_enabled:
-            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle, projector.last_tangent_sigma_max)
+            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle)
             # Convergence metric: principal angles between the basis and its own
-            # snapshot from BASIS_LAG_REFRESHES boundaries ago. Mean angle is the
-            # settling read (-> 0 iff every plane stops moving); top angle is the
-            # orbit-radius read (churn planes keep it elevated). Snapshot buffer is
-            # diagnostic-only state, gated like the Q10 probe buffer.
+            # snapshot from BASIS_LAG_REFRESHES boundaries ago. Principal-angle mass
+            # is total motion per matrix, then averaged across the model.
             snapshot = state.get("basis_lag_snapshot")
             lag_count = state.get("basis_lag_refreshes", 0) + 1
             if snapshot is None:
@@ -652,14 +658,12 @@ class UsuiTrack(Optimizer):
             elif lag_count >= self.BASIS_LAG_REFRESHES:
                 current = projector.canonical_basis()
                 lag_angles = SubspaceProjector.principal_angles_sine(snapshot, current)
-                diagnostics["basis_lag_mean_angle_sum"] += float(lag_angles.mean().detach().cpu())
-                diagnostics["basis_lag_top_angle_sum"] += float(lag_angles.max().detach().cpu())
+                diagnostics["basis_lag_angle_mass_sum"] += float(lag_angles.sum().detach().cpu())
                 diagnostics["basis_lag_tensors"] += 1
                 state["basis_lag_snapshot"] = current.detach().clone()
                 state["basis_lag_refreshes"] = 0
             else:
                 state["basis_lag_refreshes"] = lag_count
-
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
         state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
@@ -699,9 +703,8 @@ class UsuiTrack(Optimizer):
         return (projector.basis.shape[1], p.shape[1])
 
     @staticmethod
-    def _accumulate_basis_diagnostics(diagnostics: dict, rotation_angle: float, tangent_sigma_max: float) -> None:
+    def _accumulate_basis_diagnostics(diagnostics: dict, rotation_angle: float) -> None:
         diagnostics["rotation_angle_sum"] += rotation_angle
-        diagnostics["tangent_sigma_max_sum"] += tangent_sigma_max
         diagnostics["basis_refresh_tensors"] += 1
 
     @staticmethod

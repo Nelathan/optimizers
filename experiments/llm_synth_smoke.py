@@ -61,11 +61,12 @@ def gradient_norm(params: list[torch.nn.Parameter]) -> torch.Tensor:
     return tensor_global_norm([param.grad for param in params if param.grad is not None])
 
 
-def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float:
+def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float | None:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
-        return float("nan")
-    return float(diagnostics.get("update_norm", float("nan")))
+        return None
+    value = diagnostics.get("update_norm")
+    return float(value) if value is not None else None
 
 
 def scalar(value: float | int | torch.Tensor) -> float:
@@ -74,30 +75,38 @@ def scalar(value: float | int | torch.Tensor) -> float:
     return float(value.detach().float().cpu())
 
 
-def last_finite_scalar(values: list[float | int | torch.Tensor]) -> float:
+def scalar_or_none(value: float | int | torch.Tensor | None) -> float | None:
+    return scalar(value) if value is not None else None
+
+
+def last_finite_scalar(values: list[float | int | torch.Tensor | None]) -> float:
     """Last non-NaN value, e.g. the last real basis refresh event rather than
     whatever step happened to be logged last (which is NaN on non-refresh steps).
     """
 
     for value in reversed(values):
+        if value is None:
+            continue
         number = scalar(value)
         if number == number:
             return number
     return float("nan")
 
 
-def optimizer_rotation_angle(optimizer: torch.optim.Optimizer) -> float:
+def optimizer_rotation_angle(optimizer: torch.optim.Optimizer) -> float | None:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
-        return float("nan")
-    return float(diagnostics.get("mean_rotation_angle", float("nan")))
+        return None
+    value = diagnostics.get("mean_rotation_angle")
+    return float(value) if value is not None else None
 
 
-def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float:
+def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float | None:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
-        return float("nan")
-    return float(diagnostics.get(key, float("nan")))
+        return None
+    value = diagnostics.get(key)
+    return float(value) if value is not None else None
 
 
 def parquet_table_to_texts(table, dataset_format: DatasetFormat = "auto") -> list[str]:
@@ -792,20 +801,18 @@ def train_step(
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
-    projected_grad_max_norm = optimizer_diagnostic(optimizer, "projected_grad_max_norm") if collect_norms else float("nan")
-    projected_grad_p90_to_moment_ratio = optimizer_diagnostic(optimizer, "projected_grad_p90_to_moment_ratio") if collect_norms else float("nan")
+    projected_grad_norm = optimizer_diagnostic(optimizer, "mean_projected_grad_norm") if collect_norms else float("nan")
+    projected_grad_to_moment_ratio = optimizer_diagnostic(optimizer, "mean_projected_grad_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
-    tangent_sigma_max = optimizer_diagnostic(optimizer, "mean_tangent_sigma_max") if collect_basis else float("nan")
-    eigh_target_self_angle = optimizer_diagnostic(optimizer, "mean_eigh_target_self_angle") if collect_basis else float("nan")
-    eigh_target_cutoff_ratio = optimizer_diagnostic(optimizer, "mean_eigh_target_cutoff_ratio") if collect_basis else float("nan")
-    basis_lag_mean_angle = optimizer_diagnostic(optimizer, "mean_basis_lag_angle") if collect_basis else float("nan")
-    basis_lag_top_angle = optimizer_diagnostic(optimizer, "mean_basis_lag_top_angle") if collect_basis else float("nan")
+    eigh_target_angle_mass = optimizer_diagnostic(optimizer, "mean_eigh_target_angle_mass") if collect_basis else float("nan")
+    basis_step_angle_mass = rotation_angle
+    basis_lag_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_lag_angle_mass") if collect_basis else float("nan")
     basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
-    aurora_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
-    aurora_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
+    moment_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
+    moment_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
-    update_to_param_ratio = update_norm / param_norm_scalar if param_norm_scalar > 0 else float("nan")
+    update_to_param_ratio = update_norm / param_norm_scalar if update_norm is not None and param_norm_scalar > 0 else None
     return {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
@@ -813,24 +820,24 @@ def train_step(
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
-        "projected_grad_max_norm": projected_grad_max_norm,
-        "projected_grad_p90_to_moment_ratio": projected_grad_p90_to_moment_ratio,
-        "rotation_angle": rotation_angle,
-        "tangent_sigma_max": tangent_sigma_max,
-        "eigh_target_self_angle": eigh_target_self_angle,
-        "eigh_target_cutoff_ratio": eigh_target_cutoff_ratio,
-        "basis_lag_mean_angle": basis_lag_mean_angle,
-        "basis_lag_top_angle": basis_lag_top_angle,
+        "projected_grad_norm": projected_grad_norm,
+        "projected_grad_to_moment_ratio": projected_grad_to_moment_ratio,
+        "eigh_target_angle_mass": eigh_target_angle_mass,
+        "basis_step_angle_mass": basis_step_angle_mass,
+        "basis_lag_angle_mass": basis_lag_angle_mass,
         "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
-        "aurora_erank": aurora_erank,
-        "aurora_erank_pct": aurora_erank_pct,
+        "moment_erank": moment_erank,
+        "moment_erank_pct": moment_erank_pct,
     }
 
 
-def wandb_log(wandb_run: Any | None, data: Mapping[str, float | int | str], step: int) -> None:
+def wandb_log(wandb_run: Any | None, data: Mapping[str, float | int | str | None], step: int) -> None:
     if wandb_run is not None:
-        wandb_run.log(data, step=step)
+        # ``None`` means this run does not define the metric (for example source
+        # validation without a retention corpus). Keep it absent: NaN is reserved
+        # for a numeric result that actually became non-finite.
+        wandb_run.log({key: value for key, value in data.items() if value is not None}, step=step)
 
 
 def optimizer_base_lrs(optimizer: torch.optim.Optimizer) -> list[float]:
@@ -909,6 +916,7 @@ def run_optimizer(
             adafactor_beta2=args.adafactor_beta2,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
             grassmann_step_size=args.grassmann_step_size,
+            grassmann_step_schedule=args.grassmann_step_schedule,
             grassmann_rotate_rank=args.grassmann_rotate_rank,
             grassmann_aim=args.grassmann_aim,
             basis_refresh_interval=args.basis_refresh_interval,
@@ -938,8 +946,8 @@ def run_optimizer(
     wandb_log(
         wandb_run,
         {
-            f"{optimizer_name}/target_val_loss": initial_val,
-            f"{optimizer_name}/source_val_loss": initial_retention_val,
+            "eval/target_loss": initial_val if not args.skip_validation else None,
+            "eval/source_loss": initial_retention_val if retention_batches is not None and not args.skip_validation else None,
         },
         step=0,
     )
@@ -960,7 +968,7 @@ def run_optimizer(
     for step in range(args.max_steps):
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
         global_step = step + 1
-        lr_scale = apply_lr_warmup(optimizer, base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
+        apply_lr_warmup(optimizer, base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
         should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
         should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
         collect_norms = should_log_train
@@ -982,47 +990,28 @@ def run_optimizer(
             train_loss = scalar(torch.stack(loss_window).mean())
             loss_window.clear()
             train_metrics = {
-                f"{optimizer_name}/train_loss": train_loss,
-                f"{optimizer_name}/grad_norm": scalar(step_result["grad_norm"]),
-                f"{optimizer_name}/grad_norm_max_tensor": scalar(step_result["grad_norm_max_tensor"]),
-                f"{optimizer_name}/update_norm": scalar(step_result["update_norm"]),
-                f"{optimizer_name}/update_to_param_ratio": scalar(step_result["update_to_param_ratio"]),
-                f"{optimizer_name}/projected_grad_max_norm": scalar(step_result["projected_grad_max_norm"]),
-                f"{optimizer_name}/projected_grad_p90_to_moment_ratio": scalar(step_result["projected_grad_p90_to_moment_ratio"]),
-                f"{optimizer_name}/basis_capture": scalar(step_result["basis_capture"]),
-                f"{optimizer_name}/aurora_alignment": scalar(step_result["aurora_alignment"]),
-                f"{optimizer_name}/aurora_erank": scalar(step_result["aurora_erank"]),
-                f"{optimizer_name}/aurora_erank_pct": scalar(step_result["aurora_erank_pct"]),
-                f"{optimizer_name}/lr_scale": lr_scale,
+                "train/loss": train_loss,
+                "train/grad_norm": scalar(step_result["grad_norm"]),
+                "train/grad_norm_max_tensor": scalar(step_result["grad_norm_max_tensor"]),
+                "train/update_norm": scalar_or_none(step_result["update_norm"]),
+                "train/update_to_param_ratio": scalar_or_none(step_result["update_to_param_ratio"]),
+                "opt/projected_grad_norm": scalar_or_none(step_result["projected_grad_norm"]),
+                "opt/projected_grad_to_moment_ratio": scalar_or_none(step_result["projected_grad_to_moment_ratio"]),
+                "opt/basis_capture": scalar_or_none(step_result["basis_capture"]),
+                "opt/aurora_alignment": scalar_or_none(step_result["aurora_alignment"]),
+                "opt/moment_erank": scalar_or_none(step_result["moment_erank"]),
+                "opt/moment_erank_pct": scalar_or_none(step_result["moment_erank_pct"]),
+                "train/lr": optimizer.param_groups[0]["lr"],
             }
-            # rotation_angle/tangent_sigma_max are only meaningful on the
+            # Frame-motion metrics are only meaningful on the
             # rare step a basis refresh actually fires; omit them entirely on
             # other steps rather than logging NaN, so wandb's per-run summary
             # reflects the last real refresh event instead of whatever step
             # happened to be logged last.
-            rotation_angle = scalar(step_result["rotation_angle"])
-            if rotation_angle == rotation_angle:
-                train_metrics[f"{optimizer_name}/rotation_angle"] = rotation_angle
-            tangent_sigma_max = scalar(step_result["tangent_sigma_max"])
-            if tangent_sigma_max == tangent_sigma_max:
-                train_metrics[f"{optimizer_name}/tangent_sigma_max"] = tangent_sigma_max
-            # Q10 probe metrics exist only under --grassmann-aim eigh, and only on
-            # refresh steps; same omit-NaN policy as rotation_angle.
-            eigh_target_self_angle = scalar(step_result["eigh_target_self_angle"])
-            if eigh_target_self_angle == eigh_target_self_angle:
-                train_metrics[f"{optimizer_name}/eigh_target_self_angle"] = eigh_target_self_angle
-            eigh_target_cutoff_ratio = scalar(step_result["eigh_target_cutoff_ratio"])
-            if eigh_target_cutoff_ratio == eigh_target_cutoff_ratio:
-                train_metrics[f"{optimizer_name}/eigh_target_cutoff_ratio"] = eigh_target_cutoff_ratio
-            # Convergence read: basis vs its own snapshot 5 refreshes ago. Mean
-            # angle decaying = settling; top angle plateau = orbit radius. Lands
-            # only every 5th refresh; omit-NaN policy.
-            basis_lag_mean_angle = scalar(step_result["basis_lag_mean_angle"])
-            if basis_lag_mean_angle == basis_lag_mean_angle:
-                train_metrics[f"{optimizer_name}/basis_lag_mean_angle"] = basis_lag_mean_angle
-            basis_lag_top_angle = scalar(step_result["basis_lag_top_angle"])
-            if basis_lag_top_angle == basis_lag_top_angle:
-                train_metrics[f"{optimizer_name}/basis_lag_top_angle"] = basis_lag_top_angle
+            for metric_name in ("eigh_target_angle_mass", "basis_step_angle_mass", "basis_lag_angle_mass"):
+                metric = scalar_or_none(step_result[metric_name])
+                if metric is not None and metric == metric:
+                    train_metrics[f"opt/{metric_name}"] = metric
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1033,7 +1022,7 @@ def run_optimizer(
                 torch.cuda.synchronize(device)
             eval_start = time.perf_counter()
             eval_val = evaluate_loss(model, val_batches)
-            eval_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else float("nan")
+            eval_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None else None
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             eval_elapsed += time.perf_counter() - eval_start
@@ -1041,8 +1030,8 @@ def run_optimizer(
             wandb_log(
                 wandb_run,
                 {
-                    f"{optimizer_name}/target_val_loss": eval_val,
-                    f"{optimizer_name}/source_val_loss": eval_retention_val,
+                    "eval/target_loss": eval_val,
+                    "eval/source_loss": eval_retention_val,
                 },
                 step=global_step,
             )
@@ -1067,8 +1056,8 @@ def run_optimizer(
         wandb_log(
             wandb_run,
             {
-                f"{optimizer_name}/target_val_loss": final_val,
-                f"{optimizer_name}/source_val_loss": final_retention_val,
+                "eval/target_loss": final_val,
+                "eval/source_loss": final_retention_val if retention_batches is not None else None,
             },
             step=global_step,
         )
@@ -1079,18 +1068,15 @@ def run_optimizer(
     measured_param_norms = [step["param_norm"] for step in measured_steps]
     measured_update_norms = [step["update_norm"] for step in measured_steps]
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
-    measured_projected_grad_max_norms = [step["projected_grad_max_norm"] for step in measured_steps]
-    measured_projected_grad_p90_to_moment_ratios = [step["projected_grad_p90_to_moment_ratio"] for step in measured_steps]
-    measured_rotation_angle = [step["rotation_angle"] for step in measured_steps]
-    measured_tangent_sigma_max = [step["tangent_sigma_max"] for step in measured_steps]
-    measured_eigh_target_self_angle = [step["eigh_target_self_angle"] for step in measured_steps]
-    measured_eigh_target_cutoff_ratio = [step["eigh_target_cutoff_ratio"] for step in measured_steps]
-    measured_basis_lag_mean_angle = [step["basis_lag_mean_angle"] for step in measured_steps]
-    measured_basis_lag_top_angle = [step["basis_lag_top_angle"] for step in measured_steps]
+    measured_projected_grad_norms = [step["projected_grad_norm"] for step in measured_steps]
+    measured_projected_grad_to_moment_ratios = [step["projected_grad_to_moment_ratio"] for step in measured_steps]
+    measured_eigh_target_angle_mass = [step["eigh_target_angle_mass"] for step in measured_steps]
+    measured_basis_step_angle_mass = [step["basis_step_angle_mass"] for step in measured_steps]
+    measured_basis_lag_angle_mass = [step["basis_lag_angle_mass"] for step in measured_steps]
     measured_basis_capture = [step["basis_capture"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
-    measured_aurora_erank = [step["aurora_erank"] for step in measured_steps]
-    measured_aurora_erank_pct = [step["aurora_erank_pct"] for step in measured_steps]
+    measured_moment_erank = [step["moment_erank"] for step in measured_steps]
+    measured_moment_erank_pct = [step["moment_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
@@ -1106,6 +1092,7 @@ def run_optimizer(
         "basis_init": args.basis_init if optimizer_name == "usuitrack" else "n/a",
         "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
         "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
+        "grassmann_step_schedule": args.grassmann_step_schedule if optimizer_name == "usuitrack" else "n/a",
         "lr_warmup_steps": args.lr_warmup_steps,
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "usuitrack" else 0,
@@ -1137,21 +1124,15 @@ def run_optimizer(
         "last_logged_param_norm": last_finite_scalar(measured_param_norms),
         "last_logged_update_norm": last_finite_scalar(measured_update_norms),
         "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
-        "last_logged_projected_grad_max_norm": last_finite_scalar(measured_projected_grad_max_norms),
-        "last_logged_projected_grad_p90_to_moment_ratio": last_finite_scalar(measured_projected_grad_p90_to_moment_ratios),
-        # rotation_angle/tangent_sigma_max are only defined on refresh
-        # steps; last_finite_scalar reports the last real refresh event rather
-        # than mixing in NaN gaps.
-        "last_logged_rotation_angle": last_finite_scalar(measured_rotation_angle),
-        "last_logged_tangent_sigma_max": last_finite_scalar(measured_tangent_sigma_max),
-        "last_logged_eigh_target_self_angle": last_finite_scalar(measured_eigh_target_self_angle),
-        "last_logged_eigh_target_cutoff_ratio": last_finite_scalar(measured_eigh_target_cutoff_ratio),
-        "last_logged_basis_lag_mean_angle": last_finite_scalar(measured_basis_lag_mean_angle),
-        "last_logged_basis_lag_top_angle": last_finite_scalar(measured_basis_lag_top_angle),
+        "last_logged_projected_grad_norm": last_finite_scalar(measured_projected_grad_norms),
+        "last_logged_projected_grad_to_moment_ratio": last_finite_scalar(measured_projected_grad_to_moment_ratios),
+        "last_logged_eigh_target_angle_mass": last_finite_scalar(measured_eigh_target_angle_mass),
+        "last_logged_basis_step_angle_mass": last_finite_scalar(measured_basis_step_angle_mass),
+        "last_logged_basis_lag_angle_mass": last_finite_scalar(measured_basis_lag_angle_mass),
         "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
-        "last_logged_aurora_erank": last_finite_scalar(measured_aurora_erank),
-        "last_logged_aurora_erank_pct": last_finite_scalar(measured_aurora_erank_pct),
+        "last_logged_moment_erank": last_finite_scalar(measured_moment_erank),
+        "last_logged_moment_erank_pct": last_finite_scalar(measured_moment_erank_pct),
         "measured_elapsed_seconds": measured_elapsed,
         "measured_train_elapsed_seconds": training_elapsed,
         "measured_eval_elapsed_seconds": eval_elapsed,
@@ -1210,8 +1191,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
     parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
     parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="under the default eigh aim this is the EMA constant of position control: fraction of each principal angle closed per refresh toward the boundary target (1.0 = snap). 0.25 is the measured knee (Q14: 0.5 hotter but worse loss, 0.125 too slow). Under the tangent ablation aim, rotation = step_size * sigma in SubTrack units instead.")
+    parser.add_argument("--grassmann-step-schedule", choices=("fixed", "mature_ema"), default="fixed", help="eigh position-controller schedule: fixed uses --grassmann-step-size every refresh; mature_ema treats initialization as target one, then uses 1/2, 1/3, ... down to the fixed 0.1 tracking floor. The latter is the Q17 Karcher-mean ablation.")
     parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="how many principal-angle planes the geodesic rotates per refresh. Default None = ALL planes (full-spectrum position control, the Q13/Q14 winner). Set 1 for SubTrack-faithful single-plane drift (ablation).")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh"), default="eigh", help="what steers the basis at each refresh. 'eigh' (default) = position control: eigh target frame from the dampened boundary grad, contract --grassmann-step-size of every principal angle toward it; zero persistent state, noise decays instead of integrating. 'tangent' = SubTrack-faithful single-grad velocity step (reference/ablation arm; the C1 window accumulator was deleted after position control beat it). eigh aim also logs eigh_target_self_angle / eigh_target_cutoff_ratio (rank-starvation thermometers) and basis_lag_mean/top_angle (the convergence read: basis vs its own snapshot 5 refreshes ago).")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh"), default="eigh", help="what steers the basis at each refresh. 'eigh' (default) = position control: eigh target frame from the dampened boundary grad, contract --grassmann-step-size of every principal angle toward it; zero persistent state, noise decays instead of integrating. 'tangent' = SubTrack-faithful single-grad velocity step (reference/ablation arm; the C1 window accumulator was deleted after position control beat it). eigh aim logs target demand, applied step, and five-refresh lag as principal-angle mass.")
     parser.add_argument("--basis-refresh-interval", type=int, default=10)
     parser.add_argument(
         "--basis-refresh-schedule",
@@ -1245,7 +1227,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="usuitrack")
-    parser.add_argument("--wandb-log-every", type=int, default=5, help="log train loss and core grad/update norms every N measured steps; keep this at HALF the basis_refresh_interval or less -- logging at the refresh cadence samples basis_capture at a fixed phase of the rotation cycle and hides the post-rotation sawtooth (refresh-only metrics still land: refresh steps are a subset of log steps when this divides the interval)")
+    parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and core grad/update norms every N measured steps; basis_capture is measured before a refresh, so logging at the refresh cadence consistently samples the held basis")
     return parser
 
 
@@ -1365,6 +1347,7 @@ def main() -> None:
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
+        f"grassmann_step_schedule={args.grassmann_step_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "

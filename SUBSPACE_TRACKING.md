@@ -20,6 +20,16 @@ This is position control. Consecutive noisy targets scatter around the signal
 subspace, so target error decays rather than integrating as angular velocity.
 Tangent aim remains only as a SubTrack-faithful single-gradient ablation.
 
+The mature-EMA/Karcher schedule (`1/2, 1/3, …`, floor `0.1`) improved basis and
+moment health but did not improve target loss against the fixed `eta=0.25`
+controller. A replay-stable 500-step comparison was effectively neutral/slightly
+worse on loss; fixed `0.25` remains the default. At 200 steps, projecting the
+refresh boundary gradient with either the held frame or the just-updated frame
+was indistinguishable (`2.011840` vs `2.011878` target loss), while injecting the
+full instantaneous target was worse (`2.012180`). The fractional moving frame is
+the useful mixture; boundary-gradient frame selection is not a product axis and
+was deleted.
+
 The geodesic implementation supplies a horizontal rigid frame lift:
 
 ```text
@@ -110,12 +120,16 @@ Measure refresh and non-refresh walltime first. If fixed cadence is material,
 compare fixed 10, fixed 100, and a monotone `10 -> 20 -> 50 -> 100` schedule before
 building feedback control. A controller without an open-loop trace is ceremony.
 
-### R5. Is target decomposition expensive enough to replace?
+### R5. Can an interval sketch improve the target aim?
 
-Exact library `eigh` is the reference. Only after profiling should it be compared
-with warm-started block iteration, a randomized range finder, or less frequent
-exact targets. Incremental decomposition is justified only if measured Gram
-changes have exploitable structure.
+The one boundary gradient gives a proper instantaneous `eigh` target but is a
+noisy target estimate. Compare it with a cheap interval sketch that accumulates
+enough gradient information to form a better target at the boundary, without
+quietly becoming a full ambient-gradient buffer. Hold the controller and all
+other benchmark terms fixed. Measure target loss first; target-angle demand,
+applied step mass, lag mass, capture, and moment health explain any difference.
+Exact library `eigh` remains the target extraction reference; replacing its
+decomposition only becomes a question after the estimator itself earns value.
 
 ### R6. Do cutoff planes poison stable planes?
 
