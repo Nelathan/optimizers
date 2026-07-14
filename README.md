@@ -9,6 +9,7 @@ SumoTrack's product target is distribution adaptation under memory pressure: mov
 - `SPEC.md` — canonical mathematical specification of the current update.
 - `PLAN.md` — live product direction, evidence, research map, and release gates.
 - `SUBSPACE_TRACKING.md` — live geometry ledger and open questions.
+- `QUANTIZATION.md` — scoped rank-state quantization sidequest and evidence gates.
 - `LEGEND.md` — the design's anthropomorphic story; evocative, not normative.
 - `AGENTS.md` — operating contract for agents working in this repo.
 - `archive/` — complete superseded run and design histories. Use for provenance,

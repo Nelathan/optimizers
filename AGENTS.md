@@ -6,9 +6,23 @@ This file is the operating contract for agents working in this repo.
 - Current geometry questions live in `SUBSPACE_TRACKING.md`.
 - Superseded experiments and design arcs live under `archive/`. They are provenance, not current guidance.
 
+## Naming lineage
+
+- **FlashTrack** was the originating idea and early name.
+- **SumoTrack** is the current implementation identity: the `sumotrack` package,
+  `SumoTrack` class, existing commands, and pre-migration references use it.
+- **UsuiTrack** is the destination public identity for the current design. New
+  conceptual documentation should use UsuiTrack except when naming the literal
+  implementation/API that still says SumoTrack.
+- These names describe one evolving optimizer line, not three competing
+  algorithms. Do not infer a semantic distinction from the rename; `SPEC.md`
+  remains authoritative for the actual design.
+
 ## Repo purpose
 
-This repo is the SumoTrack lab: a place to design and test a memory-efficient optimizer for high-capacity continued pretraining on consumer GPUs.
+This repo is the UsuiTrack lab, currently implemented under the SumoTrack code
+name: a place to design and test a memory-efficient optimizer for high-capacity
+continued pretraining on consumer GPUs.
 
 The product target is usable distribution adaptation under memory pressure: move a pretrained model across a real data shift without full AdamW state, slow gradient accumulation, or adapter-only capacity limits. The near-term hardware target is a single RTX 5090-class machine training Gemma 4 12B-class models with high tokens per step.
 
@@ -63,7 +77,8 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 
 ## Current optimizer invariants
 
-- Public optimizer name: **SumoTrack**.
+- Destination public optimizer name: **UsuiTrack**; the code/API remains
+  `SumoTrack` until the explicit rename migration.
 - Matrix params do not store full-size first moments.
 - Matrix params do not store full-size second moments in the main path.
 - Non-2D params use boring fallback semantics or are frozen by task policy.

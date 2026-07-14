@@ -5,9 +5,10 @@ on consumer GPUs. It should move a pretrained model across a real distribution
 shift without full AdamW matrix state, slow gradient accumulation, or
 adapter-only capacity limits.
 
-This is the live direction map. Read `SPEC.md` for the current update and
-`SUBSPACE_TRACKING.md` for the open geometry ledger. Superseded runs and design
-arcs are preserved under `archive/`; they are provenance, not guidance.
+This is the live direction map. Read `SPEC.md` for the current update,
+`SUBSPACE_TRACKING.md` for the open geometry ledger, and `QUANTIZATION.md` for the
+scoped rank-state quantization sidequest. Superseded runs and design arcs are
+preserved under `archive/`; they are provenance, not guidance.
 
 ## Product contract
 
@@ -127,6 +128,7 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Is exact target `eigh` a bottleneck? | stage profile before algorithm work | retain library `eigh` or compare warm-started iteration |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
+| Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
 
 Tracking work stops unless it deletes state or machinery, reduces measured refresh
 cost, repairs demonstrated faithfulness, or improves capture and evaluation under
