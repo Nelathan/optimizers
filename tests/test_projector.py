@@ -187,6 +187,44 @@ class SubspaceProjectorTest(unittest.TestCase):
             # Full-spectrum turns the basis at least as far as drift (total radians).
             self.assertGreaterEqual(projector.last_rotation_angle, rank1.last_rotation_angle, msg=f"shape={shape}")
 
+    def test_direct_oja_moves_toward_dominant_subspace_on_both_sides(self):
+        torch.manual_seed(31)
+        for shape, side in (((18, 12), "right"), ((12, 18), "left")):
+            dimension = min(shape)
+            target, _ = torch.linalg.qr(torch.randn(dimension, 3), mode="reduced")
+            coefficients = torch.randn(max(shape), 3) * torch.tensor([4.0, 2.0, 1.0])
+            gradient = coefficients @ target.mT if side == "right" else target @ coefficients.mT
+            projector = SubspaceProjector(rank=3, side=side, init_method="random")
+            projector.fit(gradient)
+            before = float(SubspaceProjector.principal_angles_sine(projector.canonical_basis(), target).sum())
+
+            for _ in range(100):
+                projected = projector.project(gradient)
+                projector.update_oja(gradient, step_size=0.04, projected=projected)
+
+            after = float(SubspaceProjector.principal_angles_sine(projector.canonical_basis(), target).sum())
+            self.assertLess(after, before * 0.75, msg=f"side={side}")
+            self.assertLess(float(projector.orthonormality_error()), 1e-5, msg=f"side={side}")
+
+    def test_repeated_direct_oja_keeps_bf16_basis_stable(self):
+        torch.manual_seed(37)
+        gradient = torch.randn(24, 16, dtype=torch.bfloat16)
+        bf16 = SubspaceProjector(rank=6, side="right")
+        fp32 = SubspaceProjector(rank=6, side="right")
+        bf16.fit(gradient)
+        fp32.fit(gradient.float())
+
+        for _ in range(200):
+            gradient = torch.randn_like(gradient)
+            bf16.update_oja(gradient, step_size=0.04, projected=bf16.project(gradient))
+            work = gradient.float()
+            fp32.update_oja(work, step_size=0.04, projected=fp32.project(work))
+
+        self.assertEqual(bf16.basis.dtype, torch.bfloat16)
+        self.assertLess(float(bf16.orthonormality_error()), 2e-2)
+        angle_mass = SubspaceProjector.principal_angles_sine(fp32.canonical_basis(), bf16.canonical_basis()).sum()
+        self.assertLess(float(angle_mass), 0.2)
+
     @staticmethod
     def _canon_basis(projector: SubspaceProjector) -> torch.Tensor:
         from usuitrack.projector import ProjectionSide

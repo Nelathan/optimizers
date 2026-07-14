@@ -207,6 +207,43 @@ class SubspaceProjector:
         return work.mT if self._basis_side() is ProjectionSide.RIGHT else work
 
     @torch.no_grad()
+    def oja_tangent(
+        self,
+        matrix: Tensor,
+        frame: Tensor | None = None,
+        projected: Tensor | None = None,
+    ) -> Tensor:
+        """Rayleigh-normalized covariance tangent in canonical coordinates.
+
+        Omitting ``frame`` uses the live basis, allowing direct Oja to reuse the
+        projection-side covariance action without materializing a side Gram matrix.
+        """
+
+        if self.basis is None:
+            raise RuntimeError("cannot compute an Oja tangent before fitting a basis")
+        self._check_basis_matches(matrix)
+        side = self._basis_side()
+        work = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+        q = self.canonical_basis() if frame is None else frame.float()
+        low = projected.float() if projected is not None else (work @ q if side is ProjectionSide.RIGHT else q.mT @ work)
+        action = work.mT @ low if side is ProjectionSide.RIGHT else work @ low.mT
+        rayleigh = q.mT @ action
+        rayleigh = 0.5 * (rayleigh + rayleigh.mT)
+        tangent = action - q @ rayleigh
+        return tangent / rayleigh.diagonal().mean().clamp_min(1e-12)
+
+    @torch.no_grad()
+    def update_oja(self, matrix: Tensor, step_size: float, projected: Tensor | None = None) -> Tensor:
+        """Move the live frame by one horizontal geodesic Oja step."""
+
+        return self.update_grassmann_from_tangent(
+            -self.oja_tangent(matrix, projected=projected),
+            step_size=step_size,
+            rotate_rank=self.effective_rank(matrix),
+            stabilize=True,
+        )
+
+    @torch.no_grad()
     def fit_random(self, matrix: Tensor) -> Tensor:
         """Initialize the basis with QR-orthonormalized random vectors."""
 
@@ -324,7 +361,13 @@ class SubspaceProjector:
         return partial - canon_basis @ (canon_basis.mT @ partial)
 
     @torch.no_grad()
-    def update_grassmann_from_tangent(self, tangent: Tensor, step_size: float, rotate_rank: int = 1) -> Tensor:
+    def update_grassmann_from_tangent(
+        self,
+        tangent: Tensor,
+        step_size: float,
+        rotate_rank: int = 1,
+        stabilize: bool = False,
+    ) -> Tensor:
         """Retract along the exact Grassmann geodesic from a precomputed canon tangent.
 
         Port of SubTrack's ``track_the_subspace`` retraction half: take the
@@ -396,6 +439,17 @@ class SubspaceProjector:
         rotated = torch.cat([basis_v, singular_u], dim=1) @ torch.cat([cos_block, sin_block], dim=0)
         eye_rank = torch.eye(singular_v.shape[0], device=canon_basis.device, dtype=canon_basis.dtype)
         canon_new = rotated @ singular_v.mT + canon_basis @ (eye_rank - singular_v @ singular_v.mT)
+
+        if stabilize:
+            # Boundary EIGH moves are sparse enough that storage-rounding error is
+            # negligible. Direct Oja retracts every gradient, so the same tiny
+            # error compounds. Project back to Stiefel and Procrustes-register the
+            # corrected frame to the raw geodesic gauge before storing it. The
+            # correction changes neither the intended subspace nor projected
+            # coordinates beyond finite-precision error.
+            orthonormal, _ = torch.linalg.qr(canon_new, mode="reduced")
+            gauge_u, _gauge_s, gauge_vh = torch.linalg.svd(orthonormal.mT @ canon_new)
+            canon_new = orthonormal @ (gauge_u @ gauge_vh)
 
         # Back to storage layout: RIGHT is stored row-orthonormal, LEFT column-orthonormal.
         new_basis = canon_new.mT if side is ProjectionSide.RIGHT else canon_new

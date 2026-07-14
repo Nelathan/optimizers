@@ -120,278 +120,119 @@ Measure refresh and non-refresh walltime first. If fixed cadence is material,
 compare fixed 10, fixed 100, and a monotone `10 -> 20 -> 50 -> 100` schedule before
 building feedback control. A controller without an open-loop trace is ceremony.
 
-### R5. Can an interval sketch improve the target aim?
+### R5. Can online tracking improve the target aim?
 
-The one boundary gradient gives a proper instantaneous `eigh` target: under a
-stationary signal it is a noisy observation of the optimal basis, so fixed
-fractional position control converges toward a destination. The old C1 tangent
-accumulator did not have that property. Its observations were local velocity
-commands rather than one destination plus noise, so averaging reduced its noise
-floor without making stochastic descent converge to the optimal basis.
+Yes at rank 32. Direct one-state geodesic Oja (`Q` itself, fixed step `.04`) is
+the surviving challenger to the released fixed `.25` boundary-EIGH controller.
+The evaluated separate Oja target was deleted after replay-scale evidence: it
+added a second frame and a second low-pass controller without beating direct
+tracking.
 
-The next question is therefore specifically **target estimation**, not tangent
-smoothing or a new controller. For conditioned gradients `G_t` in one refresh
-interval, define the equal-step covariance target
+A rank-32, 200-step transformer-gradient diagnostic established the reason for
+the comparison. Mean next-interval predictive capture over mature steps 110-200 was
+`.4588` for the raw boundary EIGH target, `.5077` for live `.25`-EIGH `Q`, `.5299`
+for separate Oja `.0625`, and `.5274` for direct Oja `.04`. Oja therefore found a
+more predictive, much lower-churn blind-spot frame; this was estimator evidence,
+not evidence that applying Oja improves training loss.
 
-```text
-K_bar = mean_t(G_t^T G_t / ||G_t||_F^2)  # right
-K_bar = mean_t(G_t G_t^T / ||G_t||_F^2)  # left
-T_*   = top-r eigh frame of K_bar
-```
+Warm block was useful early evidence—it won predictive capture through step 100—
+but it adds another `[d,r]` state, depends on held `Q`, and has an exact orthogonal
+replacement blind spot. Keep the idea as a fallback clue if Oja initialization
+fails, not as code or a fourth training arm. The random-factor sketch and
+synthetic estimator harness did not earn continued maintenance and were removed.
 
-Per-step normalization preserves the scale invariance of the current single-grad
-target instead of allowing one high-norm step to set the interval target. This is
-an explicit estimator choice to test, not a claim that raw covariance weighting
-cannot work. The main path always forms the full gradient, applies Adafactor, then
-uses that conditioned gradient for tracking and projection; this investigation
-does not require projected-activation or custom-backward machinery.
+#### Precision and repeated-update health
 
-#### Estimator forms to keep open
+A 500-update left/right covariance probe compared persistent bf16 and fp32 Oja
+frames at rank 32. The discarded separate Euler/QR target differed by about `.13`
+radians total and had indistinguishable capture (`~.93077` versus `~.93080`).
+Direct bf16 Oja differed from fp32 by about `.16-.17` radians with capture
+differing by at most `.00011` after its numerical invariant was repaired.
 
-| form | interval state | target semantics | primary risk |
-|---|---:|---|---|
-| exact covariance oracle | `O(d^2)` | exact finite-window `T_*` | forbidden product state; synthetic reference only |
-| warm block range | `O(d*r)` | `Y=sum_t K_t Q`, `T=orth(Y)` | target depends on held `Q`; exact orthogonal replacement is invisible |
-| random gradient-factor sketch | `O(d*s)` | form thin `B` with `E[B^T B]=K_bar`, then ordinary `eigh` | sketch variance and extra thin projection work |
-| per-step target mean | `O(d*r)` plus one `eigh` per step | average already-extracted target frames | expensive and averages after cutoff noise acts |
-| Oja/online subspace iteration | `O(d*r)` | stochastic covariance iteration | introduces another controller and step size |
+That repair matters: the existing boundary geodesic's tiny orthogonality error
+compounded under per-gradient use, reaching catastrophic error in both fp32 and
+bf16. Direct Oja now projects each raw geodesic result back to Stiefel and
+Procrustes-registers the corrected frame to the raw geodesic gauge before storage.
+Over 500 updates fp32 orthogonality error stayed around `4e-6` and bf16 around
+`.007`, rather than diverging. The Oja ascent sign is separately pinned: the
+generic retraction steps along the negative of its supplied cost tangent, so the
+covariance ascent tangent must be negated at that boundary.
 
-The random-factor form sketches the opposite gradient axis independently each
-step and concatenates the thin factors over the interval:
+Direct Oja reuses held `GQ` both for its covariance action and as the projected
+gradient coordinates carried through the rigid frame move. It therefore needs
+only the covariance backprojection plus the stabilized small-frame retraction,
+not a second full projection or second basis state.
 
-```text
-B_t = R_t (G_t / ||G_t||_F)   # right, B_t:[k,d]
-B_t = (G_t / ||G_t||_F) R_t   # left,  B_t:[d,k]
-B   = concatenate_t(B_t)
-T   = eigh_target(B)
-```
+#### Training gate
 
-With correctly scaled independent `R_t`, the sketched side covariance is an
-unbiased estimate of `K_bar`. Candidate total widths are `s=r`, `2r`, and `4r`;
-`2r` is the initial product-shaped budget because `s=r` has no oversampling.
-A dense random orthoprojector is the clean simulator reference: its width ladder
-has an exact endpoint when the projected width reaches the contacted gradient
-axis. Rademacher, CountSketch, structured projections, lower precision, and
-kernel/state optimization come only after the direction earns value.
+Fresh matched rank-32 health checks first established finite behavior. Final
+target loss at step 200 was `2.010188` for EIGH, `2.009062` for the separate Oja
+target, and `2.007628` for direct Oja. Direct Oja led at every 50-step evaluation
+and used the same matrix state as EIGH. The separate target added `6,029,312`
+bf16 bytes.
 
-Warm block range remains in the comparison despite not directly estimating a
-fixed target. It uses the held projection cheaply:
+The decisive replay used the same LFM2.5-350M, rank-32, broad-no-embedding,
+right-padded SYNTH contract for 500 steps with `torch.compile`, evaluation every
+50 steps, and W&B project `pink-marker/usuitrack`:
 
-```text
-Z_t = G_t Q                         # right
-K_t Q = G_t^T Z_t
+| step | EIGH `.25` | separate Oja target | direct Oja `.04` |
+|---:|---:|---:|---:|
+| 50 | 2.206577 | 2.207120 | **2.206353** |
+| 100 | 2.109085 | 2.109607 | **2.108134** |
+| 150 | 2.050799 | 2.050696 | **2.048889** |
+| 200 | 2.010339 | 2.009210 | **2.007335** |
+| 250 | 1.979776 | 1.977259 | **1.975824** |
+| 300 | 1.955225 | 1.952096 | **1.950991** |
+| 350 | 1.935433 | 1.931883 | **1.930990** |
+| 400 | 1.919583 | 1.915692 | **1.915053** |
+| 450 | 1.907060 | 1.902743 | **1.902104** |
+| 500 | 1.895432 | 1.891082 | **1.890727** |
 
-Z_t = Q^T G_t                       # left
-K_t Q = G_t Z_t^T
-```
+Runs: EIGH `o2prop3k`, separate target `nm7jcgbc`, direct Oja `r50bh8jw`.
+Direct Oja led at every checkpoint, beat EIGH by `.004705` at step 500, and beat
+the separate target by `.000355`. Its final held-frame capture was `.5081`
+versus `.4820` EIGH and `.5114` separate-target; Aurora alignment was `.8363`
+versus `.8285` and `.8330`; moment effective rank was `27.73` versus `27.41` and
+`27.64`; projected-gradient/moment ratio was `4.26` versus `4.93` and `4.36`.
+This is target-loss evidence only: no retention corpus was configured.
 
-It is a normalized position target rather than C1's magnitude-bearing tangent,
-and repeated block-power steps can converge to the dominant eigenspace whenever
-the held frame has contact with it. It may also act as a useful prior that rejects
-finite-window noise. But its `Q`-dependent bias and orthogonal blind spot must be
-measured rather than laundered into "better averaging."
+The separate target's initially rising lag and later catch-up were the expected
+two serial low-pass filters—the online estimator followed by the `.25` boundary
+controller—not useful warmup. Direct Oja adapted immediately and consistently
+won loss. The separate estimator/controller arm was therefore deleted rather
+than retained as a user-facing option.
 
-Oja first enters as a separate online estimator frame `S:[d,r]`: it receives
-every conditioned gradient while the live projection basis `Q` still moves only
-at the interval boundary. This isolates estimator quality from basis cadence and
-the known `.25` controller. That separation is not a permanent architectural
-commitment. If Oja proves both substantially better and stable, compare using `S`
-directly as `Q`; carrying two basis-sized frames and a second controller would
-then be complexity without meaning. Direct promotion must re-measure per-step
-frame motion, moment behavior, and walltime rather than being rejected merely
-because the first clean experiment kept the roles separate.
+One diagnostic bug was found while closing the comparison: basis lag was measured
+over five basis moves. That meant 50 optimizer steps for boundary arms but only
+five steps for direct Oja, so the logged direct lag masses are not numerically
+comparable to EIGH or the separate target. The implementation now uses a fixed
+50-optimizer-step snapshot horizon for every aim. This does not affect training
+or any reported loss.
 
-#### First feasibility evidence
+Compiled measured throughput was 18,631 tokens/s for EIGH, 19,684 for the
+separate target, and 17,929 for direct Oja. Direct Oja is therefore about 3.8%
+slower than EIGH in this single run. Do not infer the exact source from aggregate
+walltime: profile the reduced QR plus rank-space Procrustes SVD before changing
+the geometry. If stabilization is the measured tax, test the existing Polar
+Express primitive, beginning with one iteration because correction runs every
+step; do not introduce another polar implementation. Replay any changed
+stabilization before promotion.
 
-A disposable fp64 stationary-covariance probe used `d=64`, `r=8`, signal
-eigenvalues `8 -> 3` over an isotropic noise floor `1`, ten finite-sample
-covariance observations per interval, fixed `eta=0.25`, 40 intervals, and 40
-trials. Against the population covariance, repeated warm block-range updates
-converged from initial principal angles of 15, 45, and 75 degrees, but remained
-stuck under an exactly orthogonal noiseless replacement, as predicted. With
-finite-window observations, random cross-contact let it escape even the
-orthogonal start. Its final mean principal-angle mass was about `0.69` radians
-versus `0.81` for exact finite-window EIGH position targets. This is feasibility
-evidence only: in that stationary world the warm prior suppressed sample noise,
-but it does not show rotating-signal tracking, language-model utility, or safety
-under abrupt replacement. A one-window probe also showed its error relative to
-the exact interval target growing sharply as the held frame moved farther away.
+Rank 32 was deliberate: it is a rank-starved tracking stress test, not a proposed
+product rank. The promotion rank remains open. Rank 64 is only the current harness
+default; historical 128/256 runs still showed quality gains and healthy rank use
+on this small model. Choose the rank for the matched 1k promotion comparison
+explicitly rather than laundering the harness default into a product decision.
 
-The reusable simulator now lives at
-`experiments/interval_target_estimators.py`; arithmetic checks live in
-`tests/test_interval_target_estimators.py`. Its first map used `d=64`, `r=10`,
-interval 10, 32 Gaussian covariance-contact rows per gradient, 40 intervals,
-eight trials, and the production `.25` boundary controller. Random-factor rows
-use dense random orthoprojectors, giving the width ladder an honest exact endpoint
-when all 32 rows per gradient are retained. Oja is a persistent separate frame
-with a Rayleigh-normalized Grassmann-gradient step; the simulator calibrates its
-single step size before any optimizer API exists.
+Do not add a harmonic warm-start arm yet: applying `1/n`-style steps immediately
+is hottest when observations are noisiest, while delaying all basis application
+would add ceremony unsupported by the nearly identical warmup losses. Fixed
+steps keep the causal comparison clean.
 
-First-map evidence, all numbers mean principal-angle mass in radians:
-
-- In the stationary world, exact interval EIGH left the controlled basis at
-  `0.88`; warm block improved it to `0.75`. Oja reached `0.69` at step `.0625`
-  and `0.81` at `.125`. The persistent prior can beat the finite-window target by
-  rejecting sample noise.
-- Over a smooth 60-degree rotation, exact interval EIGH reached `1.21`, warm
-  block `1.33`, and Oja `.125/.1875` about `1.27`. The coldest Oja step lagged at
-  `1.44`: stationary denoising and tracking speed are a real trade, not one scalar
-  ranking.
-- After an exactly orthogonal replacement, exact interval EIGH reacted fastest
-  immediately. Warm block and Oja retained their expected prior lag. By the final
-  interval the basis errors were `0.87` exact, `0.98` warm, and `0.82` Oja `.125`;
-  Oja's online contact recovered faster than warm block after the first shocked
-  windows, but did not erase the abrupt-change cost.
-- At a rank-cutoff crossing, exact interval EIGH finished at `0.88`, warm block
-  at `1.61`, and Oja `.1875/.25` near `1.00`. Hotter Oja steps replaced stale
-  membership faster, while colder steps preserved more stationary denoising.
-- The random-factor estimator was state-inefficient in this world. Controlled
-  stationary basis error was `3.85` at `2r`, `2.88` at `4r`, `1.92` at `8r`, and
-  `1.26` at `16r`; only `32r`, which retained the complete gradient factor,
-  matched exact interval EIGH at `0.88`. This does not prove every structured
-  covariance sketch bad, but the proposed `2r` factor has not earned optimizer
-  integration.
-
-This first map warms Oja substantially and keeps warm block alive. It does not
-select an Oja step: `.0625` is the stationary winner, `.125-.1875` is the current
-rotation/abrupt compromise, and `.1875-.25` handles cutoff replacement better.
-Before controller integration, sensitivity must vary SNR/eigengap, rotation rate,
-contact rows, and rank ratio so one synthetic world does not silently tune the
-estimator. The JSON output includes mean per-interval trajectories so recovery
-speed remains visible rather than being flattened into final scalars.
-
-#### Direct-Oja calibration and noise sensitivity
-
-If the Oja estimator frame itself becomes the live `Q`, its update must use the
-horizontal Grassmann geodesic rather than QR. QR is harmless for a target
-subspace `S`, but can arbitrarily change frame gauge while projected momentum
-coordinates are retained. A geodesic Oja step preserves the same rigid-frame,
-identity-coordinate transport contract as the current controller.
-
-For a Rayleigh-normalized Oja tangent, local target-error contraction per gradient
-is approximately
-
-```text
-gamma * rho
-rho = (lambda_r - lambda_{r+1}) / mean(lambda_1:r)
-```
-
-The separate estimator receives ten Oja updates and then `Q` receives only `.25`
-of the resulting displacement. In the small-motion limit this maps separate Oja
-steps `.125-.1875` to direct steps around `.031-.047`. Asking direct `Q` to close
-`0.1` of a stationary target over ten gradients gives per-gradient contraction
-`1 - 0.9^(1/10) = 0.01048`; the first simulator's gap ratio `rho ~= .364` maps
-that independently to `gamma ~= .029`. Both estimates therefore center the
-direct calibration at `.03`, without claiming transformer gradients share the
-synthetic eigengap.
-
-Direct-geodesic Oja at `.02/.03/.04/.05` confirmed the estimate. In the original
-stationary world `.03` reached basis error `0.87`; under smooth 60-degree motion,
-`.04-.05` reached `1.20-1.17`, slightly better than the separate estimator. It
-was much slower after orthogonal replacement and cutoff membership changes. This
-is the expected price of a cold direct tracker, and those hostile worlds are
-deliberately faster than the presumed LLM target drift.
-
-Three slower, noisier sensitivity regimes then varied contact rows and signal
-gap:
-
-- Moderate noise (`32 -> 16` contact rows, signal `6 -> 2`, 20-degree total
-  rotation): direct `.03-.04` was the stable center (`1.68-1.65` rotating basis
-  error), while separate `.0625` reached `1.33`.
-- Weak signal (signal `4 -> 1.5`): direct `.03-.04` reached `2.44-2.36`; warm
-  block and separate `.0625` were both about `1.94`.
-- Very weak signal (`8` contact rows, signal `3 -> 1.25`, 10-degree rotation):
-  direct `.02-.03` reached `4.58-4.59`; separate `.03125` reached `4.19` and
-  warm block `4.27`. All estimators were poor in absolute terms, but the colder
-  online estimator retained the most signal.
-
-The robust direct-Oja center is therefore approximately `.03`. A separate frame
-can supply another temporal filter, but costs one additional `[d,r]` state tensor,
-an independent `G S` projection plus covariance backprojection, and per-step
-estimator orthogonalization. Direct Oja instead reuses the actual `G Q` projected
-gradient, needs only the covariance backprojection, deletes `S`, and makes every
-small frame move the live basis.
-
-This is still Gaussian covariance evidence, not a transformer-gradient model.
-Synthetic worlds are mechanism filters and calibration tools; actual conditioned
-LLM gradients must decide whether the extra filter earns its state and compute.
-
-#### Transformer-gradient shadow probe
-
-The 200-step rank-32 shadow run `pink-marker/usuitrack/x7jy7hwm` evaluated 15
-first/middle/last matrices across transformer roles without changing the live
-optimizer update. Its final loss `2.010260` matched the fixed-controller reference
-`2.010285` within `0.000025`, and tests pin parameter updates and optimizer
-`state_dict` equality with shadowing enabled. The run is a geometry warmup, not a
-training verdict. Practical lab runs stop at 200, 500, or 1k steps because longer
-training is expensive. A 1k run is still ordinary fine-tuning territory where
-LoRA remains a credible solution; 10k names the continued-pretraining/full-
-finetuning product regime where adapter capacity can bind. Evidence must be
-interpreted for transfer toward that regime, not ritualistically rerun at 10k.
-
-Each boundary snapshot was scored on capture of the following interval's
-Adafactor-conditioned gradients. Mean capture over steps 20-200, with the mature
-steps 110-200 in parentheses:
-
-| frame or target | predictive capture |
-|---|---:|
-| live `.25`-EIGH `Q` | `.5293` (`.5077`) |
-| raw single-grad EIGH target | `.4886` (`.4588`) |
-| warm block target | `.5489` (`.5243`) |
-| separate Oja `.03125` target | `.5420` (`.5250`) |
-| separate Oja `.0625` target | `.5478` (`.5299`) |
-| direct Oja `.02` frame | `.5358` (`.5183`) |
-| direct Oja `.03` frame | `.5414` (`.5244`) |
-| direct Oja `.04` frame | `.5445` (`.5274`) |
-
-Warm block won every boundary through step 100; persistent Oja `.0625` won every
-boundary from step 110 onward. Direct Oja `.04` nearly reached that mature target
-capture without a second frame. At step 200 its capture was `.5250` versus
-`.5260` for separate Oja `.0625`, while inter-boundary churn was `3.21` radians
-versus `4.56`. Raw EIGH churn was `35.37`, warm block `13.61`, and live `Q` `8.04`.
-The direct and separate Oja frames had moved roughly 20 radians away from live
-`Q` while changing only a few radians per interval: they found a stable blind-spot
-estimate that the noisy boundary targets did not hold.
-
-The meaning is not "EIGH tracking never worked." Historical matched runs already
-showed frozen/no-update worse than moving `.25` toward EIGH, and `.1` rotation
-worse than `.25`. A noisy observation can still improve a held basis when mixed
-fractionally. The new result is sharper: the raw single-gradient EIGH target has
-less next-interval predictive value than the held basis, whereas direct Oja
-estimates and follows the blind spot with much less churn.
-
-Direct geodesic Oja is now the forward tracking lead. Do not build a production
-mixture of warm, EIGH, separate Oja, or per-linear target policies. The shadow
-alternatives were instruments for understanding the estimator. A direct frame
-keeps one state, one aim, and the exact moving-coordinate transport semantics.
-The remaining parameter question is its steady step around `.03-.04`. For early
-acquisition, test a mature Oja schedule—harmonic early weights toward a steady
-floor—without adding another tensor; this is a warm-start candidate, not yet a
-promoted rule.
-
-#### Staged evaluation contract
-
-1. **Direct integration.** Replace refresh-boundary EIGH motion with direct
-   Rayleigh-normalized geodesic Oja, reusing `G Q`; keep Adafactor conditioning,
-   full-spectrum motion, and identity-coordinate moment transport unchanged.
-2. **Warm-start calibration.** Compare a steady `.03-.04` step with one mature
-   harmonic-to-floor schedule. This is one initialization distinction, not a
-   controller lattice.
-3. **Practical training ladder.** Use 200 steps for mechanism/warmup evidence,
-   500 for replay-scale separation, and at most 1k for the faithful compiled
-   comparison. Read target/source loss first; predictive capture, motion, moment
-   health, state, and walltime explain.
-4. **Product-regime interpretation.** Judge whether the measured mechanism should
-   transfer toward a 10k continued-pretraining/full-finetuning regime, where LoRA
-   may reach capacity limits and full-matrix adaptation matters. Do not make a
-   10k run a routine gate; its cost is precisely why the shorter sensors must be
-   mechanistically honest.
-5. **Optimize afterward.** Only after direction evidence should work move to
-   precision, allocation reuse, compilation, or kernel optimization.
-
-The current released/default mechanism remains fixed `.25` EIGH position control
-until direct Oja survives the training comparison. The research direction has
-changed; the optimizer contract has not yet been promoted.
+The current released/default mechanism remains fixed `.25` EIGH until direct Oja
+survives stabilization-cost work (if needed) and a matched 1k promotion
+comparison. Predictive sensors and 500-step target loss nominate the challenger;
+the default changes only after the promotion run and documentation review.
 
 ### R6. Do cutoff planes poison stable planes?
 

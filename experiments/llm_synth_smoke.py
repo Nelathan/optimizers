@@ -378,25 +378,6 @@ def build_usuitrack_param_groups(
     return groups, policy_stats
 
 
-def select_shadow_target_probe_params(named_params: list[tuple[str, torch.nn.Parameter]]) -> list[torch.nn.Parameter]:
-    """Sample first/middle/last matrices per transformer role for the expensive shadow probe."""
-
-    by_role: dict[str, list[torch.nn.Parameter]] = {}
-    for name, param in named_params:
-        if param.ndim == 2:
-            by_role.setdefault(transformer_matrix_role(name, param), []).append(param)
-
-    selected: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-    for params in by_role.values():
-        for index in sorted({0, len(params) // 2, len(params) - 1}):
-            param = params[index]
-            if id(param) not in seen:
-                selected.append(param)
-                seen.add(id(param))
-    return selected
-
-
 def transformer_layer_index(name: str) -> int:
     parts = name.split(".")
     for layer_token in ("layers", "h", "blocks"):
@@ -823,7 +804,7 @@ def train_step(
     projected_grad_norm = optimizer_diagnostic(optimizer, "mean_projected_grad_norm") if collect_norms else float("nan")
     projected_grad_to_moment_ratio = optimizer_diagnostic(optimizer, "mean_projected_grad_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
-    eigh_target_angle_mass = optimizer_diagnostic(optimizer, "mean_eigh_target_angle_mass") if collect_basis else float("nan")
+    basis_target_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_target_angle_mass") if collect_basis else float("nan")
     basis_step_angle_mass = rotation_angle
     basis_lag_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_lag_angle_mass") if collect_basis else float("nan")
     basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
@@ -832,10 +813,6 @@ def train_step(
     moment_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if update_norm is not None and param_norm_scalar > 0 else None
-    shadow_target = {}
-    shadow_probe = getattr(optimizer, "shadow_target_probe", None)
-    if shadow_probe is not None:
-        shadow_target = dict(shadow_probe.last_step_diagnostics)
     return {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
@@ -845,14 +822,13 @@ def train_step(
         "update_to_param_ratio": update_to_param_ratio,
         "projected_grad_norm": projected_grad_norm,
         "projected_grad_to_moment_ratio": projected_grad_to_moment_ratio,
-        "eigh_target_angle_mass": eigh_target_angle_mass,
+        "basis_target_angle_mass": basis_target_angle_mass,
         "basis_step_angle_mass": basis_step_angle_mass,
         "basis_lag_angle_mass": basis_lag_angle_mass,
         "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
         "moment_erank": moment_erank,
         "moment_erank_pct": moment_erank_pct,
-        "shadow_target": shadow_target,
     }
 
 
@@ -930,7 +906,6 @@ def run_optimizer(
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
     set_projected_activation_compile(should_compile_projected_activation(args, optimizer_name))
-    shadow_probe_names: list[str] = []
     if optimizer_name == "usuitrack":
         optimizer = UsuiTrack(
             usuitrack_param_groups,
@@ -941,7 +916,6 @@ def run_optimizer(
             adafactor_beta2=args.adafactor_beta2,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
             grassmann_step_size=args.grassmann_step_size,
-            grassmann_step_schedule=args.grassmann_step_schedule,
             grassmann_rotate_rank=args.grassmann_rotate_rank,
             grassmann_aim=args.grassmann_aim,
             basis_refresh_interval=args.basis_refresh_interval,
@@ -952,12 +926,6 @@ def run_optimizer(
             consume_grad=not args.keep_grads_after_step,
             compile_tensor_kernels=args.torch_compile,
         )
-        if args.shadow_target_probe:
-            shadow_params = select_shadow_target_probe_params(trainable_named)
-            shadow_param_ids = {id(param) for param in shadow_params}
-            shadow_probe_names = [name for name, param in trainable_named if id(param) in shadow_param_ids]
-            optimizer.enable_shadow_target_probe(shadow_params)
-            print(f"shadow_target_probe_tensors={len(shadow_params)} names={','.join(shadow_probe_names)}", flush=True)
         projected_activation_modules = install_projected_activation_backend(model, optimizer, args.projected_activation_backend)
         model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name in {"adamw", "torch_adamw"}:
@@ -1039,14 +1007,10 @@ def run_optimizer(
             # other steps rather than logging NaN, so wandb's per-run summary
             # reflects the last real refresh event instead of whatever step
             # happened to be logged last.
-            for metric_name in ("eigh_target_angle_mass", "basis_step_angle_mass", "basis_lag_angle_mass"):
+            for metric_name in ("basis_target_angle_mass", "basis_step_angle_mass", "basis_lag_angle_mass"):
                 metric = scalar_or_none(step_result[metric_name])
                 if metric is not None and metric == metric:
                     train_metrics[f"opt/{metric_name}"] = metric
-            shadow_metrics = step_result["shadow_target"]
-            if isinstance(shadow_metrics, dict):
-                for metric_name, metric in shadow_metrics.items():
-                    train_metrics[f"opt/shadow/{metric_name}"] = metric
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1105,7 +1069,7 @@ def run_optimizer(
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     measured_projected_grad_norms = [step["projected_grad_norm"] for step in measured_steps]
     measured_projected_grad_to_moment_ratios = [step["projected_grad_to_moment_ratio"] for step in measured_steps]
-    measured_eigh_target_angle_mass = [step["eigh_target_angle_mass"] for step in measured_steps]
+    measured_basis_target_angle_mass = [step["basis_target_angle_mass"] for step in measured_steps]
     measured_basis_step_angle_mass = [step["basis_step_angle_mass"] for step in measured_steps]
     measured_basis_lag_angle_mass = [step["basis_lag_angle_mass"] for step in measured_steps]
     measured_basis_capture = [step["basis_capture"] for step in measured_steps]
@@ -1113,9 +1077,6 @@ def run_optimizer(
     measured_moment_erank = [step["moment_erank"] for step in measured_steps]
     measured_moment_erank_pct = [step["moment_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
-    shadow_probe = getattr(optimizer, "shadow_target_probe", None)
-    shadow_state_bytes = shadow_probe.tensor_bytes() if shadow_probe is not None else 0
-    shadow_probe_tensors = len(shadow_probe.states) if shadow_probe is not None else 0
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
@@ -1130,7 +1091,7 @@ def run_optimizer(
         "basis_init": args.basis_init if optimizer_name == "usuitrack" else "n/a",
         "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
         "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
-        "grassmann_step_schedule": args.grassmann_step_schedule if optimizer_name == "usuitrack" else "n/a",
+        "grassmann_aim": args.grassmann_aim if optimizer_name == "usuitrack" else "n/a",
         "lr_warmup_steps": args.lr_warmup_steps,
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "usuitrack" else 0,
@@ -1152,9 +1113,6 @@ def run_optimizer(
         "matrix_state_bytes": state_bytes["matrix"],
         "fallback_state_bytes": state_bytes["fallback"],
         "state_bytes": state_bytes["total"],
-        "shadow_probe_state_bytes": shadow_state_bytes,
-        "shadow_probe_tensors": shadow_probe_tensors,
-        "shadow_probe_names": ",".join(shadow_probe_names),
         "initial_val_loss": initial_val,
         "final_val_loss": final_val,
         "initial_retention_val_loss": initial_retention_val,
@@ -1167,7 +1125,7 @@ def run_optimizer(
         "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
         "last_logged_projected_grad_norm": last_finite_scalar(measured_projected_grad_norms),
         "last_logged_projected_grad_to_moment_ratio": last_finite_scalar(measured_projected_grad_to_moment_ratios),
-        "last_logged_eigh_target_angle_mass": last_finite_scalar(measured_eigh_target_angle_mass),
+        "last_logged_basis_target_angle_mass": last_finite_scalar(measured_basis_target_angle_mass),
         "last_logged_basis_step_angle_mass": last_finite_scalar(measured_basis_step_angle_mass),
         "last_logged_basis_lag_angle_mass": last_finite_scalar(measured_basis_lag_angle_mass),
         "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
@@ -1231,10 +1189,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
     parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="under the default eigh aim this is the EMA constant of position control: fraction of each principal angle closed per refresh toward the boundary target (1.0 = snap). 0.25 is the measured knee (Q14: 0.5 hotter but worse loss, 0.125 too slow). Under the tangent ablation aim, rotation = step_size * sigma in SubTrack units instead.")
-    parser.add_argument("--grassmann-step-schedule", choices=("fixed", "mature_ema"), default="fixed", help="eigh position-controller schedule: fixed uses --grassmann-step-size every refresh; mature_ema treats initialization as target one, then uses 1/2, 1/3, ... down to the fixed 0.1 tracking floor. The latter is the Q17 Karcher-mean ablation.")
+    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="boundary-controller fraction for eigh (1.0 = snap); 0.25 is the measured EIGH knee. Under the tangent ablation, rotation = step_size * sigma. direct_oja uses its fixed calibrated 0.04 step instead.")
     parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="how many principal-angle planes the geodesic rotates per refresh. Default None = ALL planes (full-spectrum position control, the Q13/Q14 winner). Set 1 for SubTrack-faithful single-plane drift (ablation).")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh"), default="eigh", help="what steers the basis at each refresh. 'eigh' (default) = position control: eigh target frame from the dampened boundary grad, contract --grassmann-step-size of every principal angle toward it; zero persistent state, noise decays instead of integrating. 'tangent' = SubTrack-faithful single-grad velocity step (reference/ablation arm; the C1 window accumulator was deleted after position control beat it). eigh aim logs target demand, applied step, and five-refresh lag as principal-angle mass.")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "direct_oja"), default="eigh", help="basis update law. eigh is the released fixed-.25 boundary controller; direct_oja moves the live frame every gradient with the calibrated one-state geodesic step; tangent is the historical SubTrack ablation.")
     parser.add_argument("--basis-refresh-interval", type=int, default=10)
     parser.add_argument(
         "--basis-refresh-schedule",
@@ -1269,7 +1226,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="usuitrack")
     parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and core grad/update norms every N measured steps; basis_capture is measured before a refresh, so logging at the refresh cadence consistently samples the held basis")
-    parser.add_argument("--shadow-target-probe", action="store_true", help="compare boundary EIGH, warm block, and calibrated Oja frames on next-interval conditioned-gradient capture without changing optimizer updates")
     return parser
 
 
@@ -1389,7 +1345,7 @@ def main() -> None:
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
         f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
-        f"grassmann_step_schedule={args.grassmann_step_schedule} "
+        f"grassmann_aim={args.grassmann_aim} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "

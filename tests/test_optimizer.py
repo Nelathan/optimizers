@@ -1,3 +1,4 @@
+import copy
 import math
 import unittest
 from unittest import mock
@@ -6,84 +7,10 @@ import torch
 
 import usuitrack
 from usuitrack import SubspaceProjector, UsuiTrack, optimizer_state_bytes_by_category
-from usuitrack.optimizer import MATURE_EMA_MIN_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
+from usuitrack.optimizer import DIRECT_OJA_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
 
 
 class UsuiTrackTest(unittest.TestCase):
-    def test_shadow_target_probe_does_not_change_optimizer_updates_or_state_dict(self):
-        torch.manual_seed(23)
-        reference_weight = torch.nn.Parameter(torch.randn(8, 6))
-        shadow_weight = torch.nn.Parameter(reference_weight.detach().clone())
-        kwargs = dict(
-            lr=0.01,
-            rank=3,
-            side="right",
-            moment_mode="ema",
-            grad_clip_norm=None,
-            basis_refresh_interval=2,
-        )
-        reference = UsuiTrack([reference_weight], **kwargs)
-        shadow = UsuiTrack([shadow_weight], **kwargs)
-        shadow.enable_shadow_target_probe([shadow_weight])
-
-        generator = torch.Generator().manual_seed(29)
-        for _ in range(6):
-            grad = torch.randn(reference_weight.shape, generator=generator)
-            reference_weight.grad = grad.clone()
-            shadow_weight.grad = grad.clone()
-            reference.step()
-            shadow.step()
-
-        torch.testing.assert_close(shadow_weight, reference_weight)
-        torch.testing.assert_close(shadow.state[shadow_weight]["basis"], reference.state[reference_weight]["basis"])
-        torch.testing.assert_close(
-            shadow.state[shadow_weight]["projected_exp_avg"], reference.state[reference_weight]["projected_exp_avg"]
-        )
-        shadow_state_dict = shadow.state_dict()
-        reference_state_dict = reference.state_dict()
-        self.assertEqual(shadow_state_dict["param_groups"], reference_state_dict["param_groups"])
-        self.assertEqual(shadow_state_dict["state"].keys(), reference_state_dict["state"].keys())
-        for param_id, shadow_state in shadow_state_dict["state"].items():
-            reference_state = reference_state_dict["state"][param_id]
-            self.assertEqual(shadow_state.keys(), reference_state.keys())
-            for key, shadow_value in shadow_state.items():
-                reference_value = reference_state[key]
-                if isinstance(shadow_value, torch.Tensor):
-                    torch.testing.assert_close(shadow_value, reference_value)
-                else:
-                    self.assertEqual(shadow_value, reference_value)
-        self.assertGreater(shadow.shadow_target_probe.tensor_bytes(), 0)
-
-    def test_shadow_target_probe_emits_next_interval_metrics_only_at_boundaries(self):
-        weight = torch.nn.Parameter(torch.zeros(6, 4))
-        opt = UsuiTrack(
-            [weight],
-            lr=0.01,
-            rank=2,
-            side="right",
-            moment_mode="ema",
-            grad_clip_norm=None,
-            basis_refresh_interval=2,
-        )
-        opt.enable_shadow_target_probe([weight])
-
-        for step in range(3):
-            weight.grad = torch.arange(24, dtype=torch.float32).reshape(6, 4).roll(step, dims=1)
-            opt.step()
-
-        diagnostics = opt.shadow_target_probe.last_step_diagnostics
-        self.assertEqual(diagnostics["tensors"], 1.0)
-        for label in ("current_q", "eigh", "warm", "oja_003125", "oja_00625", "direct_002", "direct_003", "direct_004"):
-            capture = diagnostics[f"predictive_capture/{label}"]
-            self.assertGreaterEqual(capture, 0.0)
-            self.assertLessEqual(capture, 1.0 + 1e-5)
-            self.assertGreaterEqual(diagnostics[f"target_angle_mass/{label}"], 0.0)
-            self.assertGreaterEqual(diagnostics[f"target_churn_mass/{label}"], 0.0)
-
-        weight.grad = torch.ones_like(weight)
-        opt.step()
-        self.assertEqual(opt.shadow_target_probe.last_step_diagnostics, {})
-
     def test_public_optimizer_name_has_no_legacy_alias(self):
         self.assertIs(usuitrack.UsuiTrack, UsuiTrack)
         self.assertFalse(hasattr(usuitrack, "SumoTrack"))
@@ -154,12 +81,10 @@ class UsuiTrackTest(unittest.TestCase):
 
         lag_angle_mass = float("nan")
         diagnostics = {}
-        # Enough boundaries for the probe AND one basis-lag reading: the snapshot
-        # is taken at the first post-init refresh, the lag angle lands
-        # BASIS_LAG_REFRESHES boundaries later (interval 2 -> within 16 steps).
+        # Enough boundaries for the probe AND one fixed-50-step basis-lag reading.
         # Refresh-only metrics live on boundary steps, so keep the last boundary's
         # diagnostics rather than whatever step the loop happens to end on.
-        for _ in range(16):
+        for _ in range(56):
             opt.zero_grad()
             (weight @ torch.randn(6, 6)).square().mean().backward()
             opt.step()
@@ -169,11 +94,11 @@ class UsuiTrackTest(unittest.TestCase):
             if candidate == candidate:
                 lag_angle_mass = candidate
         self.assertGreater(diagnostics["basis_refresh_tensors"], 0.0)
-        self.assertGreater(diagnostics["mean_eigh_target_angle_mass"], 0.0)
+        self.assertGreater(diagnostics["mean_basis_target_angle_mass"], 0.0)
         self.assertGreater(diagnostics["mean_rotation_angle"], 0.0)
-        self.assertLessEqual(diagnostics["mean_rotation_angle"], diagnostics["mean_eigh_target_angle_mass"] + 1e-5)
+        self.assertLessEqual(diagnostics["mean_rotation_angle"], diagnostics["mean_basis_target_angle_mass"] + 1e-5)
         # The convergence metric fired once: total principal-angle mass to the
-        # basis snapshot five refreshes ago.
+        # basis snapshot 50 optimizer steps ago.
         self.assertGreater(lag_angle_mass, 0.0)
         self.assertLessEqual(lag_angle_mass, 3 * torch.pi / 2 + 1e-5)
         # No tangent-accumulation state or stale target stream under the eigh aim.
@@ -182,37 +107,117 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertNotIn("prev_eigh_target", state)
         self.assertIn("basis_lag_snapshot", state)
 
-    def test_mature_ema_schedule_is_a_running_mean_then_tracks_at_floor(self):
-        self.assertEqual(UsuiTrack._mature_ema_step_size(1), 0.5)
-        self.assertEqual(UsuiTrack._mature_ema_step_size(2), 1 / 3)
-        self.assertEqual(UsuiTrack._mature_ema_step_size(9), MATURE_EMA_MIN_STEP_SIZE)
-        self.assertEqual(UsuiTrack._mature_ema_step_size(100), MATURE_EMA_MIN_STEP_SIZE)
+    def test_direct_oja_moves_live_basis_every_gradient_without_second_frame(self):
+        torch.manual_seed(53)
+        weight = torch.nn.Parameter(torch.randn(12, 8, dtype=torch.bfloat16))
+        opt = UsuiTrack(
+            [weight],
+            lr=0.01,
+            rank=4,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            basis_refresh_interval=10,
+            grassmann_aim="direct_oja",
+        )
 
-    def test_mature_ema_counts_initial_frame_as_first_target(self):
-        torch.manual_seed(9)
-        weight = torch.nn.Parameter(torch.randn(12, 6))
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        initial_basis = opt.state[weight]["basis"].clone()
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        state = opt.state[weight]
+        self.assertFalse(torch.equal(state["basis"], initial_basis))
+        self.assertNotIn("oja_target_basis", state)
+        self.assertEqual(state["basis"].dtype, torch.bfloat16)
+        self.assertLess(float((state["basis"].float() @ state["basis"].float().mT - torch.eye(4)).norm()), 2e-2)
+
+    def test_direct_oja_basis_lag_uses_fixed_optimizer_step_horizon(self):
+        torch.manual_seed(57)
+        weight = torch.nn.Parameter(torch.randn(10, 6))
         opt = UsuiTrack(
             [weight],
             lr=0.01,
             rank=3,
-            basis_refresh_interval=1,
-            grassmann_step_schedule="mature_ema",
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            grassmann_aim="direct_oja",
+        )
+        opt.diagnostics_enabled = True
+        opt.diagnostics_basis_enabled = True
+
+        for step in range(1, 53):
+            weight.grad = torch.randn_like(weight)
+            opt.step()
+            lag = opt.last_step_diagnostics["mean_basis_lag_angle_mass"]
+            if step < 52:
+                self.assertTrue(math.isnan(lag), msg=f"step={step}")
+            else:
+                self.assertGreater(lag, 0.0)
+
+    def test_direct_oja_reuses_held_projection_as_moving_frame_coordinates(self):
+        torch.manual_seed(59)
+        weight = torch.nn.Parameter(torch.randn(10, 6))
+        opt = UsuiTrack(
+            [weight],
+            lr=0.01,
+            beta=0.9,
+            rank=3,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            grassmann_aim="direct_oja",
         )
 
-        step_sizes = []
-        original_update = SubspaceProjector.update_grassmann_from_tangent
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        state = opt.state[weight]
+        old_basis = state["basis"].clone()
+        old_moment = state["projected_exp_avg"].clone()
+        gradient = torch.randn_like(weight)
+        held_projection = gradient @ old_basis.mT
+        weight.grad = gradient
+        opt.step()
 
-        def observe_step_size(projector, tangent, *, step_size, rotate_rank: int):
-            step_sizes.append(step_size)
-            return original_update(projector, tangent, step_size=step_size, rotate_rank=rotate_rank)
+        self.assertFalse(torch.equal(state["basis"], old_basis))
+        torch.testing.assert_close(state["projected_exp_avg"], 0.9 * old_moment + 0.1 * held_projection)
 
-        with mock.patch.object(SubspaceProjector, "update_grassmann_from_tangent", new=observe_step_size):
-            for expected_target_count in (1, 2, 3):
-                weight.grad = torch.randn_like(weight)
-                opt.step()
-                self.assertEqual(opt.state[weight]["basis_target_count"], expected_target_count)
+    def test_direct_oja_state_dict_continuation_is_deterministic(self):
+        torch.manual_seed(67)
+        first = torch.nn.Parameter(torch.randn(10, 6, dtype=torch.bfloat16))
+        kwargs = dict(
+            lr=0.01,
+            rank=3,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            grassmann_aim="direct_oja",
+        )
+        first_opt = UsuiTrack([first], **kwargs)
+        for _ in range(4):
+            first.grad = torch.randn_like(first)
+            first_opt.step()
 
-        self.assertEqual(step_sizes, [0.5, 1 / 3])
+        second = torch.nn.Parameter(first.detach().clone())
+        second_opt = UsuiTrack([second], **kwargs)
+        second_opt.load_state_dict(copy.deepcopy(first_opt.state_dict()))
+        gradient = torch.randn_like(first)
+        first.grad = gradient.clone()
+        second.grad = gradient.clone()
+        first_opt.step()
+        second_opt.step()
+
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first_opt.state[first]["basis"], second_opt.state[second]["basis"])
+        torch.testing.assert_close(
+            first_opt.state[first]["projected_exp_avg"],
+            second_opt.state[second]["projected_exp_avg"],
+        )
+
+    def test_direct_oja_step_is_fixed_replay_contract(self):
+        self.assertEqual(DIRECT_OJA_STEP_SIZE, 0.04)
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -421,9 +426,9 @@ class UsuiTrackTest(unittest.TestCase):
         torch.manual_seed(3)
         grad = torch.randn(5)
         base = torch.randn(5)
-        sumo_bias = torch.nn.Parameter(base.clone())
+        usui_bias = torch.nn.Parameter(base.clone())
         torch_bias = torch.nn.Parameter(base.clone())
-        sumo_opt = UsuiTrack([sumo_bias], lr=0.01, fallback_betas=(0.9, 0.99), weight_decay=0.01)
+        usui_opt = UsuiTrack([usui_bias], lr=0.01, fallback_betas=(0.9, 0.99), weight_decay=0.01)
         torch_opt = torch.optim.AdamW(
             [torch_bias],
             lr=0.01,
@@ -433,12 +438,12 @@ class UsuiTrackTest(unittest.TestCase):
             fused=False,
         )
 
-        sumo_bias.grad = grad.clone()
+        usui_bias.grad = grad.clone()
         torch_bias.grad = grad.clone()
-        sumo_opt.step()
+        usui_opt.step()
         torch_opt.step()
 
-        self.assertTrue(torch.allclose(sumo_bias, torch_bias))
+        self.assertTrue(torch.allclose(usui_bias, torch_bias))
 
     def test_state_dict_round_trip_preserves_state_shapes(self):
         weight = torch.nn.Parameter(torch.randn(7, 4))
