@@ -7,7 +7,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, wandb_log
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_shadow_target_probe_params, select_trainable_params, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -153,6 +153,22 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(args.torch_compile)
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
+        self.assertFalse(args.shadow_target_probe)
+
+    def test_shadow_probe_samples_first_middle_last_matrix_per_role(self):
+        named = []
+        for layer in range(5):
+            named.extend(
+                (
+                    (f"model.layers.{layer}.mlp.w1.weight", torch.nn.Parameter(torch.randn(6, 4))),
+                    (f"model.layers.{layer}.mlp.w2.weight", torch.nn.Parameter(torch.randn(4, 6))),
+                )
+            )
+
+        selected = select_shadow_target_probe_params(named)
+
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(len({id(param) for param in selected}), 6)
 
     def test_cli_has_no_loss_or_padding_option_garden(self):
         option_strings = {option for action in build_parser()._actions for option in action.option_strings}

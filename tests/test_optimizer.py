@@ -10,6 +10,80 @@ from usuitrack.optimizer import MATURE_EMA_MIN_STEP_SIZE, ORTHOGONALIZATION_SCAL
 
 
 class UsuiTrackTest(unittest.TestCase):
+    def test_shadow_target_probe_does_not_change_optimizer_updates_or_state_dict(self):
+        torch.manual_seed(23)
+        reference_weight = torch.nn.Parameter(torch.randn(8, 6))
+        shadow_weight = torch.nn.Parameter(reference_weight.detach().clone())
+        kwargs = dict(
+            lr=0.01,
+            rank=3,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            basis_refresh_interval=2,
+        )
+        reference = UsuiTrack([reference_weight], **kwargs)
+        shadow = UsuiTrack([shadow_weight], **kwargs)
+        shadow.enable_shadow_target_probe([shadow_weight])
+
+        generator = torch.Generator().manual_seed(29)
+        for _ in range(6):
+            grad = torch.randn(reference_weight.shape, generator=generator)
+            reference_weight.grad = grad.clone()
+            shadow_weight.grad = grad.clone()
+            reference.step()
+            shadow.step()
+
+        torch.testing.assert_close(shadow_weight, reference_weight)
+        torch.testing.assert_close(shadow.state[shadow_weight]["basis"], reference.state[reference_weight]["basis"])
+        torch.testing.assert_close(
+            shadow.state[shadow_weight]["projected_exp_avg"], reference.state[reference_weight]["projected_exp_avg"]
+        )
+        shadow_state_dict = shadow.state_dict()
+        reference_state_dict = reference.state_dict()
+        self.assertEqual(shadow_state_dict["param_groups"], reference_state_dict["param_groups"])
+        self.assertEqual(shadow_state_dict["state"].keys(), reference_state_dict["state"].keys())
+        for param_id, shadow_state in shadow_state_dict["state"].items():
+            reference_state = reference_state_dict["state"][param_id]
+            self.assertEqual(shadow_state.keys(), reference_state.keys())
+            for key, shadow_value in shadow_state.items():
+                reference_value = reference_state[key]
+                if isinstance(shadow_value, torch.Tensor):
+                    torch.testing.assert_close(shadow_value, reference_value)
+                else:
+                    self.assertEqual(shadow_value, reference_value)
+        self.assertGreater(shadow.shadow_target_probe.tensor_bytes(), 0)
+
+    def test_shadow_target_probe_emits_next_interval_metrics_only_at_boundaries(self):
+        weight = torch.nn.Parameter(torch.zeros(6, 4))
+        opt = UsuiTrack(
+            [weight],
+            lr=0.01,
+            rank=2,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            basis_refresh_interval=2,
+        )
+        opt.enable_shadow_target_probe([weight])
+
+        for step in range(3):
+            weight.grad = torch.arange(24, dtype=torch.float32).reshape(6, 4).roll(step, dims=1)
+            opt.step()
+
+        diagnostics = opt.shadow_target_probe.last_step_diagnostics
+        self.assertEqual(diagnostics["tensors"], 1.0)
+        for label in ("current_q", "eigh", "warm", "oja_003125", "oja_00625", "direct_002", "direct_003", "direct_004"):
+            capture = diagnostics[f"predictive_capture/{label}"]
+            self.assertGreaterEqual(capture, 0.0)
+            self.assertLessEqual(capture, 1.0 + 1e-5)
+            self.assertGreaterEqual(diagnostics[f"target_angle_mass/{label}"], 0.0)
+            self.assertGreaterEqual(diagnostics[f"target_churn_mass/{label}"], 0.0)
+
+        weight.grad = torch.ones_like(weight)
+        opt.step()
+        self.assertEqual(opt.shadow_target_probe.last_step_diagnostics, {})
+
     def test_public_optimizer_name_has_no_legacy_alias(self):
         self.assertIs(usuitrack.UsuiTrack, UsuiTrack)
         self.assertFalse(hasattr(usuitrack, "SumoTrack"))

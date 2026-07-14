@@ -10,6 +10,7 @@ from torch.optim import Optimizer
 from torch.optim import _functional as torch_optim_functional
 
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
+from .shadow_target_probe import ShadowTargetProbe
 
 
 AURORA_PP_ITERATIONS = 2
@@ -149,6 +150,7 @@ class UsuiTrack(Optimizer):
         self.diagnostics_basis_enabled = False
         self.diagnostics_aurora_health_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
+        self.shadow_target_probe: ShadowTargetProbe | None = None
         self._compiled_orthogonalize_update = torch.compile(UsuiTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
         self._queued_projected_grads: dict[Tensor, Tensor] = {}
 
@@ -189,6 +191,12 @@ class UsuiTrack(Optimizer):
     def _owns_param(self, param: Tensor) -> bool:
         return any(param is candidate for group in self.param_groups for candidate in group["params"])
 
+    def enable_shadow_target_probe(self, params: Iterable[Tensor]) -> None:
+        selected = list(params)
+        if any(not self._owns_param(param) or param.ndim != 2 for param in selected):
+            raise ValueError("shadow target probe parameters must be owned 2D matrices")
+        self.shadow_target_probe = ShadowTargetProbe(selected)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -224,6 +232,8 @@ class UsuiTrack(Optimizer):
             self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
 
         self.last_step_diagnostics = self._finalize_diagnostics(diagnostics)
+        if self.shadow_target_probe is not None:
+            self.shadow_target_probe.finalize_step()
 
         return loss
 
@@ -390,8 +400,30 @@ class UsuiTrack(Optimizer):
                 current_sum = diagnostics["basis_capture_sum"]
                 diagnostics["basis_capture_sum"] = capture if current_sum is None else current_sum + capture
                 diagnostics["basis_capture_tensors"] += 1
+            shadow_probe = self.shadow_target_probe
+            shadow_selected = shadow_probe is not None and shadow_probe.includes(p)
+            was_initialized = projector.is_initialized
+            shadow_held_frame = projector.canonical_basis().detach().float() if shadow_selected and was_initialized else None
+            if shadow_selected and was_initialized:
+                assert shadow_probe is not None
+                shadow_probe.observe(p, grad, projector)
+            target_frame = None
             if not projector.is_initialized or refresh_basis:
-                self._refresh_projector(projector, grad, group, state, diagnostics)
+                target_frame = self._refresh_projector(projector, grad, group, state, diagnostics)
+            if shadow_selected:
+                assert shadow_probe is not None
+                if not was_initialized:
+                    shadow_probe.initialize(p, projector)
+                elif refresh_basis:
+                    if target_frame is None:
+                        raise RuntimeError("shadow target probe requires an EIGH target on refresh")
+                    assert shadow_held_frame is not None
+                    shadow_probe.finish_boundary(
+                        p,
+                        shadow_held_frame,
+                        projector.canonical_basis().detach().float(),
+                        target_frame,
+                    )
             projected_grad = projector.project(grad) if refresh_basis or held_projected_grad is None else held_projected_grad
 
         projected_grad_norm = projected_grad.float().norm().detach()
@@ -599,9 +631,12 @@ class UsuiTrack(Optimizer):
 
         return max(MATURE_EMA_MIN_STEP_SIZE, 1.0 / (target_count + 1))
 
-    def _refresh_projector(self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None) -> None:
+    def _refresh_projector(
+        self, projector: SubspaceProjector, grad: Tensor, group: dict, state: dict, diagnostics: dict | None
+    ) -> Tensor | None:
         was_initialized = projector.is_initialized
         aim = group["grassmann_aim"]
+        target_frame = None
         if not was_initialized:
             projector.fit(grad)
             if aim == "eigh" and group["grassmann_step_schedule"] == "mature_ema":
@@ -685,6 +720,7 @@ class UsuiTrack(Optimizer):
             projected_shape = tuple(projector.project(grad).shape)
             if tuple(old_projected_exp_avg.shape) != projected_shape:
                 state.pop("projected_exp_avg", None)
+        return target_frame if was_initialized and aim == "eigh" else None
 
     @staticmethod
     def _resolve_rotate_rank(group: dict, projector: SubspaceProjector, grad: Tensor) -> int:

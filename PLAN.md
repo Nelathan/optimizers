@@ -68,6 +68,12 @@ These claims survived the experiments that produced the present design:
   downstream projected clip cannot protect upstream state from a blip.
 - Tangent tracking was a noisy velocity controller. Fractional full-spectrum
   `eigh` aim converged as position control.
+- A rank-32 transformer-gradient shadow probe showed why the EIGH controller
+  still leaves headroom: a raw single-gradient EIGH target predicted the next
+  interval worse than held `Q`, while direct geodesic Oja tracked a more
+  predictive blind-spot frame with far less churn and no second basis state.
+  Direct Oja is the forward research lead; fixed `.25` EIGH remains the default
+  until a training comparison promotes it.
 - Reprojecting momentum across basis refresh charged a principal-plane cosine
   tax before Aurora. Identity coordinates are exact transport along the selected
   rigid frame rotation and preserve the projected singular spectrum.
@@ -125,7 +131,7 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Does moving-frame momentum beat fixed-ambient history? | rotating toy reading lifted pre-Aurora direction, then narrow SYNTH survivor | keep identity, reproject, or reset |
 | Is the chosen frame path stable at cutoff churn and near 90 degrees? | gauge/sign and hostile-target stress | stabilize target/path or accept boundary |
 | Does refresh cadence cost meaningful walltime? | profile refresh and non-refresh steps separately | leave fixed cadence or test a monotone schedule |
-| Is exact target `eigh` a bottleneck? | stage profile before algorithm work | retain library `eigh` or compare warm-started iteration |
+| Can direct geodesic Oja replace noisy boundary EIGH? | 1k matched loss/retention run after the predictive-capture shadow probe | promote one-state online tracking or retain fixed `.25` EIGH |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
 | Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
@@ -198,6 +204,10 @@ training, uniform rank 64, residual-facing projection, stable `eigh` init,
 right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE loss, and
 position-controlled burst refresh every 10 steps. `experiments/llm_synth_smoke.py`
 is authoritative for CLI defaults; `UsuiTrack` constructor defaults may differ.
+
+Treat 200 steps as geometry and warmup evidence, 1k as medium training, and 10k
+as the full-training horizon. Do not promote a basis mechanism because it looks
+healthy at 200, or describe 1k as a full convergence result.
 
 Use `torch.compile` for expensive quality runs unless compile itself is under test
 or breaks the contract. Packed no-mask inputs are the explicit throughput lane,
