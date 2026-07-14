@@ -55,7 +55,7 @@ def set_projected_activation_compile(enabled: bool) -> None:
     """Compile pure projected-activation tensor kernels when the harness compiles.
 
     The custom autograd Functions still own the Python side-channel that queues
-    projected gradients into SumoTrack. Only the tensor math inside backward is
+    projected gradients into UsuiTrack. Only the tensor math inside backward is
     compiled here, keeping optimizer state/bookkeeping out of Dynamo's graph.
     """
 

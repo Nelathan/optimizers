@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from sumotrack import SumoTrack
-from sumotrack.projected_activation import (
+from usuitrack import UsuiTrack
+from usuitrack.projected_activation import (
     ProjectedActivationGradientSink,
     projected_activation_gated_mlp,
     projected_activation_gated_mlp_side_aware,
@@ -104,7 +104,7 @@ class ProjectedActivationTest(unittest.TestCase):
         self.assertIsNone(projected.weight.grad)
         self.assertTrue(torch.allclose(sink.projected_grads["shared"], reference.weight.grad @ basis.mT, atol=1e-12))
 
-    def test_linear_projected_grad_queues_into_sumotrack_optimizer(self):
+    def test_linear_projected_grad_queues_into_usuitrack_optimizer(self):
         torch.manual_seed(25)
         batch, in_features, out_features, rank = 5, 7, 4, 3
         warm_x = torch.randn(batch, in_features, dtype=torch.float64)
@@ -114,8 +114,8 @@ class ProjectedActivationTest(unittest.TestCase):
         reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected.load_state_dict(reference.state_dict())
-        reference_opt = SumoTrack([reference.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
-        projected_opt = SumoTrack([projected.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
+        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
+        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
 
         (reference(warm_x) - warm_target).square().mean().backward()
         (projected(warm_x) - warm_target).square().mean().backward()
@@ -137,7 +137,7 @@ class ProjectedActivationTest(unittest.TestCase):
         self.assertTrue(torch.allclose(projected.weight, reference.weight, atol=1e-12))
         self.assertTrue(torch.allclose(projected_opt.state[projected.weight]["projected_exp_avg"], reference_opt.state[reference.weight]["projected_exp_avg"], atol=1e-12))
 
-    def test_linear_left_projected_grad_queues_into_sumotrack_optimizer(self):
+    def test_linear_left_projected_grad_queues_into_usuitrack_optimizer(self):
         torch.manual_seed(28)
         batch, in_features, out_features, rank = 5, 7, 4, 3
         warm_x = torch.randn(batch, in_features, dtype=torch.float64)
@@ -147,8 +147,8 @@ class ProjectedActivationTest(unittest.TestCase):
         reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected.load_state_dict(reference.state_dict())
-        reference_opt = SumoTrack([reference.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
-        projected_opt = SumoTrack([projected.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
+        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
+        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
 
         (reference(warm_x) - warm_target).square().mean().backward()
         (projected(warm_x) - warm_target).square().mean().backward()

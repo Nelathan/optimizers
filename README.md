@@ -1,8 +1,8 @@
 # Optimizers Lab
 
-This repo is currently the **SumoTrack** lab: a place to design and test a memory-efficient optimizer for high-capacity continued pretraining on consumer GPUs.
+This repo is currently the **UsuiTrack** lab: a place to design and test a memory-efficient optimizer for high-capacity continued pretraining on consumer GPUs.
 
-SumoTrack's product target is distribution adaptation under memory pressure: move a pretrained model across a real data shift without full AdamW state, slow gradient accumulation, or adapter-only capacity limits.
+UsuiTrack's product target is distribution adaptation under memory pressure: move a pretrained model across a real data shift without full AdamW state, slow gradient accumulation, or adapter-only capacity limits.
 
 ## Documentation
 
@@ -18,7 +18,7 @@ SumoTrack's product target is distribution adaptation under memory pressure: mov
 
 ## Current mainline
 
-The active optimizer class is `SumoTrack`.
+The active optimizer class is `UsuiTrack`.
 
 Current quality/diagnostic harness defaults are broad no-embedding training,
 uniform rank `64`, stable side-Gram `eigh` basis initialization, residual-facing

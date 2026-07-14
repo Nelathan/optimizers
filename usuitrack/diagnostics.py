@@ -17,9 +17,9 @@ def tensor_state_bytes(state: Mapping) -> int:
 
 
 def optimizer_state_bytes_by_category(optimizer: torch.optim.Optimizer) -> dict[str, int]:
-    """Return optimizer state bytes split by SumoTrack matrix/fallback semantics.
+    """Return optimizer state bytes split by UsuiTrack matrix/fallback semantics.
 
-    SumoTrack deliberately uses different state shapes for matrix and fallback
+    UsuiTrack deliberately uses different state shapes for matrix and fallback
     parameters. Keep the accounting coupled to those state keys so broad-scope
     experiments cannot hide full AdamW fallback state inside a single attractive
     total.

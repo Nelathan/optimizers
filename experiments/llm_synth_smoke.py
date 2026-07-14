@@ -16,8 +16,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SumoTrack, optimizer_state_bytes_by_category
-from sumotrack.projected_activation import (
+from usuitrack import UsuiTrack, optimizer_state_bytes_by_category
+from usuitrack.projected_activation import (
     OptimizerProjectedGradientSink,
     projected_activation_gated_mlp,
     projected_activation_linear,
@@ -222,7 +222,7 @@ def repair_lfm2_gradient_checkpointing(model: torch.nn.Module) -> int:
 
     wrapped = 0
     for layer in layers:
-        if getattr(layer, "_sumotrack_checkpoint_wrapped", False):
+        if getattr(layer, "_usuitrack_checkpoint_wrapped", False):
             continue
         original_forward = layer.forward
 
@@ -232,10 +232,10 @@ def repair_lfm2_gradient_checkpointing(model: torch.nn.Module) -> int:
             return __original_forward(*args, **kwargs)
 
         layer.forward = types.MethodType(checkpointed_forward, layer)
-        layer._sumotrack_checkpoint_wrapped = True
+        layer._usuitrack_checkpoint_wrapped = True
         wrapped += 1
 
-    base_model._sumotrack_checkpoint_wrapped_layers = wrapped
+    base_model._usuitrack_checkpoint_wrapped_layers = wrapped
     return wrapped
 
 
@@ -333,7 +333,7 @@ def storage_side_for_residual_axis(role: str, policy: ProjectionSidePolicy) -> s
     return "auto"
 
 
-def build_sumotrack_param_groups(
+def build_usuitrack_param_groups(
     named_params: list[tuple[str, torch.nn.Parameter]],
     rank: int,
     projection_side_policy: ProjectionSidePolicy,
@@ -424,7 +424,7 @@ def projected_activation_param_ids(model: torch.nn.Module, backend: ProjectedAct
     return ids
 
 
-def install_projected_activation_backend(model: torch.nn.Module, optimizer: SumoTrack, backend: ProjectedActivationBackend) -> int:
+def install_projected_activation_backend(model: torch.nn.Module, optimizer: UsuiTrack, backend: ProjectedActivationBackend) -> int:
     if backend == "off":
         return 0
     if backend != "lfm":  # pragma: no cover - argparse constrains this
@@ -446,7 +446,7 @@ def install_projected_activation_backend(model: torch.nn.Module, optimizer: Sumo
 
 def _make_projected_activation_linear_forward(
     linear: torch.nn.Linear,
-    optimizer: SumoTrack,
+    optimizer: UsuiTrack,
     sink: OptimizerProjectedGradientSink,
     fallback_forward: Callable[[torch.Tensor], torch.Tensor],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -462,7 +462,7 @@ def _make_projected_activation_linear_forward(
 
 def _make_projected_activation_lfm_mlp_forward(
     module: torch.nn.Module,
-    optimizer: SumoTrack,
+    optimizer: UsuiTrack,
     sink: OptimizerProjectedGradientSink,
     fallback_forward: Callable[[torch.Tensor], torch.Tensor],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -488,12 +488,12 @@ def _make_projected_activation_lfm_mlp_forward(
     return forward
 
 
-def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: SumoTrack) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: UsuiTrack) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     params = (module.w1.weight, module.w3.weight, module.w2.weight)
     bases = []
     for param in params:
         group = _optimizer_group_for_param(optimizer, param)
-        if group is None or _sumotrack_param_refresh_due(group, param):
+        if group is None or _usuitrack_param_refresh_due(group, param):
             return None
         state = optimizer.state.get(param, {})
         basis = state.get("basis")
@@ -505,9 +505,9 @@ def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: Sumo
     return bases[0], bases[1], bases[2]
 
 
-def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: SumoTrack) -> tuple[torch.Tensor, str] | None:
+def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: UsuiTrack) -> tuple[torch.Tensor, str] | None:
     group = _optimizer_group_for_param(optimizer, linear.weight)
-    if group is None or _sumotrack_param_refresh_due(group, linear.weight):
+    if group is None or _usuitrack_param_refresh_due(group, linear.weight):
         return None
     state = optimizer.state.get(linear.weight, {})
     basis = state.get("basis")
@@ -528,7 +528,7 @@ def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn
     return None
 
 
-def _sumotrack_param_refresh_due(group: dict, param: torch.nn.Parameter) -> bool:
+def _usuitrack_param_refresh_due(group: dict, param: torch.nn.Parameter) -> bool:
     step = group.get("basis_refresh_step", 0)
     interval = group.get("basis_refresh_interval", 0)
     if interval <= 0 or step <= 0:
@@ -847,7 +847,7 @@ def apply_lr_warmup(optimizer: torch.optim.Optimizer, base_lrs: Sequence[float],
 
 
 def should_compile_projected_activation(args, optimizer_name: str) -> bool:
-    return args.torch_compile and optimizer_name == "sumotrack" and args.projected_activation_backend != "off"
+    return args.torch_compile and optimizer_name == "usuitrack" and args.projected_activation_backend != "off"
 
 
 def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
@@ -886,7 +886,7 @@ def run_optimizer(
     trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
     trainable = [param for _name, param in trainable_named]
     activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend)
-    sumotrack_param_groups, policy_stats = build_sumotrack_param_groups(
+    usuitrack_param_groups, policy_stats = build_usuitrack_param_groups(
         trainable_named,
         args.rank,
         args.projection_side_policy,
@@ -898,14 +898,11 @@ def run_optimizer(
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
-    if optimizer_name == "subspace":
-        optimizer_name = "sumotrack"
-
     set_projected_activation_compile(should_compile_projected_activation(args, optimizer_name))
-    if optimizer_name == "sumotrack":
-        optimizer = SumoTrack(
-            sumotrack_param_groups,
-            lr=args.sumotrack_lr,
+    if optimizer_name == "usuitrack":
+        optimizer = UsuiTrack(
+            usuitrack_param_groups,
+            lr=args.usuitrack_lr,
             beta=args.beta,
             basis_init=args.basis_init,
             moment_mode=args.moment_mode,
@@ -926,7 +923,7 @@ def run_optimizer(
         model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name in {"adamw", "torch_adamw"}:
         if args.projected_activation_backend != "off":
-            raise RuntimeError("projected activation backend requires the sumotrack optimizer")
+            raise RuntimeError("projected activation backend requires the usuitrack optimizer")
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
         projected_activation_modules = 0
         model = maybe_compile_training_model(model, args.torch_compile)
@@ -1097,24 +1094,24 @@ def run_optimizer(
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     result = {
         "optimizer": optimizer_name,
-        "projection_side_policy": args.projection_side_policy if optimizer_name == "sumotrack" else "n/a",
-        "projected_activation_backend": args.projected_activation_backend if optimizer_name == "sumotrack" else "n/a",
-        "projected_activation_modules": projected_activation_modules if optimizer_name == "sumotrack" else 0,
-        "rank": args.rank if optimizer_name == "sumotrack" else 0,
-        "effective_rank_min": policy_stats["effective_rank_min"] if optimizer_name == "sumotrack" else 0,
-        "effective_rank_max": policy_stats["effective_rank_max"] if optimizer_name == "sumotrack" else 0,
-        "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "sumotrack" else 0,
-        "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "sumotrack" else 0,
-        "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "sumotrack" else 0,
-        "basis_init": args.basis_init if optimizer_name == "sumotrack" else "n/a",
-        "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "sumotrack" else 0,
-        "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "sumotrack" else "n/a",
+        "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
+        "projected_activation_backend": args.projected_activation_backend if optimizer_name == "usuitrack" else "n/a",
+        "projected_activation_modules": projected_activation_modules if optimizer_name == "usuitrack" else 0,
+        "rank": args.rank if optimizer_name == "usuitrack" else 0,
+        "effective_rank_min": policy_stats["effective_rank_min"] if optimizer_name == "usuitrack" else 0,
+        "effective_rank_max": policy_stats["effective_rank_max"] if optimizer_name == "usuitrack" else 0,
+        "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "usuitrack" else 0,
+        "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "usuitrack" else 0,
+        "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "usuitrack" else 0,
+        "basis_init": args.basis_init if optimizer_name == "usuitrack" else "n/a",
+        "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
+        "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
         "lr_warmup_steps": args.lr_warmup_steps,
-        "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "sumotrack" else 0,
-        "polar_ns_steps": args.polar_ns_steps if optimizer_name == "sumotrack" else 0,
-        "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "sumotrack" else 0.0,
-        "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "sumotrack" else 0.0,
-        "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "sumotrack" else False,
+        "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
+        "polar_ns_steps": args.polar_ns_steps if optimizer_name == "usuitrack" else 0,
+        "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "usuitrack" else 0.0,
+        "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "usuitrack" else 0.0,
+        "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
@@ -1173,7 +1170,7 @@ def run_optimizer(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Short pretrained-LLM SYNTH smoke for SumoTrack")
+    parser = argparse.ArgumentParser(description="Short pretrained-LLM SYNTH smoke for UsuiTrack")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"HF model name; default = {DEFAULT_MODEL}")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--target-hf-dataset", default="", help="optional Hugging Face target dataset; first parquet shard only")
@@ -1181,7 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-val-offset", type=int, default=9000, help="row offset for validation when --target-hf-dataset is used")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--retention-hf-dataset", default="", help=f"optional Hugging Face source/retention dataset; first parquet shard only, e.g. {DEFAULT_SOURCE_HF_DATASET}")
-    parser.add_argument("--optimizers", default="sumotrack", help="comma-separated: sumotrack,torch_adamw")
+    parser.add_argument("--optimizers", default="usuitrack", help="comma-separated: usuitrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=3, help="ceiling on measured optimizer steps; clamped down with a warning if the dataset can't supply this many rows")
@@ -1197,10 +1194,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--projected-activation-backend",
         choices=("off", "lfm"),
         default="off",
-        help="experimental SumoTrack-only activation-projected backward backend; lfm wraps LFM MLP and operator projection linears after basis warmup",
+        help="experimental UsuiTrack-only activation-projected backward backend; lfm wraps LFM MLP and operator projection linears after basis warmup",
     )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
-    parser.add_argument("--sumotrack-lr", type=float, default=2e-4)
+    parser.add_argument("--usuitrack-lr", type=float, default=2e-4)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.9)
@@ -1230,7 +1227,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-compile",
         action="store_true",
-        help="compile the model forward/backward and SumoTrack tensor kernels with torch.compile; the Python optimizer step remains eager",
+        help="compile the model forward/backward and UsuiTrack tensor kernels with torch.compile; the Python optimizer step remains eager",
     )
     parser.add_argument("--attn-implementation", default="sdpa", help="Transformers attention implementation; local default is sdpa until real flash kernels are available")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
@@ -1247,7 +1244,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-dirty-final-sample", action="store_true", help="allow printing target-HF samples for non-SYNTH formats; never enable for dirty/NSFW datasets")
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
-    parser.add_argument("--wandb-project", default="sumotrack")
+    parser.add_argument("--wandb-project", default="usuitrack")
     parser.add_argument("--wandb-log-every", type=int, default=5, help="log train loss and core grad/update norms every N measured steps; keep this at HALF the basis_refresh_interval or less -- logging at the refresh cadence samples basis_capture at a fixed phase of the rotation cycle and hides the post-rotation sawtooth (refresh-only metrics still land: refresh steps are a subset of log steps when this divides the interval)")
     return parser
 
@@ -1387,8 +1384,6 @@ def main() -> None:
 
     try:
         for optimizer_name in [name.strip() for name in args.optimizers.split(",") if name.strip()]:
-            if optimizer_name == "subspace":
-                optimizer_name = "sumotrack"
             result = run_optimizer(args, optimizer_name, model_name, train_texts, val_texts, retention_texts, device, wandb_run=wandb_run)
             prefix = optimizer_name
             for key, value in result.items():

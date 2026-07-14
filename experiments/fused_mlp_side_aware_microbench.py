@@ -10,7 +10,7 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack.projected_activation import (
+from usuitrack.projected_activation import (
     ProjectedActivationGradientSink,
     projected_activation_gated_mlp_side_aware,
     set_projected_activation_compile,

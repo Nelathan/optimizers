@@ -1,4 +1,4 @@
-# SumoTrack specification
+# UsuiTrack specification
 
 Current matrix-update design. Direction and unresolved questions live in
 `PLAN.md` and `SUBSPACE_TRACKING.md`; superseded evidence lives under `archive/`.
@@ -11,7 +11,7 @@ Current matrix-update design. Direction and unresolved questions live in
 - **A tangent != a position target.** Tangent integration is velocity control;
   fractional motion toward an `eigh` frame is position control.
 - **Overlap reprojection != parallel transport.** Reprojection preserves the
-  least-squares part of a fixed ambient vector. SumoTrack carries momentum with
+  least-squares part of a fixed ambient vector. UsuiTrack carries momentum with
   its moving frame, so its stored coordinates do not change at refresh.
 - **A healthy polar output can hide a sick input.** Newton--Schulz restores
   semi-orthogonal scale after weak directions have already become noise-dominated.
@@ -138,7 +138,7 @@ There is no EMA bias correction.
 
 ### 6. Transport momentum through refresh
 
-The geodesic chooses an ambient rotation `R` with `Q_+ = RQ`. SumoTrack defines
+The geodesic chooses an ambient rotation `R` with `Q_+ = RQ`. UsuiTrack defines
 momentum as moving with that frame:
 
 $$MQ^\top\mapsto MQ_+^\top\quad\text{(right)},$$
@@ -190,7 +190,7 @@ The result `O_t` is an approximate leverage-balanced polar direction, not an
 exact SVD polar factor.
 
 **Decision — projected Aurora:** Aurora chooses direction inside the retained
-update space. SumoTrack, not Aurora, owns momentum, basis motion, scale, LR, and
+update space. UsuiTrack, not Aurora, owns momentum, basis motion, scale, LR, and
 weight decay.
 
 ### 8. Scale, lift, and update

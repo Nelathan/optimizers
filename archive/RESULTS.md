@@ -1,4 +1,4 @@
-# SumoTrack Results
+# UsuiTrack Results
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
@@ -10,7 +10,7 @@ Question: can one fused side-aware projected gated-MLP primitive (gate/up storag
 
 Setup:
 
-- New `_ProjectedActivationGatedMlpSideAware` in `sumotrack/projected_activation.py`, wired into the optional-compile kernel mechanism. Saves `x` plus two `[T, rank]` projected inputs; recomputes `gate_pre`/`up`/`hidden` in backward with scheduled frees.
+- New `_ProjectedActivationGatedMlpSideAware` in `usuitrack/projected_activation.py`, wired into the optional-compile kernel mechanism. Saves `x` plus two `[T, rank]` projected inputs; recomputes `gate_pre`/`up`/`hidden` in backward with scheduled frees.
 - fp64 equality tests prove all three sink-emitted projected grads match `full_dW @ Q.T` (gate/up) and `P.T @ full_dW` (down) and that `grad_input` is exact; saved-tensor test proves no `[T, intermediate]` retention. Full suite 80/80.
 - Standalone CUDA bf16 microbench (`experiments/fused_mlp_side_aware_microbench.py`), LFM2.5-350M MLP dims (`hidden=1024`, `intermediate=6656`), local 4070 SUPER. Contestants: eager full-grad-then-project (mainline cost today), the same under `torch.compile` (the bar), and the fused primitive with compiled backward tensors. 10 warmup / 50 timed iterations, profiler kernel counts.
 
@@ -42,8 +42,8 @@ Setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, stable `eigh`,
 
 Implementation tested:
 
-- Moved harness model compilation until after SumoTrack optimizer creation and projected-activation backend installation, so Dynamo sees the wrapped forward path as the initial program while parameter identity remains stable. Later audit found this still compiled only the outer CausalLM wrapper for the CCE loss path; CCE unwraps to the inner base model plus `lm_head`, so these early compile rows did **not** prove the transformer hot path was compiled.
-- Added `set_projected_activation_compile(enabled)` in `sumotrack/projected_activation.py`. When `--torch-compile` and projected activation are both enabled, only pure tensor helper functions inside the custom backward paths are compiled; the Python side-channel that queues projected gradients into SumoTrack remains outside Dynamo.
+- Moved harness model compilation until after UsuiTrack optimizer creation and projected-activation backend installation, so Dynamo sees the wrapped forward path as the initial program while parameter identity remains stable. Later audit found this still compiled only the outer CausalLM wrapper for the CCE loss path; CCE unwraps to the inner base model plus `lm_head`, so these early compile rows did **not** prove the transformer hot path was compiled.
+- Added `set_projected_activation_compile(enabled)` in `usuitrack/projected_activation.py`. When `--torch-compile` and projected activation are both enabled, only pure tensor helper functions inside the custom backward paths are compiled; the Python side-channel that queues projected gradients into UsuiTrack remains outside Dynamo.
 - The harness now compiles the inner training base model for CCE-style models and uses PyTorch functional AdamW for fallback parameters; fused functional AdamW is used only for fp32 CUDA fallback tensors because PyTorch rejects the mixed bf16-param/fp32-state fused case.
 
 Valid smokes:
@@ -61,7 +61,7 @@ Valid smokes:
 Interpretation:
 
 - Projected activation's eager slowdown was not inherent at this small smoke scale. Compiling the pure tensor math inside the custom backward path changed the `bs4` lane from smaller-but-slower to smaller-and-faster, and the sequential `bs8` comparison preserved a modest speed win while cutting allocated peak materially.
-- Compile-after-install was the right harness ordering cleanup, but by itself did not improve throughput. Later audit found the CCE training loss bypassed the compiled outer wrapper, so the early speed signal came from compiled projected-activation backward helpers and SumoTrack tensor kernels, not from compiling the transformer base path.
+- Compile-after-install was the right harness ordering cleanup, but by itself did not improve throughput. Later audit found the CCE training loss bypassed the compiled outer wrapper, so the early speed signal came from compiled projected-activation backward helpers and UsuiTrack tensor kernels, not from compiling the transformer base path.
 - Reserved CUDA memory can rise with the compiled `lfm` path even while allocated peak falls; use allocated peak for the activation-storage claim and keep reserved memory visible for allocator/compile pressure.
 - A first `bs8` comparison was accidentally run in parallel on the same GPU and is invalid. Only the sequential `bs8` rows above should be used.
 - This was enough to keep projected activation as an active performance/library-design lead, but not enough to make it a default quality lane.
@@ -86,7 +86,7 @@ Rank256 interpretation:
 Follow-up design cleanup:
 
 - A clean speed smoke with fixed train-only timing and true CCE hot-path compile showed full all-right `lfm` projected activation at rank256 `bs16 × seq1024` was not a speed path: `13,888 tok/s`, `1.179724s/step`, peak `3,198,173,696` versus matched residual-facing `off` control at `19,369 tok/s`, `0.845878s/step`, peak `2,873,162,240`. This invalidates the earlier hope that full activation-facing wrappers were merely missing compile coverage.
-- The implementation was therefore cut back toward the intended portable primitive: generic side-aware projected `Linear`, right-side by default when rules do not say otherwise, but using the actual SumoTrack basis side when installed by the harness. Right side emits `full_grad @ Q.T` via saved projected activations; left side emits `P.T @ full_grad` by projecting `grad_out` inside custom backward. This preserves residual-facing geometry without a late full-gradient hook path.
+- The implementation was therefore cut back toward the intended portable primitive: generic side-aware projected `Linear`, right-side by default when rules do not say otherwise, but using the actual UsuiTrack basis side when installed by the harness. Right side emits `full_grad @ Q.T` via saved projected activations; left side emits `P.T @ full_grad` by projecting `grad_out` inside custom backward. This preserves residual-facing geometry without a late full-gradient hook path.
 - The LFM fused MLP primitive remains right-only/all-right. Under residual-facing policy it falls back rather than pretending to support mixed right/right/left MLP geometry. Side-aware fused MLP is a separate future primitive if the generic `Linear` path earns more work.
 - A tiny liveness smoke after this cleanup (`rank64`, `bs4 × seq1024`, repaired checkpointing, CCE hot-path compile, `--projected-activation-backend lfm`, validation skipped) ran with residual-facing side counts restored (`left=32/right=50/auto=10`), `15,072 tok/s`, `0.271756s/step`, peak `1,598,120,960`. Treat this as a wrapper-contract smoke, not a benchmark.
 - The generic side-aware per-Linear route did **not** earn more performance work. At rank256 with true CCE hot-path compile, repaired checkpointing, LR warmup `50`, validation skipped, and residual-facing side counts (`left=32/right=50/auto=10`), matched `bs64 × seq1024` smokes with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` were decisive: `off` ran `20,089 tok/s`, `3.262229s/step`, peak `8,422,493,184`; side-aware `lfm` ran `14,564 tok/s`, `4.499743s/step`, peak `9,557,816,320`. A default-allocator `off` attempt OOMed from fragmentation while `lfm` fit, but the fair allocator retry removed that apparent capacity win. End this try: side-aware Linear is a correctness/design primitive, not the speed path.
@@ -166,21 +166,21 @@ Interpretation:
 
 ## 2026-06-30: Projected-activation LFM backend moves peak VRAM
 
-Question: after parameter hooks failed to reduce real peak memory, can lower-level custom autograd paths for LFM operator projection Linears compute activation-facing projected weight gradients before full `dW` exists, while still feeding SumoTrack's projected-moment/Aurora update path?
+Question: after parameter hooks failed to reduce real peak memory, can lower-level custom autograd paths for LFM operator projection Linears compute activation-facing projected weight gradients before full `dW` exists, while still feeding UsuiTrack's projected-moment/Aurora update path?
 
 Implementation tested:
 
-- Added a transient SumoTrack projected-gradient queue: `queue_projected_grad(param, projected_grad)`. Queued grads are not `Parameter.grad`, are not serialized optimizer state, are cleared by `zero_grad()`, and are rejected before basis initialization or on refresh steps because basis init/refresh still needs full matrix gradients.
+- Added a transient UsuiTrack projected-gradient queue: `queue_projected_grad(param, projected_grad)`. Queued grads are not `Parameter.grad`, are not serialized optimizer state, are cleared by `zero_grad()`, and are rejected before basis initialization or on refresh steps because basis init/refresh still needs full matrix gradients.
 - Added custom projected-activation Linear and fused SwiGLU/LFM MLP autograd paths. They run the full-rank forward, compute exact input gradients, emit projected weight gradients into a side-channel, and leave captured weight `.grad` as `None` on projected steps.
 - Added an opt-in harness backend, now named `--projected-activation-backend lfm`. It finds LFM-style MLP modules with `w1`, `w3`, and `w2` Linear children, forces those weights to storage-right/activation-facing bases, and monkeypatches the MLP forward. It also wraps LFM standard-attention projection Linears (`q_proj`, `k_proj`, `v_proj`, `out_proj`) and short-conv operator projection Linears (`in_proj`, `out_proj`) with projected-activation Linear backward. FA/SDPA and causal-conv kernels remain untouched; only their Linear boundaries change backward behavior. The backend falls back to the original full-gradient forward until bases are initialized and on refresh-due params.
-- Corrected the fused MLP to use separate gate/up input bases, because real SumoTrack tracks one basis per weight.
+- Corrected the fused MLP to use separate gate/up input bases, because real UsuiTrack tracks one basis per weight.
 - Added opt-in `--basis-refresh-schedule layer-staggered` after the first survival run exposed burst refresh as the new peak. This keeps default burst behavior unchanged, but assigns transformer-layer phase offsets so only one layer's MLP fallback needs full gradients at a time.
 - Changed the fused projected MLP backward to stop saving full `gate_pre` and `up` activations from forward. It now saves projected activations plus the MLP input, recomputes the two gated Linear outputs in backward, and schedules the recompute so `up` is not materialized until the gate path needs it.
 - Repaired LFM2 activation checkpointing in the harness. Transformers exposes `gradient_checkpointing_enable()` for LFM2 and sets the model flag, but `Lfm2Model.forward()` calls decoder layers directly and never routes through `_gradient_checkpointing_func`. The harness now narrowly wraps LFM2 decoder layers with non-reentrant `torch.utils.checkpoint.checkpoint()` when activation checkpointing is requested.
 
 Validation before LFM smoke:
 
-- Tiny projected-gradient queue tests prove equality against the ordinary full-gradient SumoTrack step after a warm basis initialization, and loud failure before basis init / on refresh.
+- Tiny projected-gradient queue tests prove equality against the ordinary full-gradient UsuiTrack step after a warm basis initialization, and loud failure before basis init / on refresh.
 - Tiny projected-activation tests prove projected grads equal `project(full_gradient)` for Linear and fused gated MLP, while input grads match ordinary autograd.
 - Tiny harness tests prove the LFM wrapper falls back before basis init and then queues projected grads once bases are ready, for fused MLPs, standard-attention projection Linears, and short-conv projection Linears. The short-conv convolution kernel itself remains ordinary full-gradient/fallback.
 - Extended harness math tests now compare the installed LFM MLP, standard-attention Linear, and short-conv projection wrappers against a reference model's ordinary full weight gradients projected by each optimizer-stored right-side basis. These pass, so the wrapper arithmetic matches `full_grad @ Qᵀ`.
@@ -211,7 +211,7 @@ One-forward/backward monitor at `bs8 × seq1024`, full `lfm` backend, one warm b
 | stock HF checkpoint flag | `4,420,781,056` | `4,781,892,608` | `28,573,696` | `128,512` | LFM2 flag set but decoder layers still called directly |
 | repaired decoder-layer checkpoint | `1,094,175,744` | `1,692,342,272` | `28,573,696` | `128,512` | harness-local LFM2 repair; artifacts in `/tmp/opencode/projected_activation_monitor_bs8_checkpoint_repaired_timeline/` |
 
-Quality controls after the memory smokes exposed two harness-contract traps. First, the old faithful rank-ablation lane explicitly used `--sumotrack-lr 2e-4`; the parser still defaulted to `0.0025`. Early full-`lfm` quality runs that omitted LR were therefore overdriven and are not evidence against activation projection. The harness default is now corrected to `2e-4`. Second, LFM2's advertised activation checkpointing was not actually engaged by Transformers' model code. Early checkpointed numbers were geometry sanity checks, not evidence about real checkpointed memory. After the harness repair, checkpointing is again a practical substrate to measure: it stores layer boundaries and recomputes internals, while projected activation still prevents full projection-weight `dW` materialization and keeps queued projected gradients small.
+Quality controls after the memory smokes exposed two harness-contract traps. First, the old faithful rank-ablation lane explicitly used `--usuitrack-lr 2e-4`; the parser still defaulted to `0.0025`. Early full-`lfm` quality runs that omitted LR were therefore overdriven and are not evidence against activation projection. The harness default is now corrected to `2e-4`. Second, LFM2's advertised activation checkpointing was not actually engaged by Transformers' model code. Early checkpointed numbers were geometry sanity checks, not evidence about real checkpointed memory. After the harness repair, checkpointing is again a practical substrate to measure: it stores layer boundaries and recomputes internals, while projected activation still prevents full projection-weight `dW` materialization and keeps queued projected gradients small.
 
 At corrected LR on the `bs8 × seq1024` checkpointed continuity lane, the no-projection baseline still reproduces the old rank-ablation shape:
 
@@ -277,9 +277,9 @@ Next leads:
 
 ## 2026-06-30: Backward-hook projected gradients did not reduce LFM peak VRAM
 
-Question: can parameter backward hooks project matrix gradients during backward so full `.grad` buffers do not persist, reducing SumoTrack peak VRAM without changing the optimizer update?
+Question: can parameter backward hooks project matrix gradients during backward so full `.grad` buffers do not persist, reducing UsuiTrack peak VRAM without changing the optimizer update?
 
-Implementation tested: an experimental hook path projected 2D parameter gradients into the existing SumoTrack basis, stored them as `state[p]["projected_grad"]`, zeroed the full hook gradient in-place, and cleared `p.grad` after leaf accumulation. Tiny linear equivalence tests passed for left and right projection sides against `project(full_gradient)`, and refresh/uninitialized steps correctly fell back to full gradients because basis updates still need the full matrix gradient.
+Implementation tested: an experimental hook path projected 2D parameter gradients into the existing UsuiTrack basis, stored them as `state[p]["projected_grad"]`, zeroed the full hook gradient in-place, and cleared `p.grad` after leaf accumulation. Tiny linear equivalence tests passed for left and right projection sides against `project(full_gradient)`, and refresh/uninitialized steps correctly fell back to full gradients because basis updates still need the full matrix gradient.
 
 LFM setup: `LiquidAI/LFM2.5-350M-Base`, bf16, SDPA, broad no embeddings, residual-facing projection, rank 64. A warm basis-forming step used the ordinary full-gradient path; the next backward compared ordinary full gradients against hook-projected gradients.
 
@@ -301,17 +301,17 @@ Question: after rank 64 became the boring default, does increasing or decreasing
 
 Harness change: final validation can now print one qualitative target-eval sample. Sampling defaults are `temperature=0.6`, `top_k=20`, `top_p=0.95`, no `min_p`, and max prompt+generated length `4096`. This path is guarded for dirty HF target formats; non-SYNTH HF target samples require an explicit override and were not printed for Sugar Quill.
 
-Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask SYNTH batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `sumotrack_lr=2e-4`, `basis_refresh_interval=100`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`. Training prints target/source eval every 100 measured steps, so each run exposes whether progress is smooth or stalled.
+Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask SYNTH batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `usuitrack_lr=2e-4`, `basis_refresh_interval=100`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`. Training prints target/source eval every 100 measured steps, so each run exposes whether progress is smooth or stalled.
 
 Runs:
 
 | rank | wandb | target val loss | source val loss | state bytes | peak allocated CUDA | step sec | tok/s |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 | https://wandb.ai/pink-marker/sumotrack/runs/ddshpeov | `2.300731 → 1.828967` | `2.899438 → 3.027462` | `12,507,136` | `9,840,612,864` | `0.418382` | `19,580` |
-| 32 | https://wandb.ai/pink-marker/sumotrack/runs/n68iwyi2 | `2.300731 → 1.804122` | `2.899438 → 3.019680` | `24,500,224` | `9,852,605,952` | `0.417277` | `19,632` |
-| 64 | https://wandb.ai/pink-marker/sumotrack/runs/kkmk57jz | `2.300731 → 1.778049` | `2.899438 → 3.014893` | `48,486,400` | `9,876,592,128` | `0.424949` | `19,278` |
-| 128 | https://wandb.ai/pink-marker/sumotrack/runs/milti2cv | `2.300731 → 1.750586` | `2.899438 → 3.010585` | `96,458,752` | `9,924,564,480` | `0.435693` | `18,802` |
-| 256 | https://wandb.ai/pink-marker/sumotrack/runs/cxy82wsx | `2.300731 → 1.722463` | `2.899438 → 3.012350` | `192,403,456` | `10,020,509,184` | `0.467022` | `17,541` |
+| 16 | https://wandb.ai/pink-marker/usuitrack/runs/ddshpeov | `2.300731 → 1.828967` | `2.899438 → 3.027462` | `12,507,136` | `9,840,612,864` | `0.418382` | `19,580` |
+| 32 | https://wandb.ai/pink-marker/usuitrack/runs/n68iwyi2 | `2.300731 → 1.804122` | `2.899438 → 3.019680` | `24,500,224` | `9,852,605,952` | `0.417277` | `19,632` |
+| 64 | https://wandb.ai/pink-marker/usuitrack/runs/kkmk57jz | `2.300731 → 1.778049` | `2.899438 → 3.014893` | `48,486,400` | `9,876,592,128` | `0.424949` | `19,278` |
+| 128 | https://wandb.ai/pink-marker/usuitrack/runs/milti2cv | `2.300731 → 1.750586` | `2.899438 → 3.010585` | `96,458,752` | `9,924,564,480` | `0.435693` | `18,802` |
+| 256 | https://wandb.ai/pink-marker/usuitrack/runs/cxy82wsx | `2.300731 → 1.722463` | `2.899438 → 3.012350` | `192,403,456` | `10,020,509,184` | `0.467022` | `17,541` |
 
 Interpretation:
 
@@ -334,17 +334,17 @@ Harness changes used for this run:
 - Temporarily added `--first-step-grad-accum-steps` to affect only the first optimizer step / basis-forming gradient estimate, not normal training-time gradient accumulation. After these near-null results, that flag was removed rather than kept as an undead knob.
 - Cleared CUDA cache after initial validation before training. The first `bs8`/`4×` attempt OOMed before useful training when desktop/browser VRAM pressure was present; retry with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` completed.
 
-Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `sumotrack_lr=2e-4`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`.
+Shared setup: `LiquidAI/LFM2.5-350M-Base`, broad no embeddings, rank 64, residual-facing side, stable `eigh`, Aurora `pp=2/ns=5`, CCE, SDPA, faithful right-padded no-mask batches, `batch_size=8`, `seq_len=1024`, activation checkpointing, `usuitrack_lr=2e-4`, `measure_steps=1000`, `eval_every=100`, source sensor `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled:data/train-00000-of-00100.parquet`.
 
 Runs:
 
 | target | first-step accum | refresh | wandb | supervised tokens/update | target val loss | source val loss | mean basis rotation | mean update/param |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | SYNTH | 1 | 100 | previous baseline `8yn89vj9` | 6399 | `2.300731 → 1.776949` | `2.899437 → 3.010900` | n/a in old table | `0.000227` |
-| SYNTH | 4 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/goiyjzg9 | 6399 | `2.300731 → 1.775587` | `2.899438 → 3.012776` | `0.149512` | `0.000213` |
-| SYNTH | 4 | 20 | https://wandb.ai/pink-marker/sumotrack/runs/5w6v7125 | 6399 | `2.300731 → 1.774600` | `2.899438 → 3.011622` | `0.123417` | `0.000225` |
-| Sugar Quill | 1 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/74ymlx78 | 5656 | `3.277249 → 3.183513` | `2.899438 → 2.940904` | `0.148967` | `0.000224` |
-| Sugar Quill | 4 | 100 | https://wandb.ai/pink-marker/sumotrack/runs/onduo46m | 5656 | `3.277249 → 3.182505` | `2.899438 → 2.942369` | `0.151005` | `0.000221` |
+| SYNTH | 4 | 100 | https://wandb.ai/pink-marker/usuitrack/runs/goiyjzg9 | 6399 | `2.300731 → 1.775587` | `2.899438 → 3.012776` | `0.149512` | `0.000213` |
+| SYNTH | 4 | 20 | https://wandb.ai/pink-marker/usuitrack/runs/5w6v7125 | 6399 | `2.300731 → 1.774600` | `2.899438 → 3.011622` | `0.123417` | `0.000225` |
+| Sugar Quill | 1 | 100 | https://wandb.ai/pink-marker/usuitrack/runs/74ymlx78 | 5656 | `3.277249 → 3.183513` | `2.899438 → 2.940904` | `0.148967` | `0.000224` |
+| Sugar Quill | 4 | 100 | https://wandb.ai/pink-marker/usuitrack/runs/onduo46m | 5656 | `3.277249 → 3.182505` | `2.899438 → 2.942369` | `0.151005` | `0.000221` |
 
 Interpretation:
 
@@ -358,7 +358,7 @@ Interpretation:
 
 Question: can we use `torch.compile` without compiling Python optimizer bookkeeping, and is basis refresh telemetry worth keeping in routine wandb runs?
 
-Compile result: compiling the whole `optimizer.step()` failed before measured training because Dynamo specialized on `Parameter` object identity through the fallback path and HeavyBall fused Adam internals. The viable cut is targeted compile: compile the model forward/backward and SumoTrack's pure tensor orthogonalization kernel, while leaving Python optimizer state/bookkeeping eager. A 2-step smoke and a 100-step smoke both passed with `--torch-compile`, SDPA, faithful SYNTH batches, activation checkpointing, and LR `2e-4`; no quality claim is attached to those smokes.
+Compile result: compiling the whole `optimizer.step()` failed before measured training because Dynamo specialized on `Parameter` object identity through the fallback path and HeavyBall fused Adam internals. The viable cut is targeted compile: compile the model forward/backward and UsuiTrack's pure tensor orthogonalization kernel, while leaving Python optimizer state/bookkeeping eager. A 2-step smoke and a 100-step smoke both passed with `--torch-compile`, SDPA, faithful SYNTH batches, activation checkpointing, and LR `2e-4`; no quality claim is attached to those smokes.
 
 Basis telemetry result: the 250-step and accidental uncompiled 1k telemetry runs both showed the same shape. Basis-capture before/after refresh was essentially flat (`~+3e-4`), so capture did not explain the run and is not useful routine telemetry. Chordal basis rotation is the remaining useful sensor: it is cheap enough to keep because it runs only at cadence/refresh and computes an SVD on the rank×rank basis overlap, not on model-sized matrices. In the 1k run, mean chordal rotation was lower than the 250-step probe (`~0.148` vs `~0.176`), so there is no current evidence that basis motion is exploding or that more frequent refresh is needed.
 
@@ -372,7 +372,7 @@ Question: at the same total supervised-token budget, does `grad_accum=2` improve
 
 Setup matched the `2e-4`, `bs8 + activation_checkpointing`, `pp=2/ns=5`, SDPA, faithful SYNTH baseline except `grad_accum_steps=2`, `measure_steps=500`, and `eval_every=50`. The `eval_every=50` choice aligned validation by token budget but made the wandb step-axis visually non-comparable to the 1000-step baseline; future same-token comparisons should keep `eval_every=100` for wandb consistency and compare token budget explicitly.
 
-Run: https://wandb.ai/pink-marker/sumotrack/runs/eahca2ey
+Run: https://wandb.ai/pink-marker/usuitrack/runs/eahca2ey
 
 | run | optimizer steps | supervised tokens/update | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -389,7 +389,7 @@ Shared setup:
 
 - Model: `LiquidAI/LFM2.5-350M-Base`.
 - Source sensor: first parquet shard from `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (`data/train-00000-of-00100.parquet`).
-- Faithful SYNTH right-padded no-mask batches, CCE, broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, `basis_refresh_interval=100`, `batch_size=8`, `seq_len=1024`, activation checkpointing, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`, `sumotrack_lr=2e-4`.
+- Faithful SYNTH right-padded no-mask batches, CCE, broad no embeddings, rank 64, residual-facing side policy, stable `eigh` basis init, `basis_refresh_interval=100`, `batch_size=8`, `seq_len=1024`, activation checkpointing, `warmup_steps=1`, `measure_steps=1000`, `eval_every=100`, `usuitrack_lr=2e-4`.
 - Local attention contract: `attn_implementation=sdpa`. An earlier attempted run without pinning the local SDPA contract OOMed before training and is not optimizer evidence.
 - Actual supervised tokens/update: `6399`; sequence tokens/update: `8192`; optimizer state bytes: `48,486,400`; peak allocated CUDA: `9,878,730,240`.
 
@@ -397,11 +397,11 @@ Runs:
 
 | Aurora pp | NS steps | wandb | target val loss | source val loss | last train loss | mean update norm | update/param | step sec |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 5 | https://wandb.ai/pink-marker/sumotrack/runs/8yn89vj9 | `2.300731 → 1.776949` (`-0.523782`) | `2.899437 → 3.010900` (`+0.111462`) | `1.816579` | `0.056273` | `0.000227` | `0.663540` |
-| 1 | 1 | https://wandb.ai/pink-marker/sumotrack/runs/6vlwt7ef | `2.300731 → 1.826631` (`-0.474100`) | `2.899438 → 3.018623` (`+0.119185`) | `1.868589` | `0.052900` | `0.000214` | `0.651163` |
-| 1 | 2 | https://wandb.ai/pink-marker/sumotrack/runs/tldgmkm9 | `2.300731 → 1.789151` (`-0.511580`) | `2.899438 → 3.000318` (`+0.100880`) | `1.829834` | `0.056128` | `0.000227` | `0.618963` |
-| 1 | 3 | https://wandb.ai/pink-marker/sumotrack/runs/lkptzi0s | `2.300731 → 1.802733` (`-0.497998`) | `2.899438 → 3.015043` (`+0.115605`) | `1.843152` | `0.054630` | `0.000221` | `0.475700` |
-| 1 | 5 | https://wandb.ai/pink-marker/sumotrack/runs/24m68537 | `2.300731 → 1.779830` (`-0.520901`) | `2.899438 → 3.009695` (`+0.110257`) | `1.821850` | `0.056691` | `0.000229` | `0.431666` |
+| 2 | 5 | https://wandb.ai/pink-marker/usuitrack/runs/8yn89vj9 | `2.300731 → 1.776949` (`-0.523782`) | `2.899437 → 3.010900` (`+0.111462`) | `1.816579` | `0.056273` | `0.000227` | `0.663540` |
+| 1 | 1 | https://wandb.ai/pink-marker/usuitrack/runs/6vlwt7ef | `2.300731 → 1.826631` (`-0.474100`) | `2.899438 → 3.018623` (`+0.119185`) | `1.868589` | `0.052900` | `0.000214` | `0.651163` |
+| 1 | 2 | https://wandb.ai/pink-marker/usuitrack/runs/tldgmkm9 | `2.300731 → 1.789151` (`-0.511580`) | `2.899438 → 3.000318` (`+0.100880`) | `1.829834` | `0.056128` | `0.000227` | `0.618963` |
+| 1 | 3 | https://wandb.ai/pink-marker/usuitrack/runs/lkptzi0s | `2.300731 → 1.802733` (`-0.497998`) | `2.899438 → 3.015043` (`+0.115605`) | `1.843152` | `0.054630` | `0.000221` | `0.475700` |
+| 1 | 5 | https://wandb.ai/pink-marker/usuitrack/runs/24m68537 | `2.300731 → 1.779830` (`-0.520901`) | `2.899438 → 3.009695` (`+0.110257`) | `1.821850` | `0.056691` | `0.000229` | `0.431666` |
 
 Interpretation:
 
@@ -413,7 +413,7 @@ Interpretation:
 
 ## 2026-06-24: Faithful SYNTH LR knee sweep
 
-Question: under the faithful `bs8 + activation_checkpointing` diagnostic lane, where is the useful SumoTrack LR/update-scale knee? SumoTrack already applies Muon-style scaling, so do not assume it needs Muon's larger raw LR priors.
+Question: under the faithful `bs8 + activation_checkpointing` diagnostic lane, where is the useful UsuiTrack LR/update-scale knee? UsuiTrack already applies Muon-style scaling, so do not assume it needs Muon's larger raw LR priors.
 
 Shared setup:
 
@@ -430,8 +430,8 @@ uv run python experiments/llm_synth_smoke.py \
   --measure-steps 1000 \
   --eval-every 100 \
   --activation-checkpointing \
-  --sumotrack-lr <lr> \
-  --wandb-run sumotrack-350m-faithful-bs8-checkpoint-lr-<lr>-1k \
+  --usuitrack-lr <lr> \
+  --wandb-run usuitrack-350m-faithful-bs8-checkpoint-lr-<lr>-1k \
   --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
 ```
 
@@ -439,11 +439,11 @@ Runs:
 
 | LR | wandb | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `1e-5` | https://wandb.ai/pink-marker/sumotrack/runs/ppo5piwj | `2.300632 → 2.099905` (`-0.200727`) | `2.899438 → 2.911166` (`+0.011728`) | `2.179358` | `11.277402` | `0.015174` | `0.000061` |
-| `3e-5` | https://wandb.ai/pink-marker/sumotrack/runs/wuvt5f7h | `2.300728 → 1.977568` (`-0.323160`) | `2.899438 → 2.943315` (`+0.043877`) | `2.041459` | `10.295789` | `0.023435` | `0.000095` |
-| `1e-4` | https://wandb.ai/pink-marker/sumotrack/runs/58s0amuo | `2.300731 → 1.844126` (`-0.456605`) | `2.899406 → 2.999864` (`+0.100457`) | `1.891413` | `9.731564` | `0.039362` | `0.000159` |
-| `3e-4` | https://wandb.ai/pink-marker/sumotrack/runs/2m9eq5r4 | `2.300731 → 1.749390` (`-0.551341`) | `2.899438 → 3.020600` (`+0.121162`) | `1.786439` | `9.280159` | `0.070321` | `0.000284` |
-| `1e-3` | https://wandb.ai/pink-marker/sumotrack/runs/k9olzza0 | `2.300731 → 1.779225` (`-0.521506`) | `2.899438 → 3.167889` (`+0.268451`) | `1.787664` | `8.282332` | `0.165576` | `0.000669` |
+| `1e-5` | https://wandb.ai/pink-marker/usuitrack/runs/ppo5piwj | `2.300632 → 2.099905` (`-0.200727`) | `2.899438 → 2.911166` (`+0.011728`) | `2.179358` | `11.277402` | `0.015174` | `0.000061` |
+| `3e-5` | https://wandb.ai/pink-marker/usuitrack/runs/wuvt5f7h | `2.300728 → 1.977568` (`-0.323160`) | `2.899438 → 2.943315` (`+0.043877`) | `2.041459` | `10.295789` | `0.023435` | `0.000095` |
+| `1e-4` | https://wandb.ai/pink-marker/usuitrack/runs/58s0amuo | `2.300731 → 1.844126` (`-0.456605`) | `2.899406 → 2.999864` (`+0.100457`) | `1.891413` | `9.731564` | `0.039362` | `0.000159` |
+| `3e-4` | https://wandb.ai/pink-marker/usuitrack/runs/2m9eq5r4 | `2.300731 → 1.749390` (`-0.551341`) | `2.899438 → 3.020600` (`+0.121162`) | `1.786439` | `9.280159` | `0.070321` | `0.000284` |
+| `1e-3` | https://wandb.ai/pink-marker/usuitrack/runs/k9olzza0 | `2.300731 → 1.779225` (`-0.521506`) | `2.899438 → 3.167889` (`+0.268451`) | `1.787664` | `8.282332` | `0.165576` | `0.000669` |
 
 Interpretation:
 
@@ -471,23 +471,23 @@ Runs:
 
 | run | wandb | supervised tokens/update | target val loss | source val loss | last train loss | mean grad norm | mean update norm | update/param | step sec | peak allocated |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `bs4`, refresh 20 | https://wandb.ai/pink-marker/sumotrack/runs/5ol91981 | 3340 | `2.226388 → 2.196474` | `2.875980 → 3.593040` | `2.172782` | `10.574589` | `0.354263` | `0.001426` | `0.223883` | `5,311,750,144` |
-| `bs8`, checkpoint, refresh 100 | https://wandb.ai/pink-marker/sumotrack/runs/se1ggkj0 | 6399 | `2.300725 → 2.024565` | `2.899438 → 3.508711` | `2.015278` | `7.305237` | `0.354651` | `0.001428` | `0.448283` | `9,878,730,240` |
-| `bs8`, checkpoint, refresh 20 | https://wandb.ai/pink-marker/sumotrack/runs/38z9bjca | 6399 | `2.300731 → 2.022594` | `2.899438 → 3.519228` | `2.003851` | `7.168745` | `0.355365` | `0.001431` | `0.464087` | `9,878,730,240` |
+| `bs4`, refresh 20 | https://wandb.ai/pink-marker/usuitrack/runs/5ol91981 | 3340 | `2.226388 → 2.196474` | `2.875980 → 3.593040` | `2.172782` | `10.574589` | `0.354263` | `0.001426` | `0.223883` | `5,311,750,144` |
+| `bs8`, checkpoint, refresh 100 | https://wandb.ai/pink-marker/usuitrack/runs/se1ggkj0 | 6399 | `2.300725 → 2.024565` | `2.899438 → 3.508711` | `2.015278` | `7.305237` | `0.354651` | `0.001428` | `0.448283` | `9,878,730,240` |
+| `bs8`, checkpoint, refresh 20 | https://wandb.ai/pink-marker/usuitrack/runs/38z9bjca | 6399 | `2.300731 → 2.022594` | `2.899438 → 3.519228` | `2.003851` | `7.168745` | `0.355365` | `0.001431` | `0.464087` | `9,878,730,240` |
 
 Interpretation:
 
 - `bs4 + refresh20` did not rescue the faithful lane. It made only small target progress and the source sensor rose hard. Frequent basis refresh at low token mass is not the obvious main fix.
 - `bs8 + activation checkpointing` is the useful improvement. More supervised tokens/update gave better train loss and much better target validation movement, with slightly less source damage than `bs4 + refresh20`.
 - Adding frequent refresh on top of `bs8 + checkpointing` was essentially indifferent: target was almost identical, source was slightly worse, and step time rose. Leave `basis_refresh_interval=100` as the boring default until a more targeted tracking metric proves otherwise.
-- Update magnitude was strikingly stable across runs: update norm around `0.354-0.355`, update/param around `0.00143`. The better `bs8` curve therefore looks like better signal going into the same update scale, not a quieter optimizer. That update scale is not obviously wrong in isolation and may be in the normal LoRA-training ballpark; the question is empirical target/source tradeoff. Because SumoTrack already applies Muon-style scaling, do not assume it needs Muon's larger raw LR priors. An earlier short faithful `2e-4` probe had update norm around `0.075` and source nearly flat, so a 1k `bs8 + checkpointing` LR/update-scale sweep across roughly `1e-5` to `1e-3` is the next clean cut, not because `0.35` is proven bad, but because the source curve needs a scale response.
+- Update magnitude was strikingly stable across runs: update norm around `0.354-0.355`, update/param around `0.00143`. The better `bs8` curve therefore looks like better signal going into the same update scale, not a quieter optimizer. That update scale is not obviously wrong in isolation and may be in the normal LoRA-training ballpark; the question is empirical target/source tradeoff. Because UsuiTrack already applies Muon-style scaling, do not assume it needs Muon's larger raw LR priors. An earlier short faithful `2e-4` probe had update norm around `0.075` and source nearly flat, so a 1k `bs8 + checkpointing` LR/update-scale sweep across roughly `1e-5` to `1e-3` is the next clean cut, not because `0.35` is proven bad, but because the source curve needs a scale response.
 - Checkpointing allowed `batch_size=8`, and the larger token mass clearly improved the signal, but it did not create enough headroom for another clean batch-size rung. PyTorch allocated peak was about `9.88 GB` and driver-visible reserved VRAM was observed near the card limit, so `batch_size=16` is not a free next move on this card. If `bs16`-equivalent signal is needed, the honest routes are grad accumulation or deeper memory cuts, not simply more checkpointing. Future memory reports need both allocated and reserved peaks.
 
 ## 2026-06-24: Stable side-Gram EIGH basis init
 
-Question: is full SVD necessary for SumoTrack's one-sided basis initialization, or can side-Gram `eigh` be the default without cargo-culting SVD as a correctness rail?
+Question: is full SVD necessary for UsuiTrack's one-sided basis initialization, or can side-Gram `eigh` be the default without cargo-culting SVD as a correctness rail?
 
-Answer: full SVD is unnecessary for the current projector contract. SumoTrack only needs one dominant side subspace: right basis from top eigenvectors of `GᵀG`, left basis from top eigenvectors of `GGᵀ`. The implemented default now uses stable `eigh`: fp32 finite check, Frobenius normalization, symmetric Gram, and trace-scaled jitter retry only if the eigensolve backend fails. Random init remains an explicit ablation/stress path; `svd` is no longer an accepted basis-init method.
+Answer: full SVD is unnecessary for the current projector contract. UsuiTrack only needs one dominant side subspace: right basis from top eigenvectors of `GᵀG`, left basis from top eigenvectors of `GGᵀ`. The implemented default now uses stable `eigh`: fp32 finite check, Frobenius normalization, symmetric Gram, and trace-scaled jitter retry only if the eigensolve backend fails. Random init remains an explicit ablation/stress path; `svd` is no longer an accepted basis-init method.
 
 Empirical basis probe on a faithful-format LFM-350M first-step gradient, all 92 matrix tensors:
 
@@ -521,7 +521,7 @@ Validation: `uv run python -m unittest discover -s tests` passed 50 tests.
 
 Status after later input-format audit: **not interpretable as retention evidence**. Keep this entry as a harness/plumbing record for periodic target/source eval and wandb logging, not as evidence that source behavior was preserved.
 
-Question: after the 1k Aurora target-only win, does current SumoTrack make target SYNTH progress while avoiding obvious base-model sandblasting on a broad text-completion source sensor?
+Question: after the 1k Aurora target-only win, does current UsuiTrack make target SYNTH progress while avoiding obvious base-model sandblasting on a broad text-completion source sensor?
 
 Source sensor:
 
@@ -543,14 +543,14 @@ uv run python experiments/llm_synth_smoke.py \
   --measure-steps 200 \
   --eval-every 25 \
   --log-grad-norm \
-  --wandb-run sumotrack-350m-source-mix-200 \
+  --wandb-run usuitrack-350m-source-mix-200 \
   --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
 ```
 
 - Model: `LiquidAI/LFM2.5-350M-Base`.
 - Tokens/update: `8192` (`batch_size=8`, `seq_len=1024`, no grad accumulation).
 - Defaults at the time: broad no embeddings, rank 64, residual-facing side policy, SVD basis init, Aurora, CCE, packed no-mask batches. Current code now defaults basis init to stable `eigh`.
-- Wandb: `https://wandb.ai/pink-marker/sumotrack/runs/0spqj89v`.
+- Wandb: `https://wandb.ai/pink-marker/usuitrack/runs/0spqj89v`.
 
 | metric | initial | final | delta |
 | --- | ---: | ---: | ---: |
@@ -571,12 +571,12 @@ uv run python experiments/llm_synth_smoke.py \
   --measure-steps 200 \
   --eval-every 25 \
   --log-grad-norm \
-  --wandb-run sumotrack-1p2b-source-mix-200-b2 \
+  --wandb-run usuitrack-1p2b-source-mix-200-b2 \
   --retention-hf-dataset HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
 ```
 
 - Tokens/update: `2048` (`batch_size=2`, `seq_len=1024`, no grad accumulation).
-- Wandb: `https://wandb.ai/pink-marker/sumotrack/runs/z35dj5dg`.
+- Wandb: `https://wandb.ai/pink-marker/usuitrack/runs/z35dj5dg`.
 
 | metric | initial | final | delta |
 | --- | ---: | ---: | ---: |
@@ -589,7 +589,7 @@ Interpretation:
 
 - Both models reduced loss on the current SYNTH stream and the source-mix completion loss also improved, but this should not be read as useful target progress or retention signal after the input-format audit. The safest interpretation is adaptation to a mismatched training stream.
 - Later inspection of decoded packed blocks showed the current SYNTH stream can begin with raw query/reasoning/answer text and no visible BOS, EOS, or divider inside the first 1024-token block. The harness appends EOS after rows, but long rows can push that boundary outside the block. Basic document separators and conscious BOS/EOS/label-masking policy are missing.
-- Therefore the honest claim is only: periodic target/source eval plumbing works and wandb logging works. The run does not answer whether SumoTrack preserves source behavior under faithful continued-pretraining formatting.
+- Therefore the honest claim is only: periodic target/source eval plumbing works and wandb logging works. The run does not answer whether UsuiTrack preserves source behavior under faithful continued-pretraining formatting.
 - The next algorithmic comparison should wait until formatting and gradient-scale probes are corrected. Relevant later comparisons remain SUMO/Muon-style and SubTrack/GaLore-style baselines, not full AdamW as the main opponent. AdamW destruction at medium/high LR is unsurprising and not the sharp question.
 
 ## 2026-06-13: LFM/SYNTH matrix-path smoke
@@ -603,7 +603,7 @@ Setup:
 - Excluded: 134,219,776 embedding/lm-head params and 61,440 tiny 3D conv params.
 - Sequence/batch: `--seq-len 192 --batch-size 1`.
 - Timing: `--warmup-steps 1 --measure-steps 3`; reported step time excludes warmup and first basis initialization.
-- Optimizer path: `SumoTrack`, Grassmann refresh, no torch compile.
+- Optimizer path: `UsuiTrack`, Grassmann refresh, no torch compile.
 
 Random-init rank sweep:
 
@@ -648,9 +648,9 @@ Results:
 
 | optimizer | lr | state bytes | peak CUDA bytes | initial val | final val | mean train | step seconds |
 | --- | ---: | ----------: | --------------: | ----------: | --------: | ---------: | -----------: |
-| SumoTrack, SVD ortho | 0.001 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.800248 | 2.192415 | 1.981366 |
-| SumoTrack, SVD ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.701340 | 2.046949 | 1.976006 |
-| SumoTrack, SVD ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 2.625968 | 2.397669 | 1.980586 |
+| UsuiTrack, SVD ortho | 0.001 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.800248 | 2.192415 | 1.981366 |
+| UsuiTrack, SVD ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.701340 | 2.046949 | 1.976006 |
+| UsuiTrack, SVD ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 2.625968 | 2.397669 | 1.980586 |
 | Projected momentum, no ortho | 0.0025 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.975293 | 2.309294 | 1.865864 |
 | Projected momentum, no ortho | 0.01 | 88,866,816 | 5,035,031,040 | 2.345853 | 1.815476 | 2.182461 | 1.866572 |
 | torch AdamW quality anchor | 0.00002 | 4,143,972,720 | 9,097,523,712 | 2.345853 | 1.655455 | 1.962064 | 0.200987 |
@@ -675,7 +675,7 @@ Setup:
 - Steps: 1 warmup + 40 measured optimizer steps.
 - Tokens/update: 1536 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=8`).
 - Validation texts: 16.
-- Norm logging: enabled. `update_norm` is the actual `SumoTrack` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
+- Norm logging: enabled. `update_norm` is the actual `UsuiTrack` update vector norm after LR scaling, excluding decoupled weight decay; weight decay was `0` for these runs. AdamW-style generic update norms are intentionally not computed because cloning/streaming 1B params would distort the memory/perf story.
 
 Representative command shape at the time:
 
@@ -754,7 +754,7 @@ Notes:
 
 ## 2026-06-14: Broad no-embedding LFM/SYNTH quality smoke
 
-Question: does rank-64 broad-scope `SumoTrack` preserve the state-memory story and keep useful movement when real model topology adds fallback tensors, or was the positive matrix-only signal too narrow?
+Question: does rank-64 broad-scope `UsuiTrack` preserve the state-memory story and keep useful movement when real model topology adds fallback tensors, or was the positive matrix-only signal too narrow?
 
 Setup:
 
@@ -765,29 +765,29 @@ Setup:
 - Steps: 1 warmup + 20 measured optimizer steps.
 - Tokens/update: 768 (`seq_len=192`, `batch_size=1`, `grad_accum_steps=4`).
 - Validation texts: 8.
-- Norm logging: enabled for `SumoTrack` runs.
+- Norm logging: enabled for `UsuiTrack` runs.
 
 Results:
 
 | optimizer | ortho | lr | state bytes | matrix/fallback state bytes | peak CUDA bytes | final val | mean train | mean update/param | step seconds |
 | --- | --- | ---: | ----------: | ---: | --------------: | --------: | ---------: | ----------------: | -----------: |
-| SumoTrack | HeavyBall NS + Muon scale | 0.0025 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.734250 | 2.072461 | 0.001181 | 0.323579 |
-| SumoTrack | HeavyBall NS + Muon scale | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.793099 | 2.168231 | 0.002193 | 0.326059 |
-| SumoTrack | none | 0.04 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 7.085179 | 7.481242 | 0.010982 | 0.285293 |
-| SumoTrack | none | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.811141 | 2.219735 | 0.001681 | 0.284458 |
+| UsuiTrack | HeavyBall NS + Muon scale | 0.0025 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.734250 | 2.072461 | 0.001181 | 0.323579 |
+| UsuiTrack | HeavyBall NS + Muon scale | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.793099 | 2.168231 | 0.002193 | 0.326059 |
+| UsuiTrack | none | 0.04 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 7.085179 | 7.481242 | 0.010982 | 0.285293 |
+| UsuiTrack | none | 0.005 | 89,888,768 | 88,866,816 / 1,021,952 | 5,067,364,864 | 1.811141 | 2.219735 | 0.001681 | 0.284458 |
 | torch AdamW | n/a | 0.00002 | 4,144,483,912 | n/a / 4,144,483,912 | 9,129,377,280 | 1.512150 | 1.927465 | n/a | 0.203278 |
 
 Notes:
 
-- Broad topology preserved the SumoTrack state-memory story: fallback state was ~1.0 MB and did not dominate the ~89.9 MB total.
-- Orthogonalized SumoTrack stayed numerically stable at LR `0.0025` and `0.005`, but `0.005` looked too hot on this short run.
+- Broad topology preserved the UsuiTrack state-memory story: fallback state was ~1.0 MB and did not dominate the ~89.9 MB total.
+- Orthogonalized UsuiTrack stayed numerically stable at LR `0.0025` and `0.005`, but `0.005` looked too hot on this short run.
 - The no-ortho matrix-only LR prior did not transfer. LR `0.04` was an obvious broad-topology failure, not a noisy loss comparison. LR `0.005` was stable but still worse than orthogonalized LR `0.0025`.
-- AdamW remains materially better in this short quality anchor, but it used about 46x SumoTrack optimizer state and much higher peak CUDA. That is the intended product tension, not a contradiction.
+- AdamW remains materially better in this short quality anchor, but it used about 46x UsuiTrack optimizer state and much higher peak CUDA. That is the intended product tension, not a contradiction.
 - Next useful gate is a longer broad run centered on orthogonalized LR `0.0025`, with a lower no-ortho bracket and possibly SVD init as a quality-initialization comparison. Continuing should be falsified if the AdamW quality gap fails to narrow with more steps/tokens or if no-ortho catches up after a fair broad LR tune.
 
 ## 2026-06-14: Aurora and two-sided projected geometry check
 
-Question: should SumoTrack's projected orthogonalization remain one-sided rectangular HeavyBall NS, use Aurora-style leverage-uniform rectangular polar, or move to a two-sided square-core projection?
+Question: should UsuiTrack's projected orthogonalization remain one-sided rectangular HeavyBall NS, use Aurora-style leverage-uniform rectangular polar, or move to a two-sided square-core projection?
 
 Setup:
 
@@ -868,7 +868,7 @@ Notes:
 - Packed batches omit `attention_mask`, so the harness keeps SDPA flash eligibility instead of falling back to padded-mask behavior.
 - The CCE path works in this harness shape with random basis init.
 - On this tiny-token smoke, lowering Aurora preconditioning / Newton-Schulz cycles was a big throughput win with no visible memory change. That is optimizer-side overhead amortization, not a quality claim.
-- Historical note: exact SVD basis initialization was the cold-start tax at the time of this smoke and OOMed at the same packed shape on the local card. Current SumoTrack defaults to stable side-Gram `eigh`, so rerun throughput-path fit/perf claims before carrying this old random-init workaround forward.
+- Historical note: exact SVD basis initialization was the cold-start tax at the time of this smoke and OOMed at the same packed shape on the local card. Current UsuiTrack defaults to stable side-Gram `eigh`, so rerun throughput-path fit/perf claims before carrying this old random-init workaround forward.
 - Follow-up packed smoke at `seq_len=512`, `batch_size=2` (1024 tokens/step, random init, HF loss) sharpened the cycle story: default `2/5` cycles OOMed on this card, while reduced `1/3` cycles fit and ran at `5701 tok/s` with `5.27 GB` peak CUDA. Cycle count is therefore not just a micro-optimization at this shape; it can be the difference between fit and no fit.
 - These throughput numbers were taken without `causal-conv1d`; the environment fell back to LFM2's Torch `Conv1d` short-conv path because no Triton/`causal-conv1d` package was installed.
 
@@ -982,7 +982,7 @@ Notes:
 - The clean no-mask CCE route works and reports `attn_implementation=sdpa`.
 - The practical no-grad-accum ceiling at `seq_len=1024` is `batch_size=8` / `8192` tokens per optimizer step on the current card state.
 - OOMs happen during the model forward MLP path before optimizer state matters. Activation checkpointing did not rescue `batch_size=16`, consistent with a forward temporary/activation wall rather than a backward-only saved-activation wall.
-- SumoTrack state is ~48.5 MB total at this 350M broad-no-embeddings topology: ~48.0 MB matrix state and ~0.5 MB fallback state.
+- UsuiTrack state is ~48.5 MB total at this 350M broad-no-embeddings topology: ~48.0 MB matrix state and ~0.5 MB fallback state.
 
 ## 2026-07-10 — C1 tangent accumulation arc (implement, calibrate, stress, verdict)
 

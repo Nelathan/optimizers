@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sumotrack import ProjectionSide, SubspaceProjector
+from usuitrack import ProjectionSide, SubspaceProjector
 
 
 class SubspaceProjectorTest(unittest.TestCase):
@@ -189,7 +189,7 @@ class SubspaceProjectorTest(unittest.TestCase):
 
     @staticmethod
     def _canon_basis(projector: SubspaceProjector) -> torch.Tensor:
-        from sumotrack.projector import ProjectionSide
+        from usuitrack.projector import ProjectionSide
 
         basis = projector.basis
         return basis.mT if projector._basis_side() is ProjectionSide.RIGHT else basis

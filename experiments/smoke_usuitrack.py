@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SumoTrack
+from usuitrack import UsuiTrack
 
 
 def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
@@ -36,8 +36,8 @@ def train(optimizer_name: str) -> tuple[float, float, int]:
     )
     x, y = make_problem()
 
-    if optimizer_name == "sumotrack":
-        optimizer = SumoTrack(model.parameters(), lr=0.01, rank=4, beta=0.9, basis_refresh_interval=1)
+    if optimizer_name == "usuitrack":
+        optimizer = UsuiTrack(model.parameters(), lr=0.01, rank=4, beta=0.9, basis_refresh_interval=1)
     elif optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     else:  # pragma: no cover - local script guard
@@ -55,18 +55,18 @@ def train(optimizer_name: str) -> tuple[float, float, int]:
 
 
 def main() -> None:
-    sumo_initial, sumo_final, sumo_state_bytes = train("sumotrack")
+    usui_initial, usui_final, usui_state_bytes = train("usuitrack")
     adam_initial, adam_final, adam_state_bytes = train("adamw")
-    print(f"sumotrack_initial_loss={sumo_initial:.6f}")
-    print(f"sumotrack_final_loss={sumo_final:.6f}")
+    print(f"usuitrack_initial_loss={usui_initial:.6f}")
+    print(f"usuitrack_final_loss={usui_final:.6f}")
     print(f"adamw_initial_loss={adam_initial:.6f}")
     print(f"adamw_final_loss={adam_final:.6f}")
-    print(f"sumotrack_state_bytes={sumo_state_bytes}")
+    print(f"usuitrack_state_bytes={usui_state_bytes}")
     print(f"adamw_state_bytes={adam_state_bytes}")
-    if not sumo_final < sumo_initial:
-        raise SystemExit("SumoTrack smoke failed: loss did not descend")
-    if not sumo_state_bytes < adam_state_bytes:
-        raise SystemExit("SumoTrack smoke failed: state bytes were not below AdamW")
+    if not usui_final < usui_initial:
+        raise SystemExit("UsuiTrack smoke failed: loss did not descend")
+    if not usui_state_bytes < adam_state_bytes:
+        raise SystemExit("UsuiTrack smoke failed: state bytes were not below AdamW")
 
 
 if __name__ == "__main__":

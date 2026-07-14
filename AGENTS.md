@@ -9,20 +9,18 @@ This file is the operating contract for agents working in this repo.
 ## Naming lineage
 
 - **FlashTrack** was the originating idea and early name.
-- **SumoTrack** is the current implementation identity: the `sumotrack` package,
-  `SumoTrack` class, existing commands, and pre-migration references use it.
-- **UsuiTrack** is the destination public identity for the current design. New
-  conceptual documentation should use UsuiTrack except when naming the literal
-  implementation/API that still says SumoTrack.
+- **UsuiTrack** is the current implementation identity: the `usuitrack` package,
+  `UsuiTrack` class, and commands.
+- **SumoTrack** was the immediately preceding implementation identity. Its
+  package, API, CLI, and documentation references were migrated to UsuiTrack.
 - These names describe one evolving optimizer line, not three competing
   algorithms. Do not infer a semantic distinction from the rename; `SPEC.md`
   remains authoritative for the actual design.
 
 ## Repo purpose
 
-This repo is the UsuiTrack lab, currently implemented under the SumoTrack code
-name: a place to design and test a memory-efficient optimizer for high-capacity
-continued pretraining on consumer GPUs.
+This repo is the UsuiTrack lab: a place to design and test a memory-efficient
+optimizer for high-capacity continued pretraining on consumer GPUs.
 
 The product target is usable distribution adaptation under memory pressure: move a pretrained model across a real data shift without full AdamW state, slow gradient accumulation, or adapter-only capacity limits. The near-term hardware target is a single RTX 5090-class machine training Gemma 4 12B-class models with high tokens per step.
 
@@ -77,8 +75,8 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 
 ## Current optimizer invariants
 
-- Destination public optimizer name: **UsuiTrack**; the code/API remains
-  `SumoTrack` until the explicit rename migration.
+- Public optimizer name, package, and API: **UsuiTrack** / `usuitrack` /
+  `UsuiTrack`.
 - Matrix params do not store full-size first moments.
 - Matrix params do not store full-size second moments in the main path.
 - Non-2D params use boring fallback semantics or are frozen by task policy.
@@ -151,7 +149,7 @@ Build on `../HeavyBall` directly. Use it as the primary optimizer substrate for 
 
 Do not fork HeavyBall unless explicitly asked. Do not vendor HeavyBall internals. Do not add a submodule casually.
 
-Aurora is a projected direction map inside SumoTrack, not a wholesale optimizer replacement: SumoTrack owns momentum, basis tracking, scaling, LR, fallback semantics, and accounting.
+Aurora is a projected direction map inside UsuiTrack, not a wholesale optimizer replacement: UsuiTrack owns momentum, basis tracking, scaling, LR, fallback semantics, and accounting.
 
 ## Validation expectations
 
@@ -171,7 +169,7 @@ while it runs; the harness notifies on completion.
 
 Useful checks include projector shape/orthonormality, state-dict restart, bf16 behavior, optimizer state accounting, loss curves, peak VRAM, step time, tokens/sec, and retention curves.
 
-For gradient-scale investigations, separate raw model gradients from optimizer-produced updates. Raw `.grad` norms are measured before Aurora, orthogonalization, Muon scaling, or `optimizer.step()`. If raw norms are surprising, compare against another model before blaming SumoTrack. Then measure update norm and update/param ratio to decide whether scary gradients are merely a thermometer reading or an optimizer scaling bug.
+For gradient-scale investigations, separate raw model gradients from optimizer-produced updates. Raw `.grad` norms are measured before Aurora, orthogonalization, Muon scaling, or `optimizer.step()`. If raw norms are surprising, compare against another model before blaming UsuiTrack. Then measure update norm and update/param ratio to decide whether scary gradients are merely a thermometer reading or an optimizer scaling bug.
 
 Do not report optimizer work as done because code imports or a smoke run descends. Optimizers fail silently and convincingly. If validation cannot be run, say exactly what remains unverified.
 

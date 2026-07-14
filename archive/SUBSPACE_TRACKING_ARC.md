@@ -1,6 +1,6 @@
 # Subspace Tracking Sidequest
 
-Deep-dive companion to `PLAN.md`. Scope: how SumoTrack's projection basis is
+Deep-dive companion to `PLAN.md`. Scope: how UsuiTrack's projection basis is
 refreshed over training — the Grassmann geodesic tracker, what we fixed, what we
 measured, and the masterplan for making tracking actually *earn* its place. This
 started as "audit basis-update fidelity vs SubTrack" and grew large enough to
@@ -14,7 +14,7 @@ already crossed so we don't re-derive it.
 
 ## Why this exists
 
-The projection basis decides *which* subspace of each gradient SumoTrack keeps.
+The projection basis decides *which* subspace of each gradient UsuiTrack keeps.
 Init picks a basis once (side-Gram `eigh`); tracking rotates it over time so it
 follows the moving gradient signal instead of going stale (LoRA-style adapter
 saturation is the analogy). SubTrack's `track_the_subspace` is the reference
@@ -123,7 +123,7 @@ Two bugs sat on top of each other; fixing one exposed the other. Both are fixed.
 - *Open — `step_size = 5` is the PERSISTED-BUT-TEMPORARY default.* It was tuned
   against the *inflated/normalized* σ scale; σ is now ~10× smaller and annealing, so
   5 is **not recalibrated** for the fixed regime. It is persisted as the default in
-  both `SumoTrack(grassmann_step_size=5.0)` and the harness `--grassmann-step-size`
+  both `UsuiTrack(grassmann_step_size=5.0)` and the harness `--grassmann-step-size`
   because it is the best current estimate and beats the old placeholder `1e4` — but
   it is explicitly a placeholder, marked `# TEMPORARY` in code. **Recalibrate on the
   fixed/clipped code before trusting any result that depends on it.** (Feeds
@@ -914,13 +914,13 @@ There are two different contracts which must not be conflated:
   correct; the component outside the new subspace is necessarily discarded.
 - **Moving-fiber momentum semantics:** momentum belongs to the selected rank-r
   manifold and follows that manifold by the geodesic's canonical (horizontal)
-  lift. Identity coordinates are exact parallel transport. This is SumoTrack's
+  lift. Identity coordinates are exact parallel transport. This is UsuiTrack's
   contract: Aurora acts on the projected manifold, full steps make its direction
   rather than its pre-polar magnitude load-bearing, and the basis update itself
   declares how that manifold moved.
 
 The second contract is not derivable from the first; it is a modeling choice.
-It is nevertheless the coherent choice for SumoTrack, and the observed
+It is nevertheless the coherent choice for UsuiTrack, and the observed
 alignment/loss improvement is evidence in the same direction. There is no more
 accurate transport to implement for the chosen geodesic: any extra overlap,
 projection, or renormalization would cease to be parallel transport. A future
@@ -1352,8 +1352,8 @@ Anything else belongs in the question ledger as curiosity, not in the optimizer.
 - SubTrack source: `../SubTrack/low_rank_torch/low_rank_projector.py`
   (`track_the_subspace` at ~line 140, `rank_k_matrix_estimation` at ~line 261,
   the accumulation dispatch at ~line 106–131).
-- Our implementation: `sumotrack/projector.py::update_grassmann`.
-- Diagnostics plumbing: `sumotrack/optimizer.py` (`_refresh_projector`,
+- Our implementation: `usuitrack/projector.py::update_grassmann`.
+- Diagnostics plumbing: `usuitrack/optimizer.py` (`_refresh_projector`,
   `_accumulate_basis_diagnostics`, `_new_diagnostics`, `_finalize_diagnostics`)
   and `experiments/llm_synth_smoke.py` (`optimizer_rotation_angle`, per-step
   logging, summary fields). Note: the basis-motion diagnostic is now the raw

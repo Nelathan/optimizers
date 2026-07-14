@@ -4,9 +4,9 @@ import unittest
 
 import torch
 
-from sumotrack import SumoTrack
+from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_sumotrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params
 from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -18,7 +18,7 @@ def assert_param_membership(test_case, param, params, expected: bool) -> None:
         test_case.assertFalse(present)
 
 
-def expected_projected_grad(opt: SumoTrack, param: torch.nn.Parameter, full_grad: torch.Tensor) -> torch.Tensor:
+def expected_projected_grad(opt: UsuiTrack, param: torch.nn.Parameter, full_grad: torch.Tensor) -> torch.Tensor:
     state = opt.state[param]
     basis = state["basis"]
     if state.get("projection_side_is_right", False):
@@ -107,7 +107,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.batching, "synth_right_padded_no_mask")
         self.assertEqual(args.rank, 64)
         self.assertEqual(args.projection_side_policy, "residual-facing")
-        self.assertEqual(args.sumotrack_lr, 2e-4)
+        self.assertEqual(args.usuitrack_lr, 2e-4)
         self.assertEqual(args.lr_warmup_steps, 50)
         self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.basis_refresh_schedule, "burst")
@@ -192,7 +192,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             ("model.layers.0.self_attn.q_proj.weight", q),
         ]
 
-        groups, stats = build_sumotrack_param_groups(
+        groups, stats = build_usuitrack_param_groups(
             named,
             rank=4,
             projection_side_policy="residual-facing",
@@ -215,7 +215,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             ("model.layers.0.self_attn.q_proj.weight", q),
         ]
 
-        groups, stats = build_sumotrack_param_groups(
+        groups, stats = build_usuitrack_param_groups(
             named,
             rank=4,
             projection_side_policy="right",
@@ -233,7 +233,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             ("model.layers.0.feed_forward.w2.weight", down),
         ]
 
-        groups, stats = build_sumotrack_param_groups(
+        groups, stats = build_usuitrack_param_groups(
             named,
             rank=4,
             projection_side_policy="residual-facing",
@@ -254,7 +254,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             ("model.layers.5.feed_forward.w3.weight", second),
         ]
 
-        groups, _stats = build_sumotrack_param_groups(
+        groups, _stats = build_usuitrack_param_groups(
             named,
             rank=4,
             projection_side_policy="right",
@@ -272,7 +272,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
 
         self.assertEqual(wrapped, 2)
         self.assertEqual(repair_lfm2_gradient_checkpointing(model), 0)
-        self.assertTrue(all(getattr(layer, "_sumotrack_checkpoint_wrapped", False) for layer in model.model.layers))
+        self.assertTrue(all(getattr(layer, "_usuitrack_checkpoint_wrapped", False) for layer in model.model.layers))
 
         x = torch.randn(4, requires_grad=True)
         y = model.model.layers[0](x).sum()
@@ -294,13 +294,13 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         model.feed_forward = TinyLfmMlp()
         named = list(model.named_parameters())
         activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_sumotrack_param_groups(
+        groups, _stats = build_usuitrack_param_groups(
             named,
             rank=2,
             projection_side_policy="right",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema")
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema")
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 
@@ -336,13 +336,13 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         model.feed_forward = TinyLfmMlp()
         named = list(model.named_parameters())
         activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_sumotrack_param_groups(
+        groups, _stats = build_usuitrack_param_groups(
             named,
             rank=2,
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
         install_projected_activation_backend(model, opt, "lfm")
         x = torch.randn(3, 5, 4, dtype=torch.float64)
 
@@ -364,13 +364,13 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         model.self_attn = TinyLfmAttention()
         named = list(model.named_parameters())
         activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_sumotrack_param_groups(
+        groups, _stats = build_usuitrack_param_groups(
             named,
             rank=2,
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 
@@ -400,13 +400,13 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         model.conv = TinyLfmShortConv()
         named = list(model.named_parameters())
         activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_sumotrack_param_groups(
+        groups, _stats = build_usuitrack_param_groups(
             named,
             rank=2,
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = SumoTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 
@@ -437,7 +437,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         second = torch.nn.Parameter(torch.randn(16, 4))
         named = [("a.up_proj.weight", first), ("b.up_proj.weight", second)]
 
-        groups, stats = build_sumotrack_param_groups(
+        groups, stats = build_usuitrack_param_groups(
             named,
             rank=8,
             projection_side_policy="auto",
@@ -451,7 +451,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         named = [("a.up_proj.weight", torch.nn.Parameter(torch.randn(16, 4)))]
 
         with self.assertRaises(ValueError):
-            build_sumotrack_param_groups(named, rank=0, projection_side_policy="residual-facing")
+            build_usuitrack_param_groups(named, rank=0, projection_side_policy="residual-facing")
 
     def test_packed_batches_omit_attention_mask_for_sdpa_flash_path(self):
         class TokenizerStub:

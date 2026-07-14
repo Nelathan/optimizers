@@ -1,8 +1,8 @@
 # Projected activation backward
 
-This is the design and experiment record for SumoTrack's projected-activation backward path.
+This is the design and experiment record for UsuiTrack's projected-activation backward path.
 
-The goal is not merely to save some VRAM. The goal is to replace the dominant full activation storage needed for matrix weight-gradient formation with small projected activations, then fold loss gradients onto those small tensors during backward while feeding SumoTrack's projected-moment/Aurora update path.
+The goal is not merely to save some VRAM. The goal is to replace the dominant full activation storage needed for matrix weight-gradient formation with small projected activations, then fold loss gradients onto those small tensors during backward while feeding UsuiTrack's projected-moment/Aurora update path.
 
 Checkpointing remains an empirical tool and may still be part of a practical implementation for some blocks, but it is not the product story by itself. A checkpointed run can validate projected-gradient geometry and, when actually wired, can be the right substrate for avoiding depth-wise activation buildup. It does not by itself prove that every useful full activation has been replaced by a projected save.
 
@@ -13,7 +13,7 @@ The original idea lived in `Activation_projection.md`. Its useful content is fol
 The durable values from the pitch are:
 
 - **Single-GPU full-parameter adaptation.** The target is full-parameter training under consumer-GPU memory pressure, not LoRA/adapters that permanently constrain forward capacity.
-- **Activation storage is the wall.** Optimizer state matters, but after SumoTrack's projected moments the dominant obstacle is full activation storage and backward temporaries scaling with `batch × sequence × depth × feature`.
+- **Activation storage is the wall.** Optimizer state matters, but after UsuiTrack's projected moments the dominant obstacle is full activation storage and backward temporaries scaling with `batch × sequence × depth × feature`.
 - **Full-rank forward stays sacred.** The forward model should not be low-rank bottlenecked. Projection is for optimizer/update state and weight-gradient formation, not for reducing model expressivity.
 - **Store small when it replaces large.** Projected activations are valuable when they replace a full activation that would otherwise need to survive from forward to backward for matrix weight-gradient formation.
 - **Checkpointing is a tool, not the thesis.** Normal checkpointing may still be best for some blocks if it stores a single block/layer boundary activation and recomputes internals while projected saves reduce `dW` materialization. It becomes a dead end only when projected saves are redundant with full recompute and do not buy meaningful memory.
@@ -24,22 +24,22 @@ Important parts of the original pitch are now superseded by implementation evide
 
 - Basis init is stable side-Gram `eigh`, not random init or SVD.
 - Refresh smoothing is layer-staggered phase offsets for peak control, not general round-robin optimizer activity.
-- Projected gradients are queued into SumoTrack's optimizer side channel, not expanded or injected into full `.grad` slots.
+- Projected gradients are queued into UsuiTrack's optimizer side channel, not expanded or injected into full `.grad` slots.
 - The generic projected `Linear` primitive is now side-aware: storage-right projection saves projected activations; storage-left projection forms projected loss-gradient contractions in custom backward. Residual-facing remains the optimizer-quality geometry. All-right/activation-facing was a measured tradeoff, not a default.
 
 ## Current status
 
 The current root implementation is in:
 
-- `sumotrack/projected_activation.py`
-- `sumotrack/optimizer.py`
+- `usuitrack/projected_activation.py`
+- `usuitrack/optimizer.py`
 - `experiments/llm_synth_smoke.py`
 - `tests/test_projected_activation.py`
 - `tests/test_llm_harness.py`
 
 What is now implemented:
 
-- explicit SumoTrack projected-gradient queue via `SumoTrack.queue_projected_grad(param, projected_grad)`;
+- explicit UsuiTrack projected-gradient queue via `UsuiTrack.queue_projected_grad(param, projected_grad)`;
 - generic side-aware projected `Linear` autograd path;
 - fused projected LFM/SwiGLU MLP autograd path for all-right/activation-facing bases;
 - opt-in harness backend `--projected-activation-backend lfm`;
@@ -53,7 +53,7 @@ What is now implemented:
 - true CCE hot-path compile targeting: the harness compiles the inner base model that CCE actually calls, not just the outer CausalLM wrapper.
 - harness-local LFM2 decoder-layer checkpoint repair, because the Transformers LFM2 model advertises gradient checkpointing but does not call `_gradient_checkpointing_func` in `Lfm2Model.forward()`.
 
-Default training remains no activation projection unless explicitly requested. As of the repaired-checkpoint runs, projected activation is best understood as a performance/library-design sidequest rather than the main optimizer-quality lane. The first full `lfm` path was mathematically faithful to one-sided activation-facing projection and saved memory at rank64 pressure points, but activation-facing/storage-right geometry is not the residual-facing quality default. The current cleanup restores residual-facing side policy for wrapped params and makes the generic `Linear` projected-gradient path side-aware. Right side remains the actual activation-save path; left side preserves residual-facing geometry by projecting `grad_out` in custom backward and avoiding full `weight.grad`, but it does not have the same activation-storage economics. Fused LFM MLP remains right-only until a side-aware fused primitive is written. The current mainline remains repaired checkpointing plus residual-facing SumoTrack; projected activation is opt-in.
+Default training remains no activation projection unless explicitly requested. As of the repaired-checkpoint runs, projected activation is best understood as a performance/library-design sidequest rather than the main optimizer-quality lane. The first full `lfm` path was mathematically faithful to one-sided activation-facing projection and saved memory at rank64 pressure points, but activation-facing/storage-right geometry is not the residual-facing quality default. The current cleanup restores residual-facing side policy for wrapped params and makes the generic `Linear` projected-gradient path side-aware. Right side remains the actual activation-save path; left side preserves residual-facing geometry by projecting `grad_out` in custom backward and avoiding full `weight.grad`, but it does not have the same activation-storage economics. Fused LFM MLP remains right-only until a side-aware fused primitive is written. The current mainline remains repaired checkpointing plus residual-facing UsuiTrack; projected activation is opt-in.
 
 ## Core coordinate fact
 
@@ -79,7 +79,7 @@ This matches `P.T @ full_dW` without returning a full `weight.grad`. It preserve
 
 Right side matches residual-facing for MLP up/gate and attention q/k/v. Left side matches residual-facing for MLP down and attention output. The old all-right `lfm` activation projection changed side geometry for down/out tensors.
 
-The corrected-LR all-right control showed this geometry change is real but not a basic backward-math bug: full `lfm` activation projection and ordinary no-projection all-right SumoTrack were nearly identical at the 100-step quality sensor.
+The corrected-LR all-right control showed this geometry change is real but not a basic backward-math bug: full `lfm` activation projection and ordinary no-projection all-right UsuiTrack were nearly identical at the 100-step quality sensor.
 
 ## Proven gates
 
@@ -97,13 +97,13 @@ The projected `Linear` path:
 - returns exact `grad_input` and optional bias grad;
 - leaves captured `weight.grad` as `None` on projected steps.
 
-Tiny tests prove equality to ordinary full-gradient projection on both storage sides: `full_grad @ Q.T` for right bases and `P.T @ full_grad` for left bases. Optimizer-ingress tests prove both sides drive the same SumoTrack update as ordinary full-gradient projection after basis initialization.
+Tiny tests prove equality to ordinary full-gradient projection on both storage sides: `full_grad @ Q.T` for right bases and `P.T @ full_grad` for left bases. Optimizer-ingress tests prove both sides drive the same UsuiTrack update as ordinary full-gradient projection after basis initialization.
 
 ### Optimizer ingress works
 
-`SumoTrack.queue_projected_grad()` accepts already-projected matrix gradients for initialized, non-refresh params. It is transient optimizer-side state, cleared by `zero_grad()`, not serialized, and rejected before basis init or on refresh steps.
+`UsuiTrack.queue_projected_grad()` accepts already-projected matrix gradients for initialized, non-refresh params. It is transient optimizer-side state, cleared by `zero_grad()`, not serialized, and rejected before basis init or on refresh steps.
 
-Queued projected-gradient steps match ordinary full-gradient SumoTrack steps after warm basis init.
+Queued projected-gradient steps match ordinary full-gradient UsuiTrack steps after warm basis init.
 
 ### Fused MLP math works
 
@@ -163,7 +163,7 @@ Before MLP recompute, the comparable full `lfm` 200-step no-checkpoint peak was 
 
 ## Quality and geometry controls
 
-The old faithful rank-ablation lane used `--sumotrack-lr 2e-4`. A stale parser default `0.0025` caused false catastrophic quality runs by overdriving update norms. The harness default is now corrected to `2e-4`.
+The old faithful rank-ablation lane used `--usuitrack-lr 2e-4`. A stale parser default `0.0025` caused false catastrophic quality runs by overdriving update norms. The harness default is now corrected to `2e-4`.
 
 Corrected-LR checkpointed 100-step controls:
 
@@ -222,13 +222,13 @@ Matched repaired-checkpoint controls clarify the incremental value of projected 
 | all-right `off` | `1.861207 / 3.005637` | `2,072,345,088` | `0.524142` | same geometry as activation projection, no custom projected backward |
 | full `lfm` projected activation | `1.861770 / 3.004450` | `1,797,460,480` | `0.570883` | same quality shape as all-right, `~275 MB` lower peak, slower eager wrappers |
 
-This is the current honest boundary: projected activation is faithful and still saves memory on top of real checkpointing, but the giant win was fixing checkpointing itself. The next decision is whether the extra `~275 MB` at `bs8×seq1024` and possible larger-shape headroom justify optimizing wrapper overhead, or whether the product path should lean on repaired checkpointing plus SumoTrack state savings first.
+This is the current honest boundary: projected activation is faithful and still saves memory on top of real checkpointing, but the giant win was fixing checkpointing itself. The next decision is whether the extra `~275 MB` at `bs8×seq1024` and possible larger-shape headroom justify optimizing wrapper overhead, or whether the product path should lean on repaired checkpointing plus UsuiTrack state savings first.
 
-Current answer: lean on repaired checkpointing plus SumoTrack state savings first. Keep projected activation as an opt-in branch for memory pressure and future performance work, not as the default quality lane. If revisited, the next work should be speed/perf cleanup and larger-shape memory evidence, not more proof of gradient arithmetic.
+Current answer: lean on repaired checkpointing plus UsuiTrack state savings first. Keep projected activation as an opt-in branch for memory pressure and future performance work, not as the default quality lane. If revisited, the next work should be speed/perf cleanup and larger-shape memory evidence, not more proof of gradient arithmetic.
 
 ### Compile spike after repaired checkpointing
 
-The first speed cleanup moved model compilation after projected-activation backend installation and added `set_projected_activation_compile(enabled)`, which compiles only the pure tensor work inside the projected Linear and fused gated-MLP backward paths. The custom autograd Functions still own the Python side-channel that queues projected gradients into SumoTrack; optimizer bookkeeping stays outside Dynamo. Later audit found that compiling only the outer CausalLM wrapper misses the CCE hot path, because `cce_causal_lm_loss()` calls the inner base model plus `lm_head` directly. The harness now compiles that inner training base model for CCE-style models and uses PyTorch functional AdamW for fallback parameters; fused functional AdamW is used only for fp32 CUDA fallback tensors because PyTorch rejects mixed bf16-param/fp32-state fused AdamW.
+The first speed cleanup moved model compilation after projected-activation backend installation and added `set_projected_activation_compile(enabled)`, which compiles only the pure tensor work inside the projected Linear and fused gated-MLP backward paths. The custom autograd Functions still own the Python side-channel that queues projected gradients into UsuiTrack; optimizer bookkeeping stays outside Dynamo. Later audit found that compiling only the outer CausalLM wrapper misses the CCE hot path, because `cce_causal_lm_loss()` calls the inner base model plus `lm_head` directly. The harness now compiles that inner training base model for CCE-style models and uses PyTorch functional AdamW for fallback parameters; fused functional AdamW is used only for fp32 CUDA fallback tensors because PyTorch rejects mixed bf16-param/fp32-state fused AdamW.
 
 Short validation-skipped smokes, all with repaired activation checkpointing, rank 64, `seq1024`, two warmup steps, and `--torch-compile` where noted:
 

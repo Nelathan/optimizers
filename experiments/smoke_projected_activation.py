@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack.projected_activation import ProjectedActivationGradientSink, projected_activation_linear
+from usuitrack.projected_activation import ProjectedActivationGradientSink, projected_activation_linear
 
 
 @dataclass

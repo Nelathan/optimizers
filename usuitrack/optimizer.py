@@ -33,8 +33,8 @@ class MatrixUpdate:
     original_shape: tuple[int, ...]
 
 
-class SumoTrack(Optimizer):
-    """Eager SumoTrack baseline optimizer.
+class UsuiTrack(Optimizer):
+    """Eager UsuiTrack baseline optimizer.
 
     Matrix parameters keep optimizer state in projected space: an orthonormal
     basis plus a projected first moment. Non-matrix parameters use HeavyBall's
@@ -72,7 +72,7 @@ class SumoTrack(Optimizer):
     ) -> None:
         if ecc is not None or param_ecc is not None:
             raise NotImplementedError(
-                "SumoTrack does not yet support HeavyBall ECC/param-ECC. "
+                "UsuiTrack does not yet support HeavyBall ECC/param-ECC. "
                 "Fallback updates use HeavyBall fused AdamW math, but ECC requires HeavyBall's ChainOpt state hooks."
             )
         if lr <= 0:
@@ -144,7 +144,7 @@ class SumoTrack(Optimizer):
         self.diagnostics_basis_enabled = False
         self.diagnostics_aurora_health_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
-        self._compiled_orthogonalize_update = torch.compile(SumoTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
+        self._compiled_orthogonalize_update = torch.compile(UsuiTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
         self._queued_projected_grads: dict[Tensor, Tensor] = {}
 
     @torch.no_grad()
@@ -152,7 +152,7 @@ class SumoTrack(Optimizer):
         """Queue an already-projected matrix gradient for the next ``step``.
 
         This is the explicit ingress for custom projected-activation backward
-        paths. The queued tensor must already live in SumoTrack's current basis;
+        paths. The queued tensor must already live in UsuiTrack's current basis;
         basis initialization and refresh still require a full matrix gradient.
         """
 
@@ -163,7 +163,7 @@ class SumoTrack(Optimizer):
         if projected_grad.ndim != 2:
             raise ValueError(f"projected gradient must be 2D, got shape {tuple(projected_grad.shape)}")
         if projected_grad.is_sparse:
-            raise RuntimeError("SumoTrack does not support sparse projected gradients")
+            raise RuntimeError("UsuiTrack does not support sparse projected gradients")
 
         projected_grad = projected_grad.detach()
         existing = self._queued_projected_grads.get(param)
@@ -204,7 +204,7 @@ class SumoTrack(Optimizer):
                     continue
                 grad = p.grad
                 if grad is not None and grad.is_sparse:
-                    raise RuntimeError("SumoTrack does not support sparse gradients")
+                    raise RuntimeError("UsuiTrack does not support sparse gradients")
                 if p.ndim == 2:
                     matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids, diagnostics))
                     if group["consume_grad"]:
@@ -339,9 +339,9 @@ class SumoTrack(Optimizer):
             if group["moment_mode"] == "adafactor_ema":
                 raise RuntimeError("adafactor_ema moment_mode dampens the full gradient before projection and is incompatible with queued projected gradients")
             if not projector.is_initialized:
-                raise RuntimeError("queued projected gradients require an initialized SumoTrack basis; run a full-gradient step first")
+                raise RuntimeError("queued projected gradients require an initialized UsuiTrack basis; run a full-gradient step first")
             if refresh_basis:
-                raise RuntimeError("queued projected gradients cannot refresh a SumoTrack basis; provide a full matrix gradient on refresh steps")
+                raise RuntimeError("queued projected gradients cannot refresh a UsuiTrack basis; provide a full matrix gradient on refresh steps")
             expected_shape = self._expected_projected_grad_shape(p, projector)
             if tuple(queued_projected_grad.shape) != expected_shape:
                 raise ValueError(
@@ -706,13 +706,13 @@ class SumoTrack(Optimizer):
 
     @staticmethod
     def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
-        return SumoTrack._orthogonalize_aurora(update, group, original_shape)
+        return UsuiTrack._orthogonalize_aurora(update, group, original_shape)
 
     def _orthogonalize_update_runtime(self, update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:
         if self._compiled_orthogonalize_update is None:
             return self._orthogonalize_update(update, group, original_shape)
         if original_shape is None or len(original_shape) < 2:
-            raise ValueError("compiled SumoTrack orthogonalization requires the original parameter shape")
+            raise ValueError("compiled UsuiTrack orthogonalization requires the original parameter shape")
         rows = int(original_shape[0])
         cols = int(math.prod(original_shape[1:]))
         return self._compiled_orthogonalize_update(
@@ -731,7 +731,7 @@ class SumoTrack(Optimizer):
         aurora_pp_iterations: int,
         polar_ns_steps: int,
     ) -> Tensor:
-        aurora_update = SumoTrack._aurora_leverage_uniform_polar(
+        aurora_update = UsuiTrack._aurora_leverage_uniform_polar(
             update,
             pp_iterations=aurora_pp_iterations,
             pp_beta=AURORA_PP_BETA,
@@ -741,13 +741,13 @@ class SumoTrack(Optimizer):
 
     @staticmethod
     def _orthogonalize_aurora(update: Tensor, _group: dict, original_shape: tuple[int, ...] | None) -> Tensor:
-        aurora_update = SumoTrack._aurora_leverage_uniform_polar(
+        aurora_update = UsuiTrack._aurora_leverage_uniform_polar(
             update,
             pp_iterations=_group.get("aurora_pp_iterations", AURORA_PP_ITERATIONS),
             pp_beta=AURORA_PP_BETA,
             polar_ns_steps=_group.get("polar_ns_steps", len(NEWTON_SCHULZ_COEFFICIENTS)),
         )
-        return SumoTrack._scale_orthogonalized_update(
+        return UsuiTrack._scale_orthogonalized_update(
             update,
             aurora_update,
             ORTHOGONALIZATION_SCALE_MODE,
@@ -764,7 +764,7 @@ class SumoTrack(Optimizer):
     ) -> Tensor:
         """Aurora-style leverage-uniform polar direction for rectangular projected moments.
 
-        SumoTrack owns momentum, LR, weight decay, and full-matrix Muon scaling. This
+        UsuiTrack owns momentum, LR, weight decay, and full-matrix Muon scaling. This
         helper extracts only Aurora's rectangular direction map: diagonally
         precondition a non-square matrix before polar/NS so the large-side row
         leverage approaches the Stiefel target. For wide matrices, transpose to
@@ -780,7 +780,7 @@ class SumoTrack(Optimizer):
         if not 1 <= polar_ns_steps <= len(NEWTON_SCHULZ_COEFFICIENTS):
             raise ValueError(f"polar_ns_steps must be in [1, {len(NEWTON_SCHULZ_COEFFICIENTS)}], got {polar_ns_steps}")
         if update.shape[-2] == update.shape[-1]:
-            return SumoTrack._heavyball_polar(update, steps=polar_ns_steps)
+            return UsuiTrack._heavyball_polar(update, steps=polar_ns_steps)
 
         transposed = update.shape[-2] < update.shape[-1]
         work = update.mT if transposed else update
@@ -790,7 +790,7 @@ class SumoTrack(Optimizer):
         diagonal = work32.norm(dim=-1, keepdim=True).clamp_min(eps).reciprocal()
         balanced = None
         for iteration in range(pp_iterations):
-            balanced = SumoTrack._heavyball_polar(diagonal * work32, steps=polar_ns_steps).float()
+            balanced = UsuiTrack._heavyball_polar(diagonal * work32, steps=polar_ns_steps).float()
             if iteration < pp_iterations - 1:
                 row_sq = balanced.square().sum(dim=-1, keepdim=True).clamp_min(eps * eps)
                 diagonal = diagonal * (target_row_sq / row_sq).pow(pp_beta)
@@ -800,7 +800,7 @@ class SumoTrack(Optimizer):
 
     @staticmethod
     def _heavyball_polar(update: Tensor, steps: int = len(NEWTON_SCHULZ_COEFFICIENTS)) -> Tensor:
-        return SumoTrack._batched_newton_schulz(update, steps=steps)
+        return UsuiTrack._batched_newton_schulz(update, steps=steps)
 
     @staticmethod
     def _batched_newton_schulz(update: Tensor, steps: int = len(NEWTON_SCHULZ_COEFFICIENTS), eps: float = 1e-7) -> Tensor:

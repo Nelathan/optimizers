@@ -15,12 +15,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sumotrack import SumoTrack  # noqa: E402
+from usuitrack import UsuiTrack  # noqa: E402
 
 from experiments.llm_synth_smoke import (  # noqa: E402
     DEFAULT_MODEL,
     batch_tokens,
-    build_sumotrack_param_groups,
+    build_usuitrack_param_groups,
     cce_causal_lm_loss,
     load_model_and_tokenizer,
     make_batches,
@@ -49,7 +49,7 @@ def short_param_name(name: str) -> str:
 
 
 def collect_projected_grad_rows(
-    optimizer: SumoTrack,
+    optimizer: UsuiTrack,
     named_params: list[tuple[str, torch.nn.Parameter]],
     step: int,
     clip_norm: float,
@@ -285,7 +285,7 @@ def write_markdown_summary(output_dir: Path, step_rows: list[dict], param_rows: 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Collect per-matrix projected-gradient norm spectra for SumoTrack")
+    parser = argparse.ArgumentParser(description="Collect per-matrix projected-gradient norm spectra for UsuiTrack")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--output-dir", default="/tmp/opencode/projected_grad_spectrum")
@@ -326,7 +326,7 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer(args.model, device, args.activation_checkpointing, args.attn_implementation)
     trainable_named, _stats = select_trainable_named_params(model, "broad-no-embeddings")
     trainable = [param for _name, param in trainable_named]
-    groups, policy_stats = build_sumotrack_param_groups(
+    groups, policy_stats = build_usuitrack_param_groups(
         trainable_named,
         rank=args.rank,
         projection_side_policy="residual-facing",
@@ -334,7 +334,7 @@ def main() -> None:
         basis_refresh_schedule="burst",
     )
     batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_blocks, "synth_right_padded_no_mask", "synth")
-    optimizer = SumoTrack(
+    optimizer = UsuiTrack(
         groups,
         lr=args.lr,
         beta=args.beta,

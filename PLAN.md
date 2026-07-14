@@ -1,6 +1,6 @@
-# SumoTrack Plan
+# UsuiTrack Plan
 
-SumoTrack is a memory-efficient optimizer for high-capacity continued pretraining
+UsuiTrack is a memory-efficient optimizer for high-capacity continued pretraining
 on consumer GPUs. It should move a pretrained model across a real distribution
 shift without full AdamW matrix state, slow gradient accumulation, or
 adapter-only capacity limits.
@@ -181,7 +181,7 @@ Gram construction, and vendor `eigh` are not first targets.
 When the design and integration gates hold, run one controlled LFM-350M faithful
 SYNTH table with identical formatting, token budget, optimizer scope, compile
 state, and evaluation cadence. Report target loss, source retention, state bytes,
-peak allocated VRAM, tokens/sec, and walltime to a named target. Include SumoTrack,
+peak allocated VRAM, tokens/sec, and walltime to a named target. Include UsuiTrack,
 AdamW where it fits, one credible GaLore/SubTrack-class route, and one matched-
 memory LoRA/Unsloth route. Show both equal-token and equal-memory views. Repeat
 only close decisions rather than performing ritual seed multiplication.
@@ -197,7 +197,7 @@ The default diagnostic lane is `LiquidAI/LFM2.5-350M-Base`, broad no-embedding
 training, uniform rank 64, residual-facing projection, stable `eigh` init,
 right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE loss, and
 position-controlled burst refresh every 10 steps. `experiments/llm_synth_smoke.py`
-is authoritative for CLI defaults; `SumoTrack` constructor defaults may differ.
+is authoritative for CLI defaults; `UsuiTrack` constructor defaults may differ.
 
 Use `torch.compile` for expensive quality runs unless compile itself is under test
 or breaks the contract. Packed no-mask inputs are the explicit throughput lane,
