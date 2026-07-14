@@ -323,8 +323,11 @@ first/middle/last matrices across transformer roles without changing the live
 optimizer update. Its final loss `2.010260` matched the fixed-controller reference
 `2.010285` within `0.000025`, and tests pin parameter updates and optimizer
 `state_dict` equality with shadowing enabled. The run is a geometry warmup, not a
-medium-horizon training verdict: in this lab 200 steps means warmup complete, 1k
-is medium training, and 10k is full training.
+training verdict. Practical lab runs stop at 200, 500, or 1k steps because longer
+training is expensive. A 1k run is still ordinary fine-tuning territory where
+LoRA remains a credible solution; 10k names the continued-pretraining/full-
+finetuning product regime where adapter capacity can bind. Evidence must be
+interpreted for transfer toward that regime, not ritualistically rerun at 10k.
 
 Each boundary snapshot was scored on capture of the following interval's
 Adafactor-conditioned gradients. Mean capture over steps 20-200, with the mature
@@ -374,11 +377,15 @@ promoted rule.
 2. **Warm-start calibration.** Compare a steady `.03-.04` step with one mature
    harmonic-to-floor schedule. This is one initialization distinction, not a
    controller lattice.
-3. **Medium comparison.** Run the selected direct-Oja path and the last default
-   for 1k steps under the faithful compiled contract. Read target/source loss
-   first; predictive capture, motion, moment health, state, and walltime explain.
-4. **Full horizon.** A 10k run is the full-training test of slow drift, mature
-   noise floor, and source retention. A 200-step result cannot substitute for it.
+3. **Practical training ladder.** Use 200 steps for mechanism/warmup evidence,
+   500 for replay-scale separation, and at most 1k for the faithful compiled
+   comparison. Read target/source loss first; predictive capture, motion, moment
+   health, state, and walltime explain.
+4. **Product-regime interpretation.** Judge whether the measured mechanism should
+   transfer toward a 10k continued-pretraining/full-finetuning regime, where LoRA
+   may reach capacity limits and full-matrix adaptation matters. Do not make a
+   10k run a routine gate; its cost is precisely why the shorter sensors must be
+   mechanistically honest.
 5. **Optimize afterward.** Only after direction evidence should work move to
    precision, allocation reuse, compilation, or kernel optimization.
 

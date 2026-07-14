@@ -205,9 +205,13 @@ right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE loss, and
 position-controlled burst refresh every 10 steps. `experiments/llm_synth_smoke.py`
 is authoritative for CLI defaults; `UsuiTrack` constructor defaults may differ.
 
-Treat 200 steps as geometry and warmup evidence, 1k as medium training, and 10k
-as the full-training horizon. Do not promote a basis mechanism because it looks
-healthy at 200, or describe 1k as a full convergence result.
+The practical run ladder is 200, 500, and at most 1k steps: 200 is a
+geometry/warmup sensor, 500 is replay-scale evidence, and 1k is still simple
+fine-tuning where LoRA remains a credible alternative. The product claim points
+toward a conceptual 10k continued-pretraining/full-finetuning regime, where LoRA
+can reach capacity limits and UsuiTrack's broader trainable capacity should
+matter. Interpret shorter evidence for transfer toward that regime, but do not
+make an expensive 10k run a routine evaluation gate.
 
 Use `torch.compile` for expensive quality runs unless compile itself is under test
 or breaks the contract. Packed no-mask inputs are the explicit throughput lane,
