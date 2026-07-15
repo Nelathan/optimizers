@@ -14,7 +14,9 @@ HeavyBall ECC and parameter ECC are not prerequisites for this sidequest.
 ## Heading
 
 Test a fixed group-wise regular Hadamard rotation before symmetric low-bit
-quantization, always along the rank axis, at the harness default rank `64`.
+quantization, always along the rank axis. The worked codec below was scoped at
+rank `64`; the live harness now defaults to rank `128`, so block grouping must be
+re-reviewed before this sidequest becomes active rather than silently inherited.
 
 The order of evidence is:
 
@@ -43,7 +45,7 @@ the left. Define a canonical projected-coordinate tensor `C:[s,r]`:
 | left | `Q:[m,r]` | `M:[r,n]` | `Q:[m,r]` | `C=M^T:[n,r]` | `Q C^T` |
 
 Stable EIGH initializes the basis. One-state Oja then moves it from every
-Adafactor-conditioned full gradient with fixed step `.01`, exact all-plane
+Adafactor-conditioned full gradient with harmonic steps down to `.01`, exact all-plane
 rank-space geometry, and Polar Express correction. There is no second frame.
 The projected first moment is an elementwise linear EMA in the moving frame.
 Aurora then leverage-balances that moment and applies
@@ -270,7 +272,7 @@ changes the Oja tracker and moving-frame history semantics.
 ### E. Faithful training
 
 Only geometry survivors enter the default right-padded no-mask SYNTH lane on
-`LiquidAI/LFM2.5-350M-Base`, broad no-embedding scope, rank `64`, residual-facing
+`LiquidAI/LFM2.5-350M-Base`, broad no-embedding scope, rank `128`, residual-facing
 projection, per-gradient Oja, CCE, and the current compile policy. Change only the
 state codec. The retained interval `10` is an EIGH/tangent ablation control and is
 inert under this default lane.

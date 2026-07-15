@@ -9,7 +9,7 @@ Current matrix-update design. Direction and unresolved questions live in
   those frames differ.
 - **Left != right with renamed shapes.** Derive each projection and lift.
 - **Oja != a boundary controller.** Oja updates from every full gradient with its
-  fixed step. Refresh interval, rotation rank, and boundary step configure only
+  harmonic-to-`.01` step schedule. Refresh interval, rotation rank, and boundary step configure only
   the explicit `eigh` and `tangent` ablations.
 - **Overlap reprojection != parallel transport.** Reprojection preserves the
   least-squares part of a fixed ambient vector. UsuiTrack carries momentum with
@@ -116,13 +116,19 @@ The denominator is floored at `1e-12`. With
 
 $$\Delta^\top\Delta=V\operatorname{diag}(\sigma_i^2)V^\top,$$
 
-the exact full-rank Grassmann step at fixed `eta_oja=0.01` is
+the exact full-rank Grassmann step uses
 
-$$Q_{raw}=\left[(QV)\operatorname{diag}(\cos(\eta_{oja}\sigma_i))
+$$\eta_t=\max(0.01, 1/t),$$
+
+where EIGH initialization is optimizer step one, so the first Oja move uses
+`1/2`. The released harmonic schedule reaches its steady `.01` floor at step
+100. The frame update is
+
+$$Q_{raw}=\left[(QV)\operatorname{diag}(\cos(\eta_t\sigma_i))
 +(\Delta V)\operatorname{diag}
-\left(\frac{\sin(\eta_{oja}\sigma_i)}{\sigma_i}\right)\right]V^\top.$$
+\left(\frac{\sin(\eta_t\sigma_i)}{\sigma_i}\right)\right]V^\top.$$
 
-The zero-singular-value limit is `sin(eta_oja sigma) / sigma -> eta_oja`.
+The zero-singular-value limit is `sin(eta_t sigma) / sigma -> eta_t`.
 Equal-rank tangent-Gram eigendecompositions are batched. With
 `S=Q_raw^T Q_raw`, one near-identity Polar Express step using the final stable
 HeavyBall coefficient triple retracts before storage:
@@ -179,14 +185,15 @@ Aurora acts only on `M`. For a rectangular tensor, orient it as
 
 $$D_{0,ii}=1/\|A_{i,:}\|_2.$$
 
-Run two leverage-balancing iterations:
+Run one leverage-balancing/polar iteration in the released path:
 
 $$P_k=\operatorname{NS}(D_kA),$$
 $$D_{k+1,ii}=D_{k,ii}
 \left(\frac{q/p}{\|P_{k,i,:}\|_2^2}\right)^{1/2}$$
 
-with the diagonal update omitted after the final iteration. Transpose back.
-Square tensors skip leverage balancing and use `NS(M)` directly.
+with the diagonal update omitted after the final iteration. Additional passes
+remain an explicit Aurora-depth ablation. Transpose back. Square tensors skip
+leverage balancing and use `NS(M)` directly.
 
 `NS` first divides by Frobenius norm and orients its input with rows no greater
 than columns. Five default HeavyBall polynomial steps apply
@@ -258,7 +265,8 @@ These choices define the current design; they are redesignable.
 3. **Side-Gram `eigh` initialization:** directly solves the one-sided target and
    has explicit fp32, finite-input, symmetrization, and jitter behavior.
 4. **One-state full-gradient Oja tracking:** the live frame follows conditioned
-   covariance action every step with fixed `0.01` motion and no second basis.
+   covariance action every step with harmonic motion `1/2, 1/3, ...` down to
+   `0.01` and no second basis.
 5. **Moving-frame momentum:** identity coordinates preserve the projected
    moment's spectrum through the chosen frame rotation.
 6. **Adafactor before tracking and projection:** both consumers see the same

@@ -22,9 +22,10 @@ class UsuiTrackTest(unittest.TestCase):
 
         self.assertNotIn("orthogonalization", opt.param_groups[0])
         self.assertEqual(ORTHOGONALIZATION_SCALE_MODE, "muon")
-        self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 2)
+        self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 1)
         self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 5)
         self.assertEqual(opt.param_groups[0]["grassmann_aim"], "oja")
+        self.assertEqual(opt.param_groups[0]["oja_step_schedule"], "mature")
 
     def test_step_updates_matrix_and_fallback_params(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -81,33 +82,23 @@ class UsuiTrackTest(unittest.TestCase):
         opt.diagnostics_enabled = True
         opt.diagnostics_basis_enabled = True
 
-        lag_angle_mass = float("nan")
         diagnostics = {}
-        # Enough boundaries for the probe AND one fixed-50-step basis-lag reading.
         # Refresh-only metrics live on boundary steps, so keep the last boundary's
         # diagnostics rather than whatever step the loop happens to end on.
-        for _ in range(56):
+        for _ in range(6):
             opt.zero_grad()
             (weight @ torch.randn(6, 6)).square().mean().backward()
             opt.step()
             if opt.last_step_diagnostics["basis_refresh_tensors"] > 0.0:
                 diagnostics = opt.last_step_diagnostics
-            candidate = opt.last_step_diagnostics.get("mean_basis_lag_angle_mass", float("nan"))
-            if candidate == candidate:
-                lag_angle_mass = candidate
         self.assertGreater(diagnostics["basis_refresh_tensors"], 0.0)
         self.assertGreater(diagnostics["mean_basis_target_angle_mass"], 0.0)
         self.assertGreater(diagnostics["mean_rotation_angle"], 0.0)
         self.assertLessEqual(diagnostics["mean_rotation_angle"], diagnostics["mean_basis_target_angle_mass"] + 1e-5)
-        # The convergence metric fired once: total principal-angle mass to the
-        # basis snapshot 50 optimizer steps ago.
-        self.assertGreater(lag_angle_mass, 0.0)
-        self.assertLessEqual(lag_angle_mass, 3 * torch.pi / 2 + 1e-5)
         # No tangent-accumulation state or stale target stream under the eigh aim.
         state = opt.state[weight]
         self.assertIsNone(state.get("tangent_accum"))
         self.assertNotIn("prev_eigh_target", state)
-        self.assertIn("basis_lag_snapshot", state)
 
     def test_oja_moves_live_basis_every_gradient_without_second_frame(self):
         torch.manual_seed(53)
@@ -135,8 +126,18 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertEqual(state["basis"].dtype, torch.bfloat16)
         self.assertLess(float((state["basis"].float() @ state["basis"].float().mT - torch.eye(4)).norm()), 2e-2)
 
-    def test_oja_basis_lag_uses_fixed_optimizer_step_horizon(self):
-        torch.manual_seed(57)
+    def test_mature_oja_step_schedule_is_harmonic_then_floored(self):
+        group = {"oja_step_schedule": "mature", "basis_refresh_step": 2}
+        self.assertEqual(UsuiTrack._oja_step_size(group), 0.5)
+        group["basis_refresh_step"] = 3
+        self.assertAlmostEqual(UsuiTrack._oja_step_size(group), 1.0 / 3.0)
+        group["basis_refresh_step"] = 100
+        self.assertEqual(UsuiTrack._oja_step_size(group), OJA_STEP_SIZE)
+        group["basis_refresh_step"] = 1000
+        self.assertEqual(UsuiTrack._oja_step_size(group), OJA_STEP_SIZE)
+
+    def test_mature_oja_uses_scheduled_step_after_eigh_initialization(self):
+        torch.manual_seed(55)
         weight = torch.nn.Parameter(torch.randn(10, 6))
         opt = UsuiTrack(
             [weight],
@@ -146,18 +147,21 @@ class UsuiTrackTest(unittest.TestCase):
             moment_mode="ema",
             grad_clip_norm=None,
             grassmann_aim="oja",
+            oja_step_schedule="mature",
         )
         opt.diagnostics_enabled = True
         opt.diagnostics_basis_enabled = True
 
-        for step in range(1, 53):
-            weight.grad = torch.randn_like(weight)
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        weight.grad = torch.randn_like(weight)
+        with mock.patch(
+            "usuitrack.optimizer.SubspaceProjector.oja_geodesic_from_eigh",
+            wraps=SubspaceProjector.oja_geodesic_from_eigh,
+        ) as geodesic:
             opt.step()
-            lag = opt.last_step_diagnostics["mean_basis_lag_angle_mass"]
-            if step < 52:
-                self.assertTrue(math.isnan(lag), msg=f"step={step}")
-            else:
-                self.assertGreater(lag, 0.0)
+
+        self.assertEqual(geodesic.call_args.args[4], 0.5)
 
     def test_oja_reuses_held_projection_as_moving_frame_coordinates(self):
         torch.manual_seed(59)
@@ -636,9 +640,9 @@ class UsuiTrackTest(unittest.TestCase):
         heavyball_cv, _heavyball_min, _heavyball_max = UsuiTrack._large_axis_leverage_stats(heavyball_update)
         aurora_cv, aurora_min, aurora_max = UsuiTrack._large_axis_leverage_stats(aurora_update)
         self.assertLess(aurora_cv, heavyball_cv)
-        self.assertLess(aurora_cv, 0.05)
-        self.assertGreater(aurora_min, 0.9)
-        self.assertLess(aurora_max, 1.1)
+        self.assertLess(aurora_cv, 0.1)
+        self.assertGreater(aurora_min, 0.75)
+        self.assertLess(aurora_max, 1.3)
 
     def test_batched_aurora_balances_rectangular_large_axis_leverage(self):
         torch.manual_seed(4)
@@ -651,11 +655,13 @@ class UsuiTrackTest(unittest.TestCase):
         )
 
         self.assertEqual(tuple(aurora_updates.shape), tuple(updates.shape))
-        for aurora_update in aurora_updates:
+        for update, aurora_update in zip(updates, aurora_updates):
+            heavyball_cv, _heavyball_min, _heavyball_max = UsuiTrack._large_axis_leverage_stats(UsuiTrack._heavyball_polar(update))
             aurora_cv, aurora_min, aurora_max = UsuiTrack._large_axis_leverage_stats(aurora_update)
-            self.assertLess(aurora_cv, 0.05)
-            self.assertGreater(aurora_min, 0.9)
-            self.assertLess(aurora_max, 1.1)
+            self.assertLess(aurora_cv, heavyball_cv)
+            self.assertLess(aurora_cv, 0.1)
+            self.assertGreater(aurora_min, 0.75)
+            self.assertLess(aurora_max, 1.3)
 
     def test_same_shape_one_sided_bucket_updates_multiple_params(self):
         torch.manual_seed(5)

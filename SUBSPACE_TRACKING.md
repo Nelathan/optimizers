@@ -8,12 +8,14 @@ including superseded defaults and failed mechanisms, is preserved in
 
 For a canonical column frame `Q:[d,r]`, one-state Oja reads every
 Adafactor-conditioned full gradient, forms its horizontal covariance tangent at
-the live frame, and moves fixed step `eta=0.01` along every tangent plane's exact
-Grassmann geodesic. One Polar Express correction restores the Stiefel invariant.
+the live frame, and moves along every tangent plane's exact Grassmann geodesic.
+After EIGH initialization, `eta_t=max(0.01, 1/t)` gives harmonic early adaptation
+and a steady `.01` floor. One Polar Express correction restores the Stiefel invariant.
 
 ```text
 Delta = normalized_oja_tangent(conditioned_full_gradient, Q)
-Q_+   = polar_express(geodesic(Q, Delta, eta=0.01, all_planes=True))
+eta_t = max(0.01, 1 / optimizer_step)
+Q_+   = polar_express(geodesic(Q, Delta, eta=eta_t, all_planes=True))
 ```
 
 This is the released tracker. It stores no second frame and requires a full
@@ -254,12 +256,54 @@ planes, so its growth with rank does not by itself establish a rank scaling law.
 An implicit step or LR scale such as `1/sqrt(rank)` remains a hypothesis, not a
 current mechanism.
 
-A mature-step Oja start is now a specific follow-up hypothesis, not part of the
-efficiency cut: initialize with EIGH, then use harmonic steps `1/2, 1/3, 1/4, ...`
-down to the steady `.01` floor. This could remove Oja's early adaptation lag
-without changing its converged motion. Test it only after the current per-step
-implementation is fast; a cadence change and a step schedule must remain separate
-interventions.
+The mature-step Oja start won its rank-128 sensor (`ytqnw1ip`). After EIGH
+initialization it used harmonic steps `1/2, 1/3, 1/4, ...` down to the steady
+`.01` floor, changing no other training axis. Against fixed `.01` (`tjsljczt`),
+target loss improved at every checkpoint: `2.162642` vs `2.164869` at step 50,
+`2.010792` vs `2.015143` at 100, `1.932781` vs `1.936936` at 150, and
+`1.886524` vs `1.889800` at 200. Final capture improved `.633374 -> .643801`,
+50-step lag fell `13.624978 -> 11.620014`, alignment rose
+`.767387 -> .778025`, and effective rank rose `102.79 -> 104.21`; source loss
+was effectively level/slightly worse (`2.947005` vs `2.946424`). The harmonic
+start is therefore released; fixed `.01` remains the steady-step ablation.
+
+Aurora depth was then reopened under mature rank-128 Oja without treating old
+rank-256 results as a baseline. One Polar Express pass with only two NS steps
+was decisively underpowered: `pp=1/ns=2` reached `1.956012` at step 200 versus
+`1.886524` for `pp=2/ns=5`, with a 16% smaller update norm. Restoring five NS
+steps isolated the pass count. `pp=1/ns=5` kept the same update norm but reached
+`1.903529 / 2.943642` target/source at 200: slower target adaptation and slightly
+better source retention than `pp=2/ns=5` (`1.886524 / 2.947005`). Its lower
+alignment/effective rank therefore describes a gentler leverage map, not a
+smaller step. Runs: `o2jt5qsc` (`pp=1/ns=2`), `wbjmebwo` (`pp=1/ns=5`), and
+`ytqnw1ip` (`pp=2/ns=5`).
+
+The chosen product-shaped rank-128 configuration then ran `pp=1/ns=5` for 1k
+steps at LR `3e-4` (`cqokmxft`). Target/source finished at
+`1.693917 / 3.010227`, with target loss falling monotonically at every 100-step
+evaluation, capture `.674401`, alignment `.860838`, effective rank
+`113.46 / 128`, and `.795854 s/step`. Against the earlier rank-128
+`pp=2/ns=5`, LR `2e-4` Oja run, this chosen configuration gains `.038294`
+target loss for `.019536` source loss. Because Aurora pass count and LR changed
+together, this is evidence for the configuration, not attribution to either
+axis. Historical rank-256 results remain capacity references only; rank 128 is
+the current cost/quality choice and future beta or conditioning tests must hold
+it fixed.
+
+A strict projected-moment beta `.95` sensor then changed only beta relative to
+that chosen contract (`5lkubxig`). At step 100 it was slightly worse on both
+target/source (`1.922924 / 2.944701` versus `1.920719 / 2.942897`). By step 200
+it had moved farther on both: target improved `1.815352 -> 1.808193`, while
+source worsened `2.965921 -> 2.972707`. This is a small target/source trade, not
+the catastrophic failure of the old `.98` lane and not a promotion result.
+Beta `.9` remains the default because it owns the 1k evidence; any longer beta
+test must preserve every other axis.
+
+The fixed-50-step lag probe was removed after this question closed. It cost
+about `233 ms` per event, amortized to `~4.7 ms` per optimizer step, and its
+snapshot rented a second full basis frame. Removing it reduced reported state in
+the rank-128 1k run from the prior `146.2 MB` class to `98.0 MB`. Step angle,
+capture, alignment, and moment spectrum remain available for the live questions.
 
 The matched compiled rank-128 1k promotion comparison showed a real but slight
 target/source trade, not Pareto dominance. Oja crossed EIGH around step 400 and

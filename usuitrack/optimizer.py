@@ -10,7 +10,7 @@ from torch.optim import Optimizer
 from torch.optim import _functional as torch_optim_functional
 
 from .projector import ProjectionSide, ProjectorInitMethod, SubspaceProjector
-AURORA_PP_ITERATIONS = 2
+AURORA_PP_ITERATIONS = 1
 AURORA_PP_BETA = 0.5
 ORTHOGONALIZATION_SCALE_MODE = "muon"
 NEWTON_SCHULZ_COEFFICIENTS = (
@@ -21,6 +21,7 @@ NEWTON_SCHULZ_COEFFICIENTS = (
     (2.8366, -3.0525, 1.2012),
 )
 OJA_STEP_SIZE = 0.01
+OJA_STEP_SCHEDULES = ("fixed", "mature")
 
 
 @dataclass
@@ -63,6 +64,7 @@ class UsuiTrack(Optimizer):
         grassmann_step_size: float = 0.25,
         grassmann_rotate_rank: int | None = None,
         grassmann_aim: str = "oja",
+        oja_step_schedule: str = "mature",
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -105,6 +107,8 @@ class UsuiTrack(Optimizer):
             raise ValueError(f"grassmann_rotate_rank must be None (all planes) or >= 1, got {grassmann_rotate_rank}")
         if grassmann_aim not in ("tangent", "eigh", "oja"):
             raise ValueError(f"grassmann_aim must be one of 'tangent', 'eigh', 'oja', got {grassmann_aim!r}")
+        if oja_step_schedule not in OJA_STEP_SCHEDULES:
+            raise ValueError(f"oja_step_schedule must be one of {OJA_STEP_SCHEDULES}, got {oja_step_schedule!r}")
         if basis_refresh_interval <= 0:
             raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
         if aurora_pp_iterations <= 0:
@@ -132,6 +136,7 @@ class UsuiTrack(Optimizer):
             grassmann_step_size=grassmann_step_size,
             grassmann_rotate_rank=grassmann_rotate_rank,
             grassmann_aim=grassmann_aim,
+            oja_step_schedule=oja_step_schedule,
             basis_refresh_interval=basis_refresh_interval,
             aurora_pp_iterations=aurora_pp_iterations,
             polar_ns_steps=polar_ns_steps,
@@ -251,8 +256,6 @@ class UsuiTrack(Optimizer):
             "basis_refresh_tensors": 0,
             "basis_target_angle_mass_sum": 0.0,
             "basis_target_angle_mass_tensors": 0,
-            "basis_lag_angle_mass_sum": 0.0,
-            "basis_lag_tensors": 0,
             "basis_capture_sum": None,
             "basis_capture_tensors": 0,
             "aurora_alignment_sum": 0.0,
@@ -295,8 +298,6 @@ class UsuiTrack(Optimizer):
         diagnostics["basis_refresh_tensors"] = float(basis_count)
         target_count = diagnostics.pop("basis_target_angle_mass_tensors")
         diagnostics["mean_basis_target_angle_mass"] = diagnostics.pop("basis_target_angle_mass_sum") / target_count if target_count else float("nan")
-        lag_count = diagnostics.pop("basis_lag_tensors")
-        diagnostics["mean_basis_lag_angle_mass"] = diagnostics.pop("basis_lag_angle_mass_sum") / lag_count if lag_count else float("nan")
         aurora_count = diagnostics["aurora_health_tensors"]
         diagnostics["mean_aurora_alignment"] = diagnostics["aurora_alignment_sum"] / aurora_count if aurora_count else float("nan")
         diagnostics["mean_aurora_erank"] = diagnostics["aurora_erank_sum"] / aurora_count if aurora_count else float("nan")
@@ -575,6 +576,7 @@ class UsuiTrack(Optimizer):
             key = (tangent.device, tangent.dtype, tangent.shape[1])
             buckets.setdefault(key, []).append(entry)
 
+        step_size = self._oja_step_size(group)
         record_rotation = diagnostics is not None and self.diagnostics_basis_enabled
         for bucket_entries in buckets.values():
             tangents = [entry.oja_tangent for entry in bucket_entries]
@@ -598,11 +600,11 @@ class UsuiTrack(Optimizer):
                     selected_tangents,
                     selected_values,
                     selected_vectors,
-                    OJA_STEP_SIZE,
+                    step_size,
                 )
                 rotation_angles = None
                 if record_rotation:
-                    rotation_angles = (OJA_STEP_SIZE * selected_values.clamp_min(0.0).sqrt()).abs().sum(dim=-1).detach().cpu()
+                    rotation_angles = (step_size * selected_values.clamp_min(0.0).sqrt()).abs().sum(dim=-1).detach().cpu()
                 for local_index, (entry, new_frame) in enumerate(zip(selected_entries, new_frames, strict=True)):
                     basis = new_frame.mT if side is ProjectionSide.RIGHT else new_frame
                     entry.projector.basis = basis.to(
@@ -613,9 +615,15 @@ class UsuiTrack(Optimizer):
                     state = self.state[entry.param]
                     if rotation_angles is not None and diagnostics is not None:
                         entry.projector.last_rotation_angle = float(rotation_angles[local_index])
-                        self._record_basis_motion(diagnostics, entry.projector, state, group["basis_refresh_step"])
+                        self._record_basis_motion(diagnostics, entry.projector)
                     state["basis"] = entry.projector.basis
                     state["projection_side_is_right"] = side is ProjectionSide.RIGHT
+
+    @staticmethod
+    def _oja_step_size(group: dict) -> float:
+        if group["oja_step_schedule"] == "mature":
+            return max(OJA_STEP_SIZE, 1.0 / group["basis_refresh_step"])
+        return OJA_STEP_SIZE
 
     def _apply_matrix_update(self, entry: MatrixUpdate, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
         if diagnostics is not None:
@@ -683,8 +691,6 @@ class UsuiTrack(Optimizer):
     # angles (rotation_angle, target self-angle) are floored by target noise and
     # structurally cannot show convergence; the angle of the basis against its
     # own past can: decaying lag-angle = settling, plateau = stable orbit radius.
-    BASIS_LAG_STEPS = 50
-
     def _refresh_projector(
         self,
         projector: SubspaceProjector,
@@ -741,7 +747,7 @@ class UsuiTrack(Optimizer):
             )
 
         if was_initialized and diagnostics is not None and self.diagnostics_basis_enabled:
-            self._record_basis_motion(diagnostics, projector, state, group["basis_refresh_step"])
+            self._record_basis_motion(diagnostics, projector)
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
         state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
@@ -786,23 +792,8 @@ class UsuiTrack(Optimizer):
         diagnostics["rotation_angle_sum"] += rotation_angle
         diagnostics["basis_refresh_tensors"] += 1
 
-    def _record_basis_motion(self, diagnostics: dict, projector: SubspaceProjector, state: dict, current_step: int) -> None:
+    def _record_basis_motion(self, diagnostics: dict, projector: SubspaceProjector) -> None:
         self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle)
-        # Convergence metric: principal angles between the basis and its own
-        # snapshot from BASIS_LAG_STEPS optimizer steps ago. Principal-angle
-        # mass is total motion per matrix, then averaged across the model.
-        snapshot = state.get("basis_lag_snapshot")
-        snapshot_step = state.get("basis_lag_snapshot_step")
-        if snapshot is None:
-            state["basis_lag_snapshot"] = projector.canonical_basis().detach().clone()
-            state["basis_lag_snapshot_step"] = current_step
-        elif snapshot_step is None or current_step - snapshot_step >= self.BASIS_LAG_STEPS:
-            current = projector.canonical_basis()
-            lag_angles = SubspaceProjector.principal_angles_sine(snapshot, current)
-            diagnostics["basis_lag_angle_mass_sum"] += float(lag_angles.sum().detach().cpu())
-            diagnostics["basis_lag_tensors"] += 1
-            state["basis_lag_snapshot"] = current.detach().clone()
-            state["basis_lag_snapshot_step"] = current_step
 
     @staticmethod
     def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:

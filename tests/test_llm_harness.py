@@ -7,7 +7,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -136,18 +136,23 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.seq_len, 1024)
         self.assertEqual(args.batch_size, 16)
         self.assertEqual(args.batching, "synth_right_padded_no_mask")
-        self.assertEqual(args.rank, 64)
+        self.assertEqual(args.max_steps, 1000)
+        self.assertEqual(args.retention_hf_dataset, DEFAULT_SOURCE_HF_DATASET)
+        self.assertEqual(args.rank, 128)
         self.assertEqual(args.projection_side_policy, "residual-facing")
-        self.assertEqual(args.usuitrack_lr, 2e-4)
+        self.assertEqual(args.usuitrack_lr, 3e-4)
         self.assertEqual(args.lr_warmup_steps, 50)
+        self.assertEqual(args.beta, 0.9)
         self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.basis_refresh_schedule, "burst")
         self.assertEqual(args.moment_mode, "adafactor_ema")
         self.assertEqual(args.basis_refresh_interval, 10)
         self.assertEqual(args.projected_grad_clip_norm, 0.0)
         self.assertEqual(args.projected_grad_clip_ratio, 0.0)
-        self.assertEqual(args.grad_clip_norm, 2.5)
+        self.assertEqual(args.grad_clip_norm, 1.0)
         self.assertEqual(args.grassmann_aim, "oja")
+        self.assertEqual(args.oja_step_schedule, "mature")
+        self.assertEqual(build_parser().parse_args(["--oja-step-schedule", "mature"]).oja_step_schedule, "mature")
         self.assertEqual(build_parser().parse_args(["--grassmann-aim", "eigh"]).grassmann_aim, "eigh")
         self.assertIsNone(args.grassmann_rotate_rank)
         self.assertEqual(args.grassmann_step_size, 0.25)
@@ -155,13 +160,15 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "no_grassmann_accumulate"))
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
-        self.assertEqual(args.wandb_log_every, 10)
-        self.assertEqual(args.aurora_pp_iterations, 2)
+        self.assertEqual(args.wandb_log_every, 25)
+        self.assertEqual(args.eval_every, 100)
+        self.assertEqual(args.aurora_pp_iterations, 1)
         self.assertEqual(args.polar_ns_steps, 5)
         self.assertEqual(args.basis_init, "eigh")
         self.assertEqual(args.attn_implementation, "sdpa")
         self.assertTrue(args.activation_checkpointing)
-        self.assertFalse(args.torch_compile)
+        self.assertTrue(args.torch_compile)
+        self.assertFalse(build_parser().parse_args(["--no-torch-compile"]).torch_compile)
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
         self.assertFalse(hasattr(args, "shadow_target_probe"))

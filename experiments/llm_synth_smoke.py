@@ -814,7 +814,6 @@ def train_step(
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
     basis_target_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_target_angle_mass") if collect_basis else float("nan")
     basis_step_angle_mass = rotation_angle
-    basis_lag_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_lag_angle_mass") if collect_basis else float("nan")
     basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     moment_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
@@ -833,7 +832,6 @@ def train_step(
         "projected_grad_to_moment_ratio": projected_grad_to_moment_ratio,
         "basis_target_angle_mass": basis_target_angle_mass,
         "basis_step_angle_mass": basis_step_angle_mass,
-        "basis_lag_angle_mass": basis_lag_angle_mass,
         "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
         "moment_erank": moment_erank,
@@ -934,6 +932,7 @@ def run_optimizer(
             grassmann_step_size=args.grassmann_step_size,
             grassmann_rotate_rank=args.grassmann_rotate_rank,
             grassmann_aim=args.grassmann_aim,
+            oja_step_schedule=args.oja_step_schedule,
             basis_refresh_interval=args.basis_refresh_interval,
             aurora_pp_iterations=args.aurora_pp_iterations,
             polar_ns_steps=args.polar_ns_steps,
@@ -1021,9 +1020,8 @@ def run_optimizer(
                 "train/lr": optimizer.param_groups[0]["lr"],
             }
             # Omit unavailable frame metrics rather than logging NaN. Oja moves
-            # every step, while EIGH/tangent emit motion only at boundaries and
-            # the fixed-horizon lag metric is unavailable until its snapshot matures.
-            for metric_name in ("basis_target_angle_mass", "basis_step_angle_mass", "basis_lag_angle_mass"):
+            # every step, while EIGH/tangent emit motion only at boundaries.
+            for metric_name in ("basis_target_angle_mass", "basis_step_angle_mass"):
                 metric = scalar_or_none(step_result[metric_name])
                 if metric is not None and metric == metric:
                     train_metrics[f"opt/{metric_name}"] = metric
@@ -1087,7 +1085,6 @@ def run_optimizer(
     measured_projected_grad_to_moment_ratios = [step["projected_grad_to_moment_ratio"] for step in measured_steps]
     measured_basis_target_angle_mass = [step["basis_target_angle_mass"] for step in measured_steps]
     measured_basis_step_angle_mass = [step["basis_step_angle_mass"] for step in measured_steps]
-    measured_basis_lag_angle_mass = [step["basis_lag_angle_mass"] for step in measured_steps]
     measured_basis_capture = [step["basis_capture"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_moment_erank = [step["moment_erank"] for step in measured_steps]
@@ -1108,6 +1105,7 @@ def run_optimizer(
         "boundary_ablation_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
         "boundary_ablation_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
         "grassmann_aim": args.grassmann_aim if optimizer_name == "usuitrack" else "n/a",
+        "oja_step_schedule": args.oja_step_schedule if optimizer_name == "usuitrack" else "n/a",
         "lr_warmup_steps": args.lr_warmup_steps,
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
         "polar_ns_steps": args.polar_ns_steps if optimizer_name == "usuitrack" else 0,
@@ -1143,7 +1141,6 @@ def run_optimizer(
         "last_logged_projected_grad_to_moment_ratio": last_finite_scalar(measured_projected_grad_to_moment_ratios),
         "last_logged_basis_target_angle_mass": last_finite_scalar(measured_basis_target_angle_mass),
         "last_logged_basis_step_angle_mass": last_finite_scalar(measured_basis_step_angle_mass),
-        "last_logged_basis_lag_angle_mass": last_finite_scalar(measured_basis_lag_angle_mass),
         "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
         "last_logged_moment_erank": last_finite_scalar(measured_moment_erank),
@@ -1166,25 +1163,25 @@ def run_optimizer(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Short pretrained-LLM SYNTH smoke for UsuiTrack")
+    parser = argparse.ArgumentParser(description="Faithful pretrained-LLM SYNTH harness for UsuiTrack")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"HF model name; default = {DEFAULT_MODEL}")
     parser.add_argument("--data-dir", default="/home/djg/.cache/nanochat/base_data_synth")
     parser.add_argument("--target-hf-dataset", default="", help="optional Hugging Face target dataset; first parquet shard only")
     parser.add_argument("--target-format", choices=("auto", "synth", "profile_text", "text"), default="auto", help="target dataset row formatter; profile_text masks profile+divider and trains only on text")
     parser.add_argument("--target-val-offset", type=int, default=9000, help="row offset for validation when --target-hf-dataset is used")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
-    parser.add_argument("--retention-hf-dataset", default="", help=f"optional Hugging Face source/retention dataset; first parquet shard only, e.g. {DEFAULT_SOURCE_HF_DATASET}")
+    parser.add_argument("--retention-hf-dataset", default=DEFAULT_SOURCE_HF_DATASET, help=f"Hugging Face source/retention dataset; first parquet shard only; default = {DEFAULT_SOURCE_HF_DATASET}; pass an empty string to disable")
     parser.add_argument("--optimizers", default="usuitrack", help="comma-separated: usuitrack,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=3, help="ceiling on measured optimizer steps; clamped down with a warning if the dataset can't supply this many rows")
+    parser.add_argument("--max-steps", type=int, default=1000, help="ceiling on measured optimizer steps; default is the current 1k quality contract; clamped down with a warning if the dataset can't supply this many rows")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--val-blocks", type=int, default=8, help="number of validation batches/blocks to build")
     parser.add_argument("--retention-val-blocks", type=int, default=8, help="number of source validation batches/blocks to build")
     parser.add_argument("--batching", choices=("synth_right_padded_no_mask", "eos_packed_no_mask"), default="synth_right_padded_no_mask", help="batch construction policy; default is faithful SYNTH diagnostics; choose eos_packed_no_mask explicitly for throughput")
-    parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing", "right"), default="residual-facing")
     parser.add_argument(
         "--projected-activation-backend",
@@ -1193,7 +1190,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="experimental UsuiTrack-only activation-projected backward backend; incompatible with Oja because it queues projected gradients instead of supplying the full matrix gradients Oja requires every step",
     )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
-    parser.add_argument("--usuitrack-lr", type=float, default=2e-4)
+    parser.add_argument("--usuitrack-lr", type=float, default=3e-4)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.9)
@@ -1204,10 +1201,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis tracking and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
-    parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="ablation-only boundary step: EIGH target fraction (1.0 = snap) or tangent multiplier. Oja ignores this and uses its fixed calibrated 0.01 step")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches before they can poison tracking or moment state. The released rank-128 lane uses 1.0; this is upstream of everything, unlike the moment-only projected-grad clip.")
+    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="ablation-only boundary step: EIGH target fraction (1.0 = snap) or tangent multiplier. Oja ignores this control")
     parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="ablation-only number of planes rotated by EIGH/tangent boundary updates. None rotates all planes; Oja always rotates every tracked plane and ignores this control")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="oja", help="basis update law. oja (default) updates the one live frame from every full gradient with fixed step 0.01; eigh is the fixed-.25 boundary position-control ablation; tangent is the historical SubTrack ablation")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="oja", help="basis update law. oja (default) updates the one live frame from every full gradient; eigh is the fixed-.25 boundary position-control ablation; tangent is the historical SubTrack ablation")
+    parser.add_argument("--oja-step-schedule", choices=("fixed", "mature"), default="mature", help="Oja step law. mature (default) uses 1/2, 1/3, ... down to the 0.01 floor after EIGH initialization; fixed is the steady-0.01 ablation")
     parser.add_argument("--basis-refresh-interval", type=int, default=10, help="ablation-only cadence for EIGH/tangent boundary updates; Oja updates every gradient and ignores this interval")
     parser.add_argument(
         "--basis-refresh-schedule",
@@ -1215,20 +1213,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="burst",
         help="ablation-only EIGH/tangent boundary timing; Oja updates every gradient and ignores this schedule",
     )
-    parser.add_argument("--aurora-pp-iterations", type=int, default=2)
+    parser.add_argument("--aurora-pp-iterations", type=int, default=1)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
     parser.add_argument("--projected-grad-clip-norm", type=float, default=0.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. OFF now: raw-grad clipping (--grad-clip-norm) bounds the gradient upstream of adafactor/projection, which makes this downstream moment-only clip redundant (and it could not stop a blip from poisoning adafactor's second moment anyway -- that damage is upstream). Re-enable only if a specific moment-scale failure reappears.")
     parser.add_argument("--projected-grad-clip-ratio", type=float, default=0.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables. adafactor_ema's projected-grad norm is stable so this rail is unnecessary there; --moment-mode ema needs it re-enabled, e.g. 6.0")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="model gradient checkpointing; default ON (bs16@seq1024 OOMs a 12GB card without it); --no-activation-checkpointing to disable")
     parser.add_argument(
         "--torch-compile",
-        action="store_true",
-        help="compile the model forward/backward and UsuiTrack tensor kernels with torch.compile; the Python optimizer step remains eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile the model forward/backward and UsuiTrack tensor kernels with torch.compile (default on); the Python optimizer step remains eager",
     )
     parser.add_argument("--attn-implementation", default="sdpa", help="Transformers attention implementation; local default is sdpa until real flash kernels are available")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
-    parser.add_argument("--eval-every", type=int, default=0, help="periodically log target/source validation loss every N measured steps; 0 disables")
+    parser.add_argument("--eval-every", type=int, default=100, help="periodically log target/source validation loss every N measured steps; default 100 for the 1k quality contract; use 50 for a 200-step sensor; 0 disables")
     parser.add_argument("--no-final-sample", dest="final_sample", action="store_false", help="disable final qualitative generation from a target eval prompt")
     parser.set_defaults(final_sample=True)
     parser.add_argument("--final-sample-row", type=int, default=0, help="target eval row index used for final qualitative generation")
@@ -1241,7 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="usuitrack")
-    parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and optimizer diagnostics every N measured steps; basis_capture always measures the held frame before that step's basis movement")
+    parser.add_argument("--wandb-log-every", type=int, default=25, help="log train loss and optimizer diagnostics every N measured steps; basis_capture always measures the held frame before that step's basis movement")
     return parser
 
 
@@ -1361,7 +1360,7 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
-        f"basis_init={args.basis_init} grassmann_aim={args.grassmann_aim} "
+        f"basis_init={args.basis_init} grassmann_aim={args.grassmann_aim} oja_step_schedule={args.oja_step_schedule} "
         f"boundary_ablation_refresh_interval={args.basis_refresh_interval} boundary_ablation_refresh_schedule={args.basis_refresh_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "

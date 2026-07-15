@@ -36,6 +36,15 @@ gradients already exceed that budget before activations or optimizer machinery.
 The near-term systems question is how far full-gradient continued pretraining can
 be expanded on consumer cards, likely beginning around the 4B class. Full
 gradients, not UsuiTrack's rank state, are expected to be the dominant VRAM tax.
+The current post-backward preparation already consumes each full gradient after
+forming its rank-sized pending update, which shortens optimizer-step residency but
+cannot lower the peak where backward has materialized all gradients. HeavyBall's
+`register_post_accumulate_grad_hook` pattern suggests the stronger lead: run the
+same preparation when each parameter gradient becomes complete, release that full
+gradient while backward continues, then batch the retained rank-space geometry
+and apply updates after backward. This could shrink the weights + activations +
+full-gradients overlap; it requires exact ordering/parity tests and explicit
+failure semantics before becoming a memory claim.
 
 ## Current design
 
@@ -53,7 +62,8 @@ finite raw gradient
 ```
 
 The basis starts from stable side-Gram `eigh`, then one-state Oja moves the live
-frame from every conditioned full gradient with fixed step `.01`. Its exact
+frame from every conditioned full gradient with harmonic steps `1/2, 1/3, ...`
+down to `.01`. Its exact
 rank-space geodesic rotates every tracked plane and stores no second frame. The
 geodesic's rigid frame rotation parallel-transports projected momentum with
 identity coordinates, so tracking does not brake and rebuild the moment. Fixed
@@ -74,8 +84,11 @@ These claims survived the experiments that produced the present design:
   scale and memory.
 - Residual-facing projection beat shape-only side selection.
 - Uniform rank beat the tested allocation policies on complexity-adjusted value.
-  Rank remains a user control; rank 64 is the generic harness default, while
-  rank 256 carried more quality in the historical 350M candidate lane.
+  Rank remains a cost/quality control. Rank 256 carried the strongest historical
+  350M quality lane; after Oja repaired tracking, rank 128 is the current harness
+  balance rather than assuming the older capacity optimum remains necessary.
+  Rank also changes update norm, so results across ranks describe different
+  capacity/pressure choices and are not optimizer-control baselines for one another.
 - Stable side-Gram `eigh` was faster and more robust than exact SVD for the
   required one-sided initialization.
 - Adafactor-conditioned EMA beat plain EMA, no momentum, and second-moment-only
@@ -164,8 +177,14 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Is the chosen frame path stable at cutoff churn and near 90 degrees? | gauge/sign and hostile-target stress | stabilize target/path or accept boundary |
 | Does tracking cadence cost meaningful walltime? | profile ordinary and telemetry Oja steps; separate EIGH boundary/non-boundary steps only for that ablation | retain per-gradient Oja unless a measured sparse estimator preserves quality |
 | Did Oja clear promotion over noisy boundary EIGH? | one-state Oja won rank-32 replay loss and the rank-128 1k target endpoint; optimized rank-space geometry preserved loss and beat EIGH walltime by 12.9% in a matched rank-128 500 replay | yes: Oja is released; retain EIGH as the position-control ablation and keep the slight source trade visible |
+| Can Oja close its early post-EIGH lag without losing its settled stability? | rank-128 sensor `ytqnw1ip` changed only the schedule to `1/2, 1/3, ...` down to `.01`; target loss improved at every checkpoint and settled geometry also improved | yes: mature Oja is the released schedule; fixed `.01` remains the steady-step ablation |
+| Does the well-aligned projected moment still need Aurora `pp=2/ns=5`? | `pp=1/ns=2` under-stepped badly; `pp=1/ns=5` preserved update norm but adapted more gently at 200, and the chosen rank-128 `pp=1/ns=5`, LR `3e-4` configuration reached `1.693917 / 3.010227` target/source at 1k | use one Aurora pass with five NS steps; do not infer the separate effect of pass count from the chosen configuration run |
+| How much adaptation pressure should the rank-128 product lane use? | hold mature Oja and `pp=1/ns=5` fixed, then compare LR or horizon one axis at a time against the `3e-4` 1k reference `cqokmxft` | choose target/source operating point without laundering rank-256 capacity evidence into rank-128 tuning |
+| Does the repaired moving-frame moment benefit from longer memory? | strict beta `.95` sensor `5lkubxig`: at step 200 target improved `.007159` while source worsened `.006785`; it was slightly worse on both at step 100 | unresolved longer-horizon target/source trade; beta `.9` retains the proven 1k default, and any extension changes beta only |
+| Can projected second-moment conditioning replace full-gradient Adafactor? | hold the chosen training contract fixed and compare Adafactor-conditioned Oja/EMA against raw-gradient Oja plus a bf16 projected elementwise second moment | remove the largest optimizer stage only if loss, source, aim quality, state, and walltime survive |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
+| Can full gradients be released during backward? | post-accumulate hook prototype measuring peak allocated VRAM and exact update parity | prepare each tensor's Adafactor/Oja/projected-moment state as soon as its gradient is complete, retain only rank-sized pending work, and release the full gradient before the rest of backward finishes |
 | Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
 
 Tracking work stops unless it deletes state or machinery, reduces measured tracking
@@ -214,6 +233,23 @@ Adafactor preparation, projected EMA bookkeeping, and a project-back GEMM
 epilogue that writes the parameter directly. cuBLAS GEMMs, Newton-Schulz products,
 Gram construction, and vendor `eigh` are not first targets.
 
+The current mechanism is still moving; do not begin Triton work while Oja startup
+and Aurora/NS depth remain live algorithmic questions. Sparse Oja cadence,
+stable-prefix rotation, and a new rank sweep are not active leads: per-gradient
+Oja is already fast, useful rank energy is broadly distributed, and rank remains
+an explicit cost/quality choice.
+
+Current diagnostic cost is measured rather than assumed. On the rank-128
+LFM-350M topology, ordinary basis-step telemetry is negligible, while the old
+fixed-50-step basis-lag probe cost about `233 ms` when it fired (`~4.7 ms`
+amortized per optimizer step) and stored a second full basis snapshot. Its
+startup question closed with mature Oja, so the probe and snapshot state were
+deleted. Core optimizer diagnostics cost about `20 ms` per logged step, Aurora
+health about `10 ms`, and harness gradient/parameter scans about `8.5 ms`.
+Keep alignment/effective rank only while they answer the live Aurora/moment
+questions, then reassess the eigensolve rent rather than making every sensor
+permanent.
+
 ### Release evidence
 
 When the design and integration gates hold, first run the primary controlled
@@ -235,27 +271,34 @@ fraction, and rotation rank are ablation-only under the released Oja path.
 
 ## Benchmark contract
 
-The default diagnostic lane is `LiquidAI/LFM2.5-350M-Base`, broad no-embedding
-training, uniform rank 64, residual-facing projection, stable `eigh` init,
-right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE loss, and
-one-state Oja tracking from every full gradient. `experiments/llm_synth_smoke.py`
-is authoritative for CLI defaults; the retained interval-10 burst settings apply
-only when an explicit EIGH/tangent boundary ablation is selected.
+The harness defaults to the current 1k quality contract: `LiquidAI/LFM2.5-350M-Base`,
+broad no-embedding training, uniform rank 128, residual-facing projection, stable
+`eigh` init, right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE,
+mature Oja, LR `3e-4` with 50-step warmup, projected-moment beta `.9`, raw
+per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, `torch.compile`, target
+and source evaluation every 100 steps, telemetry every 25, and a final qualitative
+sample. `experiments/llm_synth_smoke.py` is authoritative for CLI defaults; the
+retained interval-10 burst settings apply only when an explicit EIGH/tangent
+boundary ablation is selected.
 
-The practical run ladder is 200, 500, and at most 1k steps: 200 is a
-geometry/warmup sensor, 500 is replay-scale evidence, and 1k is still simple
-fine-tuning where LoRA remains a credible alternative. The product claim points
-toward a conceptual 10k continued-pretraining/full-finetuning regime, where LoRA
-can reach capacity limits and UsuiTrack's broader trainable capacity should
-matter. Interpret shorter evidence for transfer toward that regime, but do not
-make an expensive 10k run a routine evaluation gate.
+The practical run ladder is 200, 500, and at most 1k steps. A 200-step health
+sensor keeps the 1k algorithm/training contract unchanged except for the named
+axis, sets `--max-steps 200 --eval-every 50 --no-final-sample --no-torch-compile`,
+and retains telemetry every 25. Compile startup is not worth paying for a short
+mechanism sensor; enable it only when the sensor explicitly measures compiled
+throughput. A 500-step replay uses evaluation every 100, normally omits the final
+sample, and follows the compiled quality contract. The 1k default is still simple fine-tuning where LoRA
+remains a credible alternative. The product claim points toward a conceptual
+10k continued-pretraining/full-finetuning regime, where LoRA can reach capacity
+limits and UsuiTrack's broader trainable capacity should matter. Interpret
+shorter evidence for transfer toward that regime, but do not let a short sensor
+silently redefine the 1k defaults or make an expensive 10k run a routine gate.
 
-The completed Oja promotion lane used rank 128; this does not change the generic
-harness default of rank 64. Historical evidence showed quality scaling through
-rank 256, but improved tracking may move that Pareto frontier. Any future rank
-comparison must keep source retention, `torch.compile`, training-only elapsed
-time, and final qualitative sampling in contract rather than inheriting the
-promotion result as a new rank default.
+The completed Oja promotion lane used rank 128, now the harness default. Historical
+evidence showed quality scaling through rank 256, but improved tracking changes
+that cost/quality balance; rank remains a user control, not a universal optimum.
+Any future rank comparison must keep source retention, `torch.compile`,
+training-only elapsed time, and final qualitative sampling in contract.
 
 Use `torch.compile` for expensive quality runs unless compile itself is under test
 or breaks the contract. Packed no-mask inputs are the explicit throughput lane,

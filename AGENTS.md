@@ -84,7 +84,7 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 - Orthogonalization happens in projected space.
 - Aurora with Muon scale semantics is the forward projected direction.
 - HeavyBall Newton-Schulz is the internal polar primitive inside Aurora.
-- One-state Oja is the forward basis-update path after stable EIGH initialization: every conditioned full gradient moves the live frame through an all-plane exact rank-space geodesic at fixed step `0.01`, followed by Polar Express correction. It stores no second frame. Full-gradient input is mandatory; projected-activation backward is incompatible.
+- One-state Oja is the forward basis-update path after stable EIGH initialization: every conditioned full gradient moves the live frame through an all-plane exact rank-space geodesic with harmonic steps `1/2, 1/3, ...` down to `0.01`, followed by Polar Express correction. It stores no second frame. Full-gradient input is mandatory; projected-activation backward is incompatible.
 - Fixed `.25` boundary EIGH position control and tangent velocity control remain explicit ablations. `grassmann_step_size`, `grassmann_rotate_rank`, refresh interval, and refresh schedule govern those ablations only and are inert under Oja.
 - The projected first moment parallel-transports through every geodesic refresh as the identity in projected coordinates (the retraction is a rigid frame rotation; pinned by test). Do not reintroduce project-back/re-project transfer — its cos-tax feeds Aurora's polar map shrunken, noise-dominated directions that NS re-amplifies.
 - Burst refresh is the default schedule for boundary ablations; round-robin was removed as complexity rent.
@@ -94,7 +94,7 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, and one-state per-gradient Oja tracking. Constructor and harness both default to Oja. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
+The LLM harness defaults to the current rank-128 1k quality contract: broad no-embedding training, stable `eigh` basis init, residual-facing projection, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, mature per-gradient Oja, LR `3e-4` with 50-step warmup, projected-moment beta `.9`, raw per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, `torch.compile`, evaluation every 100 steps, and telemetry every 25. Constructor and harness both default to Oja and one Aurora pass; model-scale/training defaults otherwise remain harness policy. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
 For expensive 1k-quality runs, use `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Record compile state in results so throughput comparisons stay honest.
 
@@ -112,7 +112,7 @@ Default harness model is `LiquidAI/LFM2.5-350M-Base`. `LiquidAI/LFM2.5-1.2B-Base
 
 Stay on the small/default model until the user explicitly authorizes going up. Larger LFM or Qwen runs are not harmless “continuations”; they change OOM risk, time cost, and experiment meaning.
 
-Rank allocation is uniform. Do not reintroduce rank-allocation knobs without a fresh product-shaped reason and a direct comparison against uniform rank 64.
+Rank allocation is uniform. Rank remains a cost/quality control; the harness uses 128 after tracking improved enough to make it the current balance, while rank 256 remains the historical higher-capacity quality lane. Do not reintroduce rank-allocation knobs without a fresh product-shaped reason and a direct comparison against uniform rank.
 
 Optimizer side names are PyTorch weight-storage coordinates: `Linear.weight == [out_features, in_features]`.
 
