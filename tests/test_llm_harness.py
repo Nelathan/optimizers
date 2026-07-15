@@ -8,7 +8,7 @@ import torch
 from usuitrack import UsuiTrack
 
 from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, wandb_log
-from experiments.llm_synth_smoke import cce_causal_lm_loss, make_packed_batches, make_right_padded_batches, synth_masked_examples
+from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
 def assert_param_membership(test_case, param, params, expected: bool) -> None:
@@ -98,6 +98,18 @@ class TinyLfmForCausalLM(torch.nn.Module):
 
 
 class LlmHarnessParamScopeTest(unittest.TestCase):
+    def test_gradient_norm_statistics_describe_the_per_tensor_clip_population(self):
+        first = torch.nn.Parameter(torch.zeros(2))
+        second = torch.nn.Parameter(torch.zeros(1))
+        first.grad = torch.tensor([3.0, 4.0])
+        second.grad = torch.tensor([10.0])
+
+        global_norm, median, clipped_fraction = gradient_norm_statistics([first, second], clip_norm=6.0)
+
+        torch.testing.assert_close(global_norm, torch.tensor(125.0).sqrt())
+        torch.testing.assert_close(median, torch.tensor(5.0))
+        torch.testing.assert_close(clipped_fraction, torch.tensor(0.5))
+
     def test_wandb_omits_unavailable_metrics_but_preserves_numeric_nan(self):
         class Run:
             def __init__(self):
@@ -138,6 +150,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         # Position-control defaults (Q14 promotion): eigh aim, full-spectrum
         # rotation, EMA constant at the measured knee.
         self.assertEqual(args.grassmann_aim, "eigh")
+        self.assertEqual(build_parser().parse_args(["--grassmann-aim", "oja"]).grassmann_aim, "oja")
         self.assertIsNone(args.grassmann_rotate_rank)
         self.assertEqual(args.grassmann_step_size, 0.25)
         self.assertFalse(hasattr(args, "grassmann_step_schedule"))

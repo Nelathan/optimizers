@@ -61,6 +61,15 @@ def gradient_norm(params: list[torch.nn.Parameter]) -> torch.Tensor:
     return tensor_global_norm([param.grad for param in params if param.grad is not None])
 
 
+@torch.no_grad()
+def gradient_norm_statistics(
+    params: list[torch.nn.Parameter], clip_norm: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    norms = torch.stack([param.grad.detach().float().norm() for param in params if param.grad is not None])
+    clipped_fraction = (norms > clip_norm).float().mean() if clip_norm > 0 else None
+    return norms.norm(), norms.median(), clipped_fraction
+
+
 def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float | None:
     diagnostics = getattr(optimizer, "last_step_diagnostics", None)
     if not diagnostics:
@@ -770,9 +779,10 @@ def train_step(
     batches,
     start_index: int,
     grad_accum_steps: int,
+    grad_clip_norm: float,
     collect_norms: bool,
     collect_basis: bool,
-) -> dict[str, float | torch.Tensor]:
+) -> dict[str, float | torch.Tensor | None]:
     if hasattr(optimizer, "diagnostics_enabled"):
         optimizer.diagnostics_enabled = collect_norms or collect_basis
     if hasattr(optimizer, "diagnostics_leverage_enabled"):
@@ -788,16 +798,14 @@ def train_step(
         loss = cce_causal_lm_loss(model, batch)
         (loss / grad_accum_steps).backward()
         losses.append(loss.detach().float())
-    grad_norm = gradient_norm(trainable) if collect_norms else float("nan")
-    # The optimizer clips PER TENSOR at grad_clip_norm; the global norm above sums
-    # over ~all tensors and so cannot be read against that rail (and it scales with
-    # batch noise, e.g. ~2x higher at bs4 than bs16). Log the max per-tensor norm
-    # too so "is the clip firing" is answerable from the curves.
-    grad_norm_max_tensor = (
-        max(param.grad.detach().float().norm() for param in trainable if param.grad is not None)
-        if collect_norms
-        else float("nan")
-    )
+    if collect_norms:
+        grad_norm, grad_norm_median_tensor, grad_clip_fraction = gradient_norm_statistics(
+            trainable, grad_clip_norm
+        )
+    else:
+        grad_norm = float("nan")
+        grad_norm_median_tensor = float("nan")
+        grad_clip_fraction = None
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
     optimizer.step()
     update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
@@ -816,7 +824,8 @@ def train_step(
     return {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
-        "grad_norm_max_tensor": grad_norm_max_tensor,
+        "grad_norm_median_tensor": grad_norm_median_tensor,
+        "grad_clip_fraction": grad_clip_fraction,
         "param_norm": param_norm,
         "update_norm": update_norm,
         "update_to_param_ratio": update_to_param_ratio,
@@ -957,7 +966,7 @@ def run_optimizer(
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
         apply_lr_warmup(optimizer, base_lrs, step + 1, args.lr_warmup_steps)
-        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, False, False)
+        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.grad_clip_norm, False, False)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -979,6 +988,7 @@ def run_optimizer(
             train_batches,
             batch_index,
             args.grad_accum_steps,
+            args.grad_clip_norm,
             collect_norms,
             collect_basis,
         )
@@ -991,7 +1001,8 @@ def run_optimizer(
             train_metrics = {
                 "train/loss": train_loss,
                 "train/grad_norm": scalar(step_result["grad_norm"]),
-                "train/grad_norm_max_tensor": scalar(step_result["grad_norm_max_tensor"]),
+                "train/grad_norm_median_tensor": scalar(step_result["grad_norm_median_tensor"]),
+                "train/grad_clip_fraction": scalar_or_none(step_result["grad_clip_fraction"]),
                 "train/update_norm": scalar_or_none(step_result["update_norm"]),
                 "train/update_to_param_ratio": scalar_or_none(step_result["update_to_param_ratio"]),
                 "opt/projected_grad_norm": scalar_or_none(step_result["projected_grad_norm"]),
@@ -1189,9 +1200,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
     parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="boundary-controller fraction for eigh (1.0 = snap); 0.25 is the measured EIGH knee. Under the tangent ablation, rotation = step_size * sigma. direct_oja uses its fixed calibrated 0.04 step instead.")
+    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="boundary-controller fraction for eigh (1.0 = snap); 0.25 is the measured EIGH knee. Under the tangent ablation, rotation = step_size * sigma. oja uses its fixed calibrated 0.01 step instead.")
     parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="how many principal-angle planes the geodesic rotates per refresh. Default None = ALL planes (full-spectrum position control, the Q13/Q14 winner). Set 1 for SubTrack-faithful single-plane drift (ablation).")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "direct_oja"), default="eigh", help="basis update law. eigh is the released fixed-.25 boundary controller; direct_oja moves the live frame every gradient with the calibrated one-state geodesic step; tangent is the historical SubTrack ablation.")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="eigh", help="basis update law. eigh is the released fixed-.25 boundary controller; oja moves the live frame every gradient with the calibrated one-state geodesic step; tangent is the historical SubTrack ablation.")
     parser.add_argument("--basis-refresh-interval", type=int, default=10)
     parser.add_argument(
         "--basis-refresh-schedule",

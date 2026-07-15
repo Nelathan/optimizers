@@ -7,7 +7,7 @@ import torch
 
 import usuitrack
 from usuitrack import SubspaceProjector, UsuiTrack, optimizer_state_bytes_by_category
-from usuitrack.optimizer import DIRECT_OJA_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
+from usuitrack.optimizer import OJA_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
 
 
 class UsuiTrackTest(unittest.TestCase):
@@ -107,7 +107,7 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertNotIn("prev_eigh_target", state)
         self.assertIn("basis_lag_snapshot", state)
 
-    def test_direct_oja_moves_live_basis_every_gradient_without_second_frame(self):
+    def test_oja_moves_live_basis_every_gradient_without_second_frame(self):
         torch.manual_seed(53)
         weight = torch.nn.Parameter(torch.randn(12, 8, dtype=torch.bfloat16))
         opt = UsuiTrack(
@@ -118,7 +118,7 @@ class UsuiTrackTest(unittest.TestCase):
             moment_mode="ema",
             grad_clip_norm=None,
             basis_refresh_interval=10,
-            grassmann_aim="direct_oja",
+            grassmann_aim="oja",
         )
 
         weight.grad = torch.randn_like(weight)
@@ -133,7 +133,7 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertEqual(state["basis"].dtype, torch.bfloat16)
         self.assertLess(float((state["basis"].float() @ state["basis"].float().mT - torch.eye(4)).norm()), 2e-2)
 
-    def test_direct_oja_basis_lag_uses_fixed_optimizer_step_horizon(self):
+    def test_oja_basis_lag_uses_fixed_optimizer_step_horizon(self):
         torch.manual_seed(57)
         weight = torch.nn.Parameter(torch.randn(10, 6))
         opt = UsuiTrack(
@@ -143,7 +143,7 @@ class UsuiTrackTest(unittest.TestCase):
             side="right",
             moment_mode="ema",
             grad_clip_norm=None,
-            grassmann_aim="direct_oja",
+            grassmann_aim="oja",
         )
         opt.diagnostics_enabled = True
         opt.diagnostics_basis_enabled = True
@@ -157,7 +157,7 @@ class UsuiTrackTest(unittest.TestCase):
             else:
                 self.assertGreater(lag, 0.0)
 
-    def test_direct_oja_reuses_held_projection_as_moving_frame_coordinates(self):
+    def test_oja_reuses_held_projection_as_moving_frame_coordinates(self):
         torch.manual_seed(59)
         weight = torch.nn.Parameter(torch.randn(10, 6))
         opt = UsuiTrack(
@@ -168,7 +168,7 @@ class UsuiTrackTest(unittest.TestCase):
             side="right",
             moment_mode="ema",
             grad_clip_norm=None,
-            grassmann_aim="direct_oja",
+            grassmann_aim="oja",
         )
 
         weight.grad = torch.randn_like(weight)
@@ -184,7 +184,7 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertFalse(torch.equal(state["basis"], old_basis))
         torch.testing.assert_close(state["projected_exp_avg"], 0.9 * old_moment + 0.1 * held_projection)
 
-    def test_direct_oja_state_dict_continuation_is_deterministic(self):
+    def test_oja_state_dict_continuation_is_deterministic(self):
         torch.manual_seed(67)
         first = torch.nn.Parameter(torch.randn(10, 6, dtype=torch.bfloat16))
         kwargs = dict(
@@ -193,7 +193,7 @@ class UsuiTrackTest(unittest.TestCase):
             side="right",
             moment_mode="ema",
             grad_clip_norm=None,
-            grassmann_aim="direct_oja",
+            grassmann_aim="oja",
         )
         first_opt = UsuiTrack([first], **kwargs)
         for _ in range(4):
@@ -216,8 +216,8 @@ class UsuiTrackTest(unittest.TestCase):
             second_opt.state[second]["projected_exp_avg"],
         )
 
-    def test_direct_oja_step_is_fixed_replay_contract(self):
-        self.assertEqual(DIRECT_OJA_STEP_SIZE, 0.04)
+    def test_oja_step_is_fixed_replay_contract(self):
+        self.assertEqual(OJA_STEP_SIZE, 0.01)
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))

@@ -20,7 +20,7 @@ NEWTON_SCHULZ_COEFFICIENTS = (
     (2.8769, -3.1427, 1.2046),
     (2.8366, -3.0525, 1.2012),
 )
-DIRECT_OJA_STEP_SIZE = 0.04
+OJA_STEP_SIZE = 0.01
 
 
 @dataclass
@@ -99,8 +99,8 @@ class UsuiTrack(Optimizer):
             raise ValueError(f"grassmann_step_size must be positive, got {grassmann_step_size}")
         if grassmann_rotate_rank is not None and grassmann_rotate_rank < 1:
             raise ValueError(f"grassmann_rotate_rank must be None (all planes) or >= 1, got {grassmann_rotate_rank}")
-        if grassmann_aim not in ("tangent", "eigh", "direct_oja"):
-            raise ValueError(f"grassmann_aim must be one of 'tangent', 'eigh', 'direct_oja', got {grassmann_aim!r}")
+        if grassmann_aim not in ("tangent", "eigh", "oja"):
+            raise ValueError(f"grassmann_aim must be one of 'tangent', 'eigh', 'oja', got {grassmann_aim!r}")
         if basis_refresh_interval <= 0:
             raise ValueError(f"basis_refresh_interval must be positive, got {basis_refresh_interval}")
         if aurora_pp_iterations <= 0:
@@ -326,7 +326,7 @@ class UsuiTrack(Optimizer):
         state = self.state[p]
         projector = self._projector_from_state(p, group, state)
         if queued_projected_grad is not None:
-            if group["grassmann_aim"] == "direct_oja":
+            if group["grassmann_aim"] == "oja":
                 raise RuntimeError("Oja basis updates require a full matrix gradient on every step")
             if group["moment_mode"] == "adafactor_ema":
                 raise RuntimeError("adafactor_ema moment_mode dampens the full gradient before projection and is incompatible with queued projected gradients")
@@ -391,7 +391,7 @@ class UsuiTrack(Optimizer):
             if not was_initialized:
                 basis_moved = self._refresh_projector(projector, grad, group, state, diagnostics)
             else:
-                if aim == "direct_oja":
+                if aim == "oja":
                     basis_moved = self._refresh_projector(
                         projector,
                         grad,
@@ -405,7 +405,7 @@ class UsuiTrack(Optimizer):
             # Direct Oja consumes GQ to steer Q, then carries those projected
             # coordinates through the rigid frame move unchanged. This avoids a
             # second full projection and matches the moving-frame moment contract.
-            if aim == "direct_oja" and held_projected_grad is not None:
+            if aim == "oja" and held_projected_grad is not None:
                 projected_grad = held_projected_grad
             else:
                 projected_grad = projector.project(grad) if basis_moved or held_projected_grad is None else held_projected_grad
@@ -638,8 +638,8 @@ class UsuiTrack(Optimizer):
                 step_size=group["grassmann_step_size"],
                 rotate_rank=rotate_rank,
             )
-        elif aim == "direct_oja":
-            projector.update_oja(grad, step_size=DIRECT_OJA_STEP_SIZE, projected=projected_grad)
+        elif aim == "oja":
+            projector.update_oja(grad, step_size=OJA_STEP_SIZE, projected=projected_grad)
         else:
             # Velocity control (SubTrack-faithful single-grad tangent step): kept as
             # the reference/ablation arm. The C1 window accumulator was deleted when

@@ -187,7 +187,7 @@ class SubspaceProjectorTest(unittest.TestCase):
             # Full-spectrum turns the basis at least as far as drift (total radians).
             self.assertGreaterEqual(projector.last_rotation_angle, rank1.last_rotation_angle, msg=f"shape={shape}")
 
-    def test_direct_oja_moves_toward_dominant_subspace_on_both_sides(self):
+    def test_oja_moves_toward_dominant_subspace_on_both_sides(self):
         torch.manual_seed(31)
         for shape, side in (((18, 12), "right"), ((12, 18), "left")):
             dimension = min(shape)
@@ -206,7 +206,7 @@ class SubspaceProjectorTest(unittest.TestCase):
             self.assertLess(after, before * 0.75, msg=f"side={side}")
             self.assertLess(float(projector.orthonormality_error()), 1e-5, msg=f"side={side}")
 
-    def test_repeated_direct_oja_keeps_bf16_basis_stable(self):
+    def test_repeated_oja_keeps_bf16_basis_stable(self):
         torch.manual_seed(37)
         gradient = torch.randn(24, 16, dtype=torch.bfloat16)
         bf16 = SubspaceProjector(rank=6, side="right")

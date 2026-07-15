@@ -122,16 +122,18 @@ building feedback control. A controller without an open-loop trace is ceremony.
 
 ### R5. Can online tracking improve the target aim?
 
-Yes at rank 32. Direct one-state geodesic Oja (`Q` itself, fixed step `.04`) is
-the surviving challenger to the released fixed `.25` boundary-EIGH controller.
+Yes at rank 32. One-state geodesic Oja (`grassmann_aim="oja"`, using `Q` itself)
+is the surviving challenger to the released fixed `.25` boundary-EIGH
+controller. The deleted two-frame arm supplied the temporary need for the name
+"direct Oja"; the surviving mechanism is now simply Oja.
 The evaluated separate Oja target was deleted after replay-scale evidence: it
-added a second frame and a second low-pass controller without beating direct
+added a second frame and a second low-pass controller without beating one-state
 tracking.
 
 A rank-32, 200-step transformer-gradient diagnostic established the reason for
 the comparison. Mean next-interval predictive capture over mature steps 110-200 was
 `.4588` for the raw boundary EIGH target, `.5077` for live `.25`-EIGH `Q`, `.5299`
-for separate Oja `.0625`, and `.5274` for direct Oja `.04`. Oja therefore found a
+for separate Oja `.0625`, and `.5274` for one-state Oja `.04`. Oja therefore found a
 more predictive, much lower-churn blind-spot frame; this was estimator evidence,
 not evidence that applying Oja improves training loss.
 
@@ -146,19 +148,19 @@ synthetic estimator harness did not earn continued maintenance and were removed.
 A 500-update left/right covariance probe compared persistent bf16 and fp32 Oja
 frames at rank 32. The discarded separate Euler/QR target differed by about `.13`
 radians total and had indistinguishable capture (`~.93077` versus `~.93080`).
-Direct bf16 Oja differed from fp32 by about `.16-.17` radians with capture
+One-state bf16 Oja differed from fp32 by about `.16-.17` radians with capture
 differing by at most `.00011` after its numerical invariant was repaired.
 
 That repair matters: the existing boundary geodesic's tiny orthogonality error
 compounded under per-gradient use, reaching catastrophic error in both fp32 and
-bf16. Direct Oja now projects each raw geodesic result back to Stiefel and
+bf16. Oja now projects each raw geodesic result back to Stiefel and
 Procrustes-registers the corrected frame to the raw geodesic gauge before storage.
 Over 500 updates fp32 orthogonality error stayed around `4e-6` and bf16 around
 `.007`, rather than diverging. The Oja ascent sign is separately pinned: the
 generic retraction steps along the negative of its supplied cost tangent, so the
 covariance ascent tangent must be negated at that boundary.
 
-Direct Oja reuses held `GQ` both for its covariance action and as the projected
+Oja reuses held `GQ` both for its covariance action and as the projected
 gradient coordinates carried through the rigid frame move. It therefore needs
 only the covariance backprojection plus the stabilized small-frame retraction,
 not a second full projection or second basis state.
@@ -167,7 +169,7 @@ not a second full projection or second basis state.
 
 Fresh matched rank-32 health checks first established finite behavior. Final
 target loss at step 200 was `2.010188` for EIGH, `2.009062` for the separate Oja
-target, and `2.007628` for direct Oja. Direct Oja led at every 50-step evaluation
+target, and `2.007628` for one-state Oja. Oja led at every 50-step evaluation
 and used the same matrix state as EIGH. The separate target added `6,029,312`
 bf16 bytes.
 
@@ -175,7 +177,7 @@ The decisive replay used the same LFM2.5-350M, rank-32, broad-no-embedding,
 right-padded SYNTH contract for 500 steps with `torch.compile`, evaluation every
 50 steps, and W&B project `pink-marker/usuitrack`:
 
-| step | EIGH `.25` | separate Oja target | direct Oja `.04` |
+| step | EIGH `.25` | separate Oja target | one-state Oja `.04` |
 |---:|---:|---:|---:|
 | 50 | 2.206577 | 2.207120 | **2.206353** |
 | 100 | 2.109085 | 2.109607 | **2.108134** |
@@ -188,8 +190,8 @@ right-padded SYNTH contract for 500 steps with `torch.compile`, evaluation every
 | 450 | 1.907060 | 1.902743 | **1.902104** |
 | 500 | 1.895432 | 1.891082 | **1.890727** |
 
-Runs: EIGH `o2prop3k`, separate target `nm7jcgbc`, direct Oja `r50bh8jw`.
-Direct Oja led at every checkpoint, beat EIGH by `.004705` at step 500, and beat
+Runs: EIGH `o2prop3k`, separate target `nm7jcgbc`, one-state Oja `r50bh8jw`.
+Oja led at every checkpoint, beat EIGH by `.004705` at step 500, and beat
 the separate target by `.000355`. Its final held-frame capture was `.5081`
 versus `.4820` EIGH and `.5114` separate-target; Aurora alignment was `.8363`
 versus `.8285` and `.8330`; moment effective rank was `27.73` versus `27.41` and
@@ -198,19 +200,19 @@ This is target-loss evidence only: no retention corpus was configured.
 
 The separate target's initially rising lag and later catch-up were the expected
 two serial low-pass filters—the online estimator followed by the `.25` boundary
-controller—not useful warmup. Direct Oja adapted immediately and consistently
+controller—not useful warmup. One-state Oja adapted immediately and consistently
 won loss. The separate estimator/controller arm was therefore deleted rather
 than retained as a user-facing option.
 
 One diagnostic bug was found while closing the comparison: basis lag was measured
 over five basis moves. That meant 50 optimizer steps for boundary arms but only
-five steps for direct Oja, so the logged direct lag masses are not numerically
+five steps for Oja, so the logged Oja lag masses are not numerically
 comparable to EIGH or the separate target. The implementation now uses a fixed
 50-optimizer-step snapshot horizon for every aim. This does not affect training
 or any reported loss.
 
 Compiled measured throughput was 18,631 tokens/s for EIGH, 19,684 for the
-separate target, and 17,929 for direct Oja. Direct Oja is therefore about 3.8%
+separate target, and 17,929 for one-state Oja. Oja was therefore about 3.8%
 slower than EIGH in this single run. Do not infer the exact source from aggregate
 walltime: profile the reduced QR plus rank-space Procrustes SVD before changing
 the geometry. If stabilization is the measured tax, test the existing Polar
@@ -219,20 +221,47 @@ step; do not introduce another polar implementation. Replay any changed
 stabilization before promotion.
 
 Rank 32 was deliberate: it is a rank-starved tracking stress test, not a proposed
-product rank. The promotion rank remains open. Rank 64 is only the current harness
-default; historical 128/256 runs still showed quality gains and healthy rank use
-on this small model. Choose the rank for the matched 1k promotion comparison
-explicitly rather than laundering the harness default into a product decision.
+product rank. Rank 128 is the chosen promotion lane. Historical 128/256 runs
+showed quality gains and healthy rank use, but better tracking may move the rank
+Pareto frontier; returning directly to 256 would assume the old frontier survived
+the new controller.
+
+#### Rank-128 promotion sensors
+
+The first compiled bs16, 200-step sensor used Oja step `.02`, raw clip `2.0`, and
+source retention (W&B `mcib2cti`). Target loss moved `2.296923 -> 1.887331` and
+source `2.917480 -> 2.946691`. Final capture was `.645365`, alignment `.778973`,
+moment effective rank `104.30/128`, step angle mass `1.663318`, and corrected
+50-step lag mass `20.969606`. The frame was healthy and adaptive but visibly
+churny. No tensor crossed the raw `2.0` clip at the final logged step; median
+per-tensor raw norm was `.424750`.
+
+A second sensor used Oja step `.01` and raw clip `1.0` (W&B `tjsljczt`). Target
+finished slightly worse at `1.889800`; source was effectively identical at
+`2.946424`. Step mass nearly halved to `.860838`, while 50-step lag fell only
+about 35% to `13.624978`. Capture, alignment, and effective rank were slightly
+lower at `.633374`, `.767387`, and `102.79/128`. The median raw norm remained
+`.425403`, and `9.59%` of tensors crossed the tighter clip.
+
+The pair shows the intended freshness/stability tradeoff: `.01` is steadier and
+slightly slower to fit at 200 steps. It does not isolate step size because the
+raw clip changed simultaneously. Total angle mass also sums over all principal
+planes, so its growth with rank does not by itself establish a rank scaling law.
+An implicit step or LR scale such as `1/sqrt(rank)` remains a hypothesis, not a
+current mechanism.
 
 Do not add a harmonic warm-start arm yet: applying `1/n`-style steps immediately
 is hottest when observations are noisiest, while delaying all basis application
 would add ceremony unsupported by the nearly identical warmup losses. Fixed
 steps keep the causal comparison clean.
 
-The current released/default mechanism remains fixed `.25` EIGH until direct Oja
-survives stabilization-cost work (if needed) and a matched 1k promotion
-comparison. Predictive sensors and 500-step target loss nominate the challenger;
-the default changes only after the promotion run and documentation review.
+The current released/default mechanism remains fixed `.25` EIGH until Oja wins a
+matched compiled rank-128 1k comparison with source retention and a final quality
+sample. Evaluate target and source loss every 100 steps and log training telemetry
+every 25. If it wins clearly, promote Oja, update `SPEC.md`, and merge the
+completed basis-update branch. If it does not, Oja has earned diagnosis through
+geometry, health tests, and focused mathematical or engineering repair rather
+than quick abandonment or an arm garden.
 
 ### R6. Do cutoff planes poison stable planes?
 
