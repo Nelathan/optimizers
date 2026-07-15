@@ -170,6 +170,12 @@ The car holds a four-wheel slide through the whole spectrum. Each principal plan
 turns by its own angle. The cutoff planes dance; the stable planes pull. The line
 emerges from their argument.
 
+That controller remains in the notebook as the boundary EIGH test car. The road
+car now reads every full contact patch: one-state Oja turns the same live frame a
+fixed hundredth-step along its covariance tangent, through every tracked plane,
+then squares the chassis with a Polar Express correction. No second frame rides
+along. The quarter-turn boundary controls belong to the test car, not this one.
+
 ---
 
 ## December 18, no lift
@@ -268,11 +274,11 @@ No component is heroic alone. The build works because the parts agree:
 ```text
 raw clip              protects every later memory
 factored variance     reads traction cheaply
-eigh target           sees the exit
-fractional geodesic   turns without panic
+EIGH initialization   finds the first line
+one-state Oja         reads and turns on every contact patch
 identity transport    keeps speed through the slide
 projected EMA         holds the line
-Aurora + NS            distributes force across it
+Aurora + NS           distributes force across it
 Muon scale            matches force to the full chassis
 ```
 

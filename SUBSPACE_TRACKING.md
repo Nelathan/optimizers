@@ -6,24 +6,26 @@ including superseded defaults and failed mechanisms, is preserved in
 
 ## Settled current mechanism
 
-For a canonical column frame `Q:[d,r]`, each refresh constructs a target frame
-`T` from the Adafactor-conditioned boundary gradient's side Gram. The basis moves
-one fraction `eta=0.25` toward `T` along every principal plane of the selected
-Grassmann geodesic.
+For a canonical column frame `Q:[d,r]`, one-state Oja reads every
+Adafactor-conditioned full gradient, forms its horizontal covariance tangent at
+the live frame, and moves fixed step `eta=0.01` along every tangent plane's exact
+Grassmann geodesic. One Polar Express correction restores the Stiefel invariant.
 
 ```text
-T   = eigh_target(conditioned_gradient)
-Q_+ = geodesic(Q, T, eta=0.25, all_planes=True)
+Delta = normalized_oja_tangent(conditioned_full_gradient, Q)
+Q_+   = polar_express(geodesic(Q, Delta, eta=0.01, all_planes=True))
 ```
 
-This is position control. Consecutive noisy targets scatter around the signal
-subspace, so target error decays rather than integrating as angular velocity.
-Tangent aim remains only as a SubTrack-faithful single-gradient ablation.
+This is the released tracker. It stores no second frame and requires a full
+matrix gradient every step. Fixed `.25` boundary EIGH position control and
+tangent velocity control remain explicit ablations. Their refresh interval,
+schedule, step, and rotate-rank controls are inert under Oja.
 
-The mature-EMA/Karcher schedule (`1/2, 1/3, …`, floor `0.1`) improved basis and
-moment health but did not improve target loss against the fixed `eta=0.25`
-controller. A replay-stable 500-step comparison was effectively neutral/slightly
-worse on loss; fixed `0.25` remains the default. At 200 steps, projecting the
+In the retained EIGH ablation, the mature-EMA/Karcher schedule (`1/2, 1/3, …`,
+floor `0.1`) improved basis and moment health but did not improve target loss
+against the fixed `eta=0.25` controller. A replay-stable 500-step comparison was
+effectively neutral/slightly worse on loss; fixed `0.25` remains that ablation's
+setting. At 200 steps, projecting the
 refresh boundary gradient with either the held frame or the just-updated frame
 was indistinguishable (`2.011840` vs `2.011878` target loss), while injecting the
 full instantaneous target was worse (`2.012180`). The fractional moving frame is
@@ -73,12 +75,12 @@ purpose
     follow a drifting useful gradient subspace without storing full history
 
 assumption
-    instantaneous spectral targets are noisy positions around a useful center;
+    online conditioned covariance action tracks a useful drifting subspace;
     moving-frame momentum is the useful history semantics for Aurora
 
 intervention
-    frozen vs position aim; identity vs overlap vs reset transport; target/path
-    stress; refresh cadence
+    frozen vs Oja vs boundary EIGH; identity vs overlap vs reset transport;
+    path stress; Oja cadence
 
 observable
     principal-angle motion, capture, target stability, pre-Aurora moment spectrum,
@@ -95,7 +97,7 @@ These are independent axes whose signs are not assumed.
 
 ### R1. Is tracking worth keeping?
 
-Compare frozen `eigh` initialization with current position control over a horizon
+Compare frozen `eigh` initialization with current Oja over a horizon
 long enough for capture to decay. Read capture, target loss, source loss, and
 walltime. A null product result makes frozen `eigh` a serious simplification, not
 an embarrassing outcome.
@@ -114,18 +116,19 @@ Stress gauge/sign changes, cutoff eigenvalue crossings, and near-orthogonal targ
 frames. Distinguish a correct transport along an unstable selected path from an
 incorrect transport formula.
 
-### R4. Does cadence deserve intelligence?
+### R4. Does Oja cadence deserve intelligence?
 
-Measure refresh and non-refresh walltime first. If fixed cadence is material,
-compare fixed 10, fixed 100, and a monotone `10 -> 20 -> 50 -> 100` schedule before
-building feedback control. A controller without an open-loop trace is ceremony.
+Current Oja deliberately consumes every gradient; boundary refresh cadence does
+not govern it. Sparse Oja with a correspondingly larger step is a later
+estimator-variance comparison, not an equivalent free speedup. Measure that axis
+directly before building a schedule or feedback controller.
 
 ### R5. Can online tracking improve the target aim?
 
-Yes at rank 32. One-state geodesic Oja (`grassmann_aim="oja"`, using `Q` itself)
-is the surviving challenger to the released fixed `.25` boundary-EIGH
-controller. The deleted two-frame arm supplied the temporary need for the name
-"direct Oja"; the surviving mechanism is now simply Oja.
+Yes. One-state geodesic Oja (`grassmann_aim="oja"`, using `Q` itself) is the
+released tracker; fixed `.25` boundary EIGH is now the position-control ablation.
+The deleted two-frame arm supplied the temporary need for the name "direct Oja";
+the surviving mechanism is simply Oja.
 The evaluated separate Oja target was deleted after replay-scale evidence: it
 added a second frame and a second low-pass controller without beating one-state
 tracking.
@@ -153,12 +156,13 @@ differing by at most `.00011` after its numerical invariant was repaired.
 
 That repair matters: the existing boundary geodesic's tiny orthogonality error
 compounded under per-gradient use, reaching catastrophic error in both fp32 and
-bf16. Oja now projects each raw geodesic result back to Stiefel and
-Procrustes-registers the corrected frame to the raw geodesic gauge before storage.
-Over 500 updates fp32 orthogonality error stayed around `4e-6` and bf16 around
-`.007`, rather than diverging. The Oja ascent sign is separately pinned: the
-generic retraction steps along the negative of its supplied cost tangent, so the
-covariance ascent tangent must be negated at that boundary.
+bf16. The first repair used QR plus Procrustes registration. The promoted hot path
+computes the same geodesic from the rank-space tangent Gram and applies one
+near-identity Polar Express correction before storage, removing both
+decompositions while preserving the intended subspace and gauge to replay
+precision. Over 500 updates fp32 orthogonality error stayed around `4e-6` and
+bf16 around `.007`, rather than diverging. The Oja ascent sign is separately
+pinned against the generic cost-tangent retraction.
 
 Oja reuses held `GQ` both for its covariance action and as the projected
 gradient coordinates carried through the rigid frame move. It therefore needs
@@ -250,24 +254,63 @@ planes, so its growth with rank does not by itself establish a rank scaling law.
 An implicit step or LR scale such as `1/sqrt(rank)` remains a hypothesis, not a
 current mechanism.
 
-Do not add a harmonic warm-start arm yet: applying `1/n`-style steps immediately
-is hottest when observations are noisiest, while delaying all basis application
-would add ceremony unsupported by the nearly identical warmup losses. Fixed
-steps keep the causal comparison clean.
+A mature-step Oja start is now a specific follow-up hypothesis, not part of the
+efficiency cut: initialize with EIGH, then use harmonic steps `1/2, 1/3, 1/4, ...`
+down to the steady `.01` floor. This could remove Oja's early adaptation lag
+without changing its converged motion. Test it only after the current per-step
+implementation is fast; a cadence change and a step schedule must remain separate
+interventions.
 
-The current released/default mechanism remains fixed `.25` EIGH until Oja wins a
-matched compiled rank-128 1k comparison with source retention and a final quality
-sample. Evaluate target and source loss every 100 steps and log training telemetry
-every 25. If it wins clearly, promote Oja, update `SPEC.md`, and merge the
-completed basis-update branch. If it does not, Oja has earned diagnosis through
-geometry, health tests, and focused mathematical or engineering repair rather
-than quick abandonment or an arm garden.
+The matched compiled rank-128 1k promotion comparison showed a real but slight
+target/source trade, not Pareto dominance. Oja crossed EIGH around step 400 and
+finished slightly better on target loss (`1.732211` versus `1.733106`) while slightly worse
+on source loss (`2.990691` versus `2.989094`). Final held-frame capture was
+materially better (`.681027` versus `.653297`); alignment and moment effective
+rank converged to the same endpoint. Over a comparable 50-step horizon, Oja lag
+mass fell cleanly to `8.1480` while EIGH remained at `56.6568`, and Oja's step mass
+declined to `.7193` rather than chasing EIGH's noisy boundary targets.
+
+Runs: EIGH `0vfocafl`; Oja `0knxstwb`. Oja paid `1.292748 s/step` versus
+`.944404 s/step`, a 36.9% training-time tax (`12,674` versus `17,349` tokens/s).
+Profiling located the tax in 92 tall tangent SVDs plus 92 QR/Procrustes
+stabilizations per step. The semantics-preserving replacement computes the exact
+geodesic from the `r x r` tangent Gram, applies one near-identity Polar Express
+correction in the same gauge, and batches equal-rank eigendecompositions within
+each parameter group. On the rank-128 product topology, synthetic optimizer-only
+time fell from `616.9 ms` to `122.1 ms`; the non-refresh EIGH baseline was
+`83.0 ms`, so Oja's incremental tax fell from `533.9 ms` to `39.1 ms` without
+changing cadence, step size, initialization, or moving-frame coordinates.
+
+The matched rank-128 500-step replay confirmed both semantics and walltime. The
+optimized Oja trajectory reproduced the old implementation at step 500 to
+`0.0000017` target loss and `0.0000076` source loss. Against a fresh EIGH control,
+Oja reached `1.782755 / 2.974067` target/source versus EIGH's
+`1.783133 / 2.972688`, while training at `.8318 s/step` versus `.9229 s/step`
+(`19,697` versus `17,752` tokens/s). Runs: Oja `pc69yp41`; EIGH `ji7sf72c`.
+Per-gradient Oja was therefore 9.9% faster in the matched training contract, not
+merely faster in the synthetic optimizer profile. The avoidable implementation
+tax was no longer a promotion blocker.
+
+A full-path profiler then separated ordinary from telemetry steps. It identified
+three remaining accidental costs: a full-size Adafactor reconstruction temporary,
+per-matrix Aurora health eigensolves, and serial post-EIGH Oja geometry. Separable
+Adafactor scaling plus batched equal-shape health and Oja geometry reduced the
+9:1 telemetry-weighted synthetic optimizer path from `131.5 ms` before this pass
+to `100.5 ms`. The final replay `dpiwqydb` reached `1.783078 / 2.973868` at
+`.803951 s/step` (`20,379` tokens/s), versus fresh EIGH control `ji7sf72c` at
+`1.783133 / 2.972688` and `.922948 s/step`. It also stayed within `0.000323`
+target and `0.000199` source loss of the preceding optimized Oja replay, while
+capture (`.66399`), 50-step lag (`9.6092`), alignment (`.83559`), and effective
+rank (`110.30 / 128`) held. Oja is therefore 12.9% faster than EIGH in the final
+matched training contract, and the Phase 1 promotion gate is satisfied. This
+does not erase the slight source-retention cost. Sparse Oja with a larger step is
+a later estimator-variance trade, not a free equivalent of per-gradient Oja.
 
 ### R6. Do cutoff planes poison stable planes?
 
 Measure per-plane target stability and contribution to capture. A stable-prefix
 rotation is interesting only if cutoff churn demonstrably harms useful planes.
-Otherwise full-spectrum position control remains simpler.
+Otherwise all-plane Oja remains the simpler released policy.
 
 ### R7. Where is the compile boundary?
 
@@ -297,7 +340,7 @@ No new aim, transport, target, or schedule mechanism enters the main path unless
 it does at least one of the following:
 
 - deletes state or tracking machinery;
-- reduces measured refresh walltime;
+- reduces measured tracking walltime;
 - repairs a demonstrated faithfulness failure;
 - improves capture and evaluation under drift.
 

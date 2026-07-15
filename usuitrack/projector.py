@@ -6,6 +6,7 @@ from enum import StrEnum
 
 import torch
 from torch import Tensor
+from heavyball.utils import ABC_LIST_STABLE
 
 
 class ProjectionSide(StrEnum):
@@ -233,15 +234,101 @@ class SubspaceProjector:
         return tangent / rayleigh.diagonal().mean().clamp_min(1e-12)
 
     @torch.no_grad()
-    def update_oja(self, matrix: Tensor, step_size: float, projected: Tensor | None = None) -> Tensor:
-        """Move the live frame by one horizontal geodesic Oja step."""
+    def update_oja(
+        self,
+        matrix: Tensor,
+        step_size: float,
+        projected: Tensor | None = None,
+        record_rotation: bool = True,
+    ) -> Tensor:
+        """Move the live frame by one exact full-rank geodesic Oja step.
 
-        return self.update_grassmann_from_tangent(
-            -self.oja_tangent(matrix, projected=projected),
+        Oja always rotates every tracked plane. Computing the geodesic from the
+        tangent Gram avoids a tall ``[d,r]`` SVD, and the final Polar Express
+        step removes storage error without QR plus a second SVD.
+        """
+
+        if step_size <= 0:
+            raise ValueError(f"step_size must be positive, got {step_size}")
+        if self.basis is None:
+            raise RuntimeError("cannot update Oja before fitting a basis")
+
+        tangent = self.oja_tangent(matrix, projected=projected)
+        tangent_gram = tangent.mT @ tangent
+        tangent_gram = 0.5 * (tangent_gram + tangent_gram.mT)
+        eigenvalues, eigenvectors = torch.linalg.eigh(tangent_gram)
+        return self.update_oja_from_eigh(
+            tangent,
+            eigenvalues,
+            eigenvectors,
             step_size=step_size,
-            rotate_rank=self.effective_rank(matrix),
-            stabilize=True,
+            record_rotation=record_rotation,
         )
+
+    @torch.no_grad()
+    def update_oja_from_eigh(
+        self,
+        tangent: Tensor,
+        eigenvalues: Tensor,
+        eigenvectors: Tensor,
+        step_size: float,
+        record_rotation: bool = True,
+    ) -> Tensor:
+        """Apply an Oja geodesic from a precomputed tangent eigendecomposition."""
+
+        if step_size <= 0:
+            raise ValueError(f"step_size must be positive, got {step_size}")
+        if self.basis is None:
+            raise RuntimeError("cannot update Oja before fitting a basis")
+
+        side = self._basis_side()
+        q = self.canonical_basis()
+        canon_new = self.oja_geodesic_from_eigh(q, tangent, eigenvalues, eigenvectors, step_size)
+        sigma = eigenvalues.clamp_min(0.0).sqrt()
+        rotation = step_size * sigma
+
+        if record_rotation:
+            self.last_rotation_angle = float(rotation.abs().sum().detach().cpu())
+
+        new_basis = canon_new.mT if side is ProjectionSide.RIGHT else canon_new
+        self.basis = new_basis.to(device=self.basis.device, dtype=self.basis.dtype).contiguous()
+        self.resolved_side = side
+        return self.basis
+
+    @staticmethod
+    def oja_geodesic_from_eigh(
+        frame: Tensor,
+        tangent: Tensor,
+        eigenvalues: Tensor,
+        eigenvectors: Tensor,
+        step_size: float,
+    ) -> Tensor:
+        """Apply exact Oja geodesics to one frame or a batch of equal-shape frames."""
+
+        sigma = eigenvalues.clamp_min(0.0).sqrt()
+        rotation = step_size * sigma
+        sin_over_sigma = torch.where(
+            sigma > 1e-7,
+            torch.sin(rotation) / sigma.clamp_min(1e-12),
+            torch.full_like(sigma, step_size),
+        )
+        canon_new = (
+            (frame @ eigenvectors) * torch.cos(rotation).unsqueeze(-2)
+            + (tangent @ eigenvectors) * sin_over_sigma.unsqueeze(-2)
+        ) @ eigenvectors.mT
+        return SubspaceProjector._polar_express_stiefel_correction(canon_new)
+
+    @staticmethod
+    def _polar_express_stiefel_correction(frame: Tensor) -> Tensor:
+        """One near-identity Polar Express step toward the frame's polar factor."""
+
+        gram = frame.mT @ frame
+        a, b, c = ABC_LIST_STABLE[-1]
+        correction = c * gram
+        correction.diagonal(dim1=-2, dim2=-1).add_(b)
+        correction = correction @ gram
+        correction.diagonal(dim1=-2, dim2=-1).add_(a)
+        return frame @ correction
 
     @torch.no_grad()
     def fit_random(self, matrix: Tensor) -> Tensor:
@@ -366,7 +453,7 @@ class SubspaceProjector:
         tangent: Tensor,
         step_size: float,
         rotate_rank: int = 1,
-        stabilize: bool = False,
+        record_rotation: bool = True,
     ) -> Tensor:
         """Retract along the exact Grassmann geodesic from a precomputed canon tangent.
 
@@ -399,12 +486,11 @@ class SubspaceProjector:
         # (``rank_k_matrix_estimation(..., k=1)``), whose single-batch residual
         # tail is near-isotropic noise -- rotating the full spectrum of a raw
         # tangent spins the basis on that noise (measured; drift-vs-spin record).
-        # The optimizer-level default is full-spectrum, because its default aim is
-        # a DENOISED object (eigh target under fractional-step position control,
+        # The explicit EIGH ablation uses full-spectrum rotation because its aim is
+        # a DENOISED object (an eigh target under fractional position control,
         # Q13/Q14): every principal angle carries signal there, and rotating them
         # all measured better than rank-1 on capture and loss.
         singular_u, singular_values, singular_v = self._rank_k_svd(tangent, rotate_rank)
-        self.last_tangent_sigma_max = float(singular_values.max().detach().cpu()) if singular_values.numel() else float("nan")
         # No sigma clip. A clip existed as blip safety, but whenever sigma sat above
         # it the rotation became a CONSTANT angle (step*clip) -- self-annealing died
         # and the geodesic limit-cycled instead of converging (measured in vitro:
@@ -431,25 +517,22 @@ class SubspaceProjector:
         # NOT report |sin(angle)|: sin peaks at angle=pi/2 and *comes back down* past
         # 90 deg, so it aliases a big (wrapping) rotation as a small one. The raw
         # radian never lies about magnitude. (``.sum()`` is total radians over the
-        # ``rotate_rank`` rotated directions -- length 1 on the default path.)
-        self.last_rotation_angle = float(rotation.abs().sum().detach().cpu()) if rotation.numel() else float("nan")
+        # ``rotate_rank`` rotated directions -- length 1 on the historical
+        # tangent-ablation path.)
+        if record_rotation:
+            if rotation.numel():
+                sigma_and_rotation = torch.stack((singular_values.max(), rotation.abs().sum())).detach().cpu()
+                self.last_tangent_sigma_max = float(sigma_and_rotation[0])
+                self.last_rotation_angle = float(sigma_and_rotation[1])
+            else:
+                self.last_tangent_sigma_max = float("nan")
+                self.last_rotation_angle = float("nan")
         cos_block = torch.diag(torch.cos(rotation))
         sin_block = torch.diag(torch.sin(-rotation))
         basis_v = canon_basis @ singular_v
         rotated = torch.cat([basis_v, singular_u], dim=1) @ torch.cat([cos_block, sin_block], dim=0)
         eye_rank = torch.eye(singular_v.shape[0], device=canon_basis.device, dtype=canon_basis.dtype)
         canon_new = rotated @ singular_v.mT + canon_basis @ (eye_rank - singular_v @ singular_v.mT)
-
-        if stabilize:
-            # Boundary EIGH moves are sparse enough that storage-rounding error is
-            # negligible. Direct Oja retracts every gradient, so the same tiny
-            # error compounds. Project back to Stiefel and Procrustes-register the
-            # corrected frame to the raw geodesic gauge before storing it. The
-            # correction changes neither the intended subspace nor projected
-            # coordinates beyond finite-precision error.
-            orthonormal, _ = torch.linalg.qr(canon_new, mode="reduced")
-            gauge_u, _gauge_s, gauge_vh = torch.linalg.svd(orthonormal.mT @ canon_new)
-            canon_new = orthonormal @ (gauge_u @ gauge_vh)
 
         # Back to storage layout: RIGHT is stored row-orthonormal, LEFT column-orthonormal.
         new_basis = canon_new.mT if side is ProjectionSide.RIGHT else canon_new
@@ -459,7 +542,13 @@ class SubspaceProjector:
         return self.basis
 
     @torch.no_grad()
-    def update_grassmann(self, matrix: Tensor, step_size: float, rotate_rank: int = 1) -> Tensor:
+    def update_grassmann(
+        self,
+        matrix: Tensor,
+        step_size: float,
+        rotate_rank: int = 1,
+        record_rotation: bool = True,
+    ) -> Tensor:
         """Refresh the basis with a Grassmann geodesic tangent step from ``matrix``.
 
         Composition of ``compute_tangent`` (tangent at the current basis) and
@@ -467,7 +556,12 @@ class SubspaceProjector:
         Single entry point for the SubTrack-faithful single-grad tangent path.
         """
 
-        return self.update_grassmann_from_tangent(self.compute_tangent(matrix), step_size=step_size, rotate_rank=rotate_rank)
+        return self.update_grassmann_from_tangent(
+            self.compute_tangent(matrix),
+            step_size=step_size,
+            rotate_rank=rotate_rank,
+            record_rotation=record_rotation,
+        )
 
     @staticmethod
     def _rank_k_svd(matrix: Tensor, k: int) -> tuple[Tensor, Tensor, Tensor]:

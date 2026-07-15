@@ -21,7 +21,7 @@ The order of evidence is:
 1. establish that rank-coordinate outliers exist and that the rotation flattens
    them;
 2. measure offline quantization damage in the state tensor's own geometry;
-3. measure propagation through the stochastic Karcher basis update and
+3. measure propagation through the one-state Oja basis update and
    Aurora/HeavyBall Newton--Schulz;
 4. run faithful SYNTH loss and source-retention comparisons only for survivors;
 5. count realized state bytes and walltime before calling a quality-neutral arm
@@ -42,11 +42,11 @@ the left. Define a canonical projected-coordinate tensor `C:[s,r]`:
 | right | `Q^T:[r,n]` | `M:[m,r]` | `Q:[n,r]` | `C=M:[m,r]` | `C Q^T` |
 | left | `Q:[m,r]` | `M:[r,n]` | `Q:[m,r]` | `C=M^T:[n,r]` | `Q C^T` |
 
-The basis target is the top-`r` frame from the Adafactor-conditioned boundary
-gradient. Every refresh moves `0.25` of each principal angle toward that target.
-This is a stochastic Karcher mean: the basis is itself the accumulator; there is
-no separate Karcher buffer. The projected first moment is an elementwise linear
-EMA in the moving frame. Aurora then leverage-balances that moment and applies
+Stable EIGH initializes the basis. One-state Oja then moves it from every
+Adafactor-conditioned full gradient with fixed step `.01`, exact all-plane
+rank-space geometry, and Polar Express correction. There is no second frame.
+The projected first moment is an elementwise linear EMA in the moving frame.
+Aurora then leverage-balances that moment and applies
 five HeavyBall polynomial Newton--Schulz steps before full-parameter Muon scaling
 and lift.
 
@@ -93,7 +93,7 @@ Aurora(C H) = Aurora(C) H.
 This is stronger than the imported proposal's bare-polar argument. Aurora's
 nonlinearity does not obstruct this particular rank-side gauge.
 
-The stochastic Karcher update is gauge-invariant as a Grassmann operation and
+The Oja update is gauge-invariant as a Grassmann operation and
 should be equivariant as the selected horizontal frame lift. That is a
 mathematical expectation, not yet evidence about the implementation around SVD
 gauge choices, repeated principal angles, and finite precision. It must be pinned
@@ -199,8 +199,8 @@ Before quantization noise, force both left and right projection paths and verify
 - `H_64^T H_64 = I` and codec round-trip identity without quantization;
 - projection covariance and lift invariance under `(Q,C) -> (QH,CH)`;
 - EMA covariance over multiple updates;
-- stochastic Karcher refresh equivariance, including zero angle, ordinary
-  angles, repeated principal angles, and near-90-degree targets;
+- Oja update equivariance, including zero tangent, ordinary angles, repeated
+  tangent singular values, and near-90-degree motion;
 - Aurora covariance after each leverage/NS stage, not merely final output;
 - transpose/side equivalence and state-dict restart in the chosen gauge.
 
@@ -209,7 +209,7 @@ Failure here is a coordinate bug. Do not continue to loss.
 ### B. Static outlier anatomy
 
 Capture current bf16 basis and projected moment tensors from the faithful rank-64
-LFM-350M lane across initialization, ordinary steps, and refresh boundaries. No
+LFM-350M lane across initialization and ordinary Oja steps. No
 quantized optimizer is needed. Compare identity against fixed regular `H_64` on
 the rank-coordinate metrics above.
 
@@ -265,18 +265,20 @@ Read the quantization-induced noise floor in:
 - one-step error versus accumulated drift.
 
 This stage decides whether low precision merely adds bounded observation noise or
-changes the Karcher controller and moving-frame history semantics.
+changes the Oja tracker and moving-frame history semantics.
 
 ### E. Faithful training
 
 Only geometry survivors enter the default right-padded no-mask SYNTH lane on
 `LiquidAI/LFM2.5-350M-Base`, broad no-embedding scope, rank `64`, residual-facing
-projection, refresh interval `10`, CCE, and the current compile policy. Change
-only the state codec.
+projection, per-gradient Oja, CCE, and the current compile policy. Change only the
+state codec. The retained interval `10` is an EIGH/tangent ablation control and is
+inert under this default lane.
 
 Read target loss and source retention beside pre-Aurora moment health, Aurora
 output agreement where affordable, lifted update/parameter ratio, state bytes,
-peak allocated VRAM, tokens/sec, and refresh/non-refresh walltime. Loss parity is
+peak allocated VRAM, tokens/sec, and per-gradient tracker walltime. Explicit EIGH
+comparators additionally separate boundary from non-boundary cost. Loss parity is
 judged against matched bf16 run noise, not an invented decimal threshold.
 
 The first training table contains only offline survivors and their direct
@@ -300,7 +302,7 @@ but it does not run merely because int8 ran.
 
 The likely asymmetry is worth stating before measurement: moment quantization is
 the cleaner candidate because it has no orthonormality constraint, while basis
-quantization risks changing the represented subspace and the stochastic Karcher
+quantization risks changing the represented subspace and the Oja
 trajectory. On the other hand, a side-Gram eigenbasis may already be too dense for
 Hadamard flattening to help. The outlier capture, not taste, decides both.
 
@@ -319,7 +321,7 @@ Hadamard flattening to help. The outlier capture, not taste, decides both.
 
 - Current optimizer mathematics: [`SPEC.md`](SPEC.md)
 - Product direction and benchmark contract: [`PLAN.md`](PLAN.md)
-- Current stochastic Karcher/transport ledger:
+- Current Oja/transport ledger:
   [`SUBSPACE_TRACKING.md`](SUBSPACE_TRACKING.md)
 - ConvRot paper: [ConvRot: Rotation-Based Plug-and-Play 4-bit Quantization for
   Diffusion Transformers](https://arxiv.org/abs/2512.03673)

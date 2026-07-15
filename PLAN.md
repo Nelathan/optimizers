@@ -52,11 +52,13 @@ finite raw gradient
   -> lift and parameter update
 ```
 
-The basis starts from stable side-Gram `eigh`. At refresh boundaries, a transient
-`eigh` target steers every principal plane a fraction `0.25` along the Grassmann
-geodesic. This is position control, not accumulated tangent velocity. The
+The basis starts from stable side-Gram `eigh`, then one-state Oja moves the live
+frame from every conditioned full gradient with fixed step `.01`. Its exact
+rank-space geodesic rotates every tracked plane and stores no second frame. The
 geodesic's rigid frame rotation parallel-transports projected momentum with
-identity coordinates, so refresh does not brake and rebuild the moment.
+identity coordinates, so tracking does not brake and rebuild the moment. Fixed
+`.25` boundary EIGH position control and tangent velocity control remain explicit
+ablations; cadence, boundary step, and rotation-rank controls govern only them.
 
 Current redesignable decisions and their reasons live in `SPEC.md`. Do not infer
 the design from old commands or old result tables.
@@ -89,8 +91,21 @@ These claims survived the experiments that produced the present design:
   led EIGH and a separate Oja-target controller at every checkpoint of a matched
   compiled 500-step run, finishing at `1.890727` versus `1.895432` and `1.891082`.
   The separate target was deleted, and the surviving mechanism is now simply
-  named `oja`. Fixed `.25` EIGH remains the released default until Oja clears a
-  matched rank-128 1k target/source promotion run.
+  named `oja`. At rank 128 and 1k steps, Oja then finished slightly better on
+  target loss (`1.732211` versus `1.733106`) with slightly worse source retention,
+  materially better capture, and clean 50-step basis convergence. Its current
+  original per-gradient implementation was 36.9% slower. Profiling traced that
+  tax to per-matrix SVD/QR/SVD decompositions; exact rank-space geodesics,
+  Polar Express correction, and batched equal-rank EIGH reduced synthetic
+  optimizer-only Oja time from `616.9 ms` to `122.1 ms` against an `83.0 ms`
+  EIGH non-refresh baseline. The subsequent full-path pass removed a full-size
+  Adafactor temporary and batched equal-shape Oja geometry and Aurora health
+  diagnostics, reducing the telemetry-weighted synthetic optimizer path to
+  `100.5 ms`. Its rank-128 500-step replay reached `1.783078 / 2.973868`
+  target/source at `.8040 s/step`, versus EIGH's `1.783133 / 2.972688` at
+  `.9229 s/step`. Oja is 12.9% faster under the real training contract, with the
+  same small target/source trade seen before. The implementation-efficiency
+  promotion gate is cleared.
 - Reprojecting momentum across basis refresh charged a principal-plane cosine
   tax before Aurora. Identity coordinates are exact transport along the selected
   rigid frame rotation and preserve the projected singular spectrum.
@@ -144,16 +159,16 @@ This is a space, not an ordered queue. The user chooses traversal.
 
 | question | cheapest discriminating evidence | possible consequence |
 |---|---|---|
-| Does tracking improve the product over frozen `eigh`? | long-enough frozen vs position-control run with capture, target, and source | keep tracking or delete it |
+| Does tracking improve the product over frozen `eigh`? | long-enough frozen vs Oja run with capture, target, and source | keep tracking or delete it |
 | Does moving-frame momentum beat fixed-ambient history? | rotating toy reading lifted pre-Aurora direction, then narrow SYNTH survivor | keep identity, reproject, or reset |
 | Is the chosen frame path stable at cutoff churn and near 90 degrees? | gauge/sign and hostile-target stress | stabilize target/path or accept boundary |
-| Does refresh cadence cost meaningful walltime? | profile refresh and non-refresh steps separately | leave fixed cadence or test a monotone schedule |
-| Can Oja replace noisy boundary EIGH? | one-state Oja won every checkpoint through a matched compiled rank-32 500-step replay; rank-128 `.02` and `.01` sensors expose the freshness/stability tradeoff before the matched 1k | promote one-state online tracking or retain fixed `.25` EIGH |
+| Does tracking cadence cost meaningful walltime? | profile ordinary and telemetry Oja steps; separate EIGH boundary/non-boundary steps only for that ablation | retain per-gradient Oja unless a measured sparse estimator preserves quality |
+| Did Oja clear promotion over noisy boundary EIGH? | one-state Oja won rank-32 replay loss and the rank-128 1k target endpoint; optimized rank-space geometry preserved loss and beat EIGH walltime by 12.9% in a matched rank-128 500 replay | yes: Oja is released; retain EIGH as the position-control ablation and keep the slight source trade visible |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
 | Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
 
-Tracking work stops unless it deletes state or machinery, reduces measured refresh
+Tracking work stops unless it deletes state or machinery, reduces measured tracking
 cost, repairs demonstrated faithfulness, or improves capture and evaluation under
 drift. New mechanism inventory is not progress.
 
@@ -178,8 +193,8 @@ policy rather than a claim of architectural inference.
 
 ### Performance contract
 
-Profile optimizer steps at the product-candidate rank, with EIGH refresh and
-non-refresh iterations separated where applicable:
+Profile optimizer steps at the product-candidate rank, with per-gradient Oja and
+explicit EIGH refresh/non-refresh ablation iterations separated where applicable:
 
 ```text
 sanitize + raw clip
@@ -214,16 +229,18 @@ only close decisions rather than performing ritual seed multiplication.
 
 The public artifact should contain the optimizer, projector, tested defaults, and
 short examples. Keep harness surgery and archived research out of the package.
-Classify controls as normal (`lr`, rank, weight decay, refresh interval), advanced
-(side, aim, rotation fraction, Aurora iterations), or ablation/debug.
+Classify controls as normal (`lr`, rank, weight decay), advanced (side, aim,
+Aurora iterations), or ablation/debug. Refresh interval, boundary rotation
+fraction, and rotation rank are ablation-only under the released Oja path.
 
 ## Benchmark contract
 
 The default diagnostic lane is `LiquidAI/LFM2.5-350M-Base`, broad no-embedding
 training, uniform rank 64, residual-facing projection, stable `eigh` init,
 right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE loss, and
-position-controlled burst refresh every 10 steps. `experiments/llm_synth_smoke.py`
-is authoritative for CLI defaults; `UsuiTrack` constructor defaults may differ.
+one-state Oja tracking from every full gradient. `experiments/llm_synth_smoke.py`
+is authoritative for CLI defaults; the retained interval-10 burst settings apply
+only when an explicit EIGH/tangent boundary ablation is selected.
 
 The practical run ladder is 200, 500, and at most 1k steps: 200 is a
 geometry/warmup sensor, 500 is replay-scale evidence, and 1k is still simple
@@ -233,13 +250,12 @@ can reach capacity limits and UsuiTrack's broader trainable capacity should
 matter. Interpret shorter evidence for transfer toward that regime, but do not
 make an expensive 10k run a routine evaluation gate.
 
-The current Oja promotion lane uses rank 128. Historical evidence showed clear
-quality scaling through rank 256, but improved tracking may move that Pareto
-frontier and rank 128 is the chosen balance for the next 1k. The comparison must
-use source retention, `torch.compile`, training-only elapsed time, and a final
-qualitative sample. Evaluate target and source loss every 100 steps. W&B training
-telemetry every 25 steps preserves useful geometry resolution without making
-validation part of the timed training path.
+The completed Oja promotion lane used rank 128; this does not change the generic
+harness default of rank 64. Historical evidence showed quality scaling through
+rank 256, but improved tracking may move that Pareto frontier. Any future rank
+comparison must keep source retention, `torch.compile`, training-only elapsed
+time, and final qualitative sampling in contract rather than inheriting the
+promotion result as a new rank default.
 
 Use `torch.compile` for expensive quality runs unless compile itself is under test
 or breaks the contract. Packed no-mask inputs are the explicit throughput lane,

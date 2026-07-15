@@ -866,6 +866,11 @@ def should_compile_projected_activation(args, optimizer_name: str) -> bool:
     return args.torch_compile and optimizer_name == "usuitrack" and args.projected_activation_backend != "off"
 
 
+def validate_projected_activation_contract(args) -> None:
+    if args.projected_activation_backend != "off" and args.grassmann_aim == "oja":
+        raise ValueError("--projected-activation-backend is incompatible with --grassmann-aim oja, which requires full matrix gradients every step")
+
+
 def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
     """Compile the module that the CCE training loss actually calls.
 
@@ -894,6 +899,8 @@ def run_optimizer(
     device: torch.device,
     wandb_run: Any | None = None,
 ) -> dict[str, float | int | str]:
+    if optimizer_name == "usuitrack":
+        validate_projected_activation_contract(args)
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -1013,11 +1020,9 @@ def run_optimizer(
                 "opt/moment_erank_pct": scalar_or_none(step_result["moment_erank_pct"]),
                 "train/lr": optimizer.param_groups[0]["lr"],
             }
-            # Frame-motion metrics are only meaningful on the
-            # rare step a basis refresh actually fires; omit them entirely on
-            # other steps rather than logging NaN, so wandb's per-run summary
-            # reflects the last real refresh event instead of whatever step
-            # happened to be logged last.
+            # Omit unavailable frame metrics rather than logging NaN. Oja moves
+            # every step, while EIGH/tangent emit motion only at boundaries and
+            # the fixed-horizon lag metric is unavailable until its snapshot matures.
             for metric_name in ("basis_target_angle_mass", "basis_step_angle_mass", "basis_lag_angle_mass"):
                 metric = scalar_or_none(step_result[metric_name])
                 if metric is not None and metric == metric:
@@ -1100,8 +1105,8 @@ def run_optimizer(
         "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "usuitrack" else 0,
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "usuitrack" else 0,
         "basis_init": args.basis_init if optimizer_name == "usuitrack" else "n/a",
-        "basis_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
-        "basis_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
+        "boundary_ablation_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
+        "boundary_ablation_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
         "grassmann_aim": args.grassmann_aim if optimizer_name == "usuitrack" else "n/a",
         "lr_warmup_steps": args.lr_warmup_steps,
         "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
@@ -1185,7 +1190,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--projected-activation-backend",
         choices=("off", "lfm"),
         default="off",
-        help="experimental UsuiTrack-only activation-projected backward backend; lfm wraps LFM MLP and operator projection linears after basis warmup",
+        help="experimental UsuiTrack-only activation-projected backward backend; incompatible with Oja because it queues projected gradients instead of supplying the full matrix gradients Oja requires every step",
     )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
     parser.add_argument("--usuitrack-lr", type=float, default=2e-4)
@@ -1196,19 +1201,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--moment-mode",
         choices=("ema", "adafactor_ema"),
         default="adafactor_ema",
-        help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis refresh and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
+        help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis tracking and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
     )
     parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
     parser.add_argument("--grad-clip-norm", type=float, default=2.5, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches (random, unpredictable norm spikes otherwise poison the second moment for ~100 steps at beta2=0.99, over-dampening whole directions and collapsing basis alignment). 2.5 sits just above the bs16 per-tensor grad body (the old 10 was calibrated on noisier bs4 grads and never fired at bs16) so it clips only genuine spikes. Upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="boundary-controller fraction for eigh (1.0 = snap); 0.25 is the measured EIGH knee. Under the tangent ablation, rotation = step_size * sigma. oja uses its fixed calibrated 0.01 step instead.")
-    parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="how many principal-angle planes the geodesic rotates per refresh. Default None = ALL planes (full-spectrum position control, the Q13/Q14 winner). Set 1 for SubTrack-faithful single-plane drift (ablation).")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="eigh", help="basis update law. eigh is the released fixed-.25 boundary controller; oja moves the live frame every gradient with the calibrated one-state geodesic step; tangent is the historical SubTrack ablation.")
-    parser.add_argument("--basis-refresh-interval", type=int, default=10)
+    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="ablation-only boundary step: EIGH target fraction (1.0 = snap) or tangent multiplier. Oja ignores this and uses its fixed calibrated 0.01 step")
+    parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="ablation-only number of planes rotated by EIGH/tangent boundary updates. None rotates all planes; Oja always rotates every tracked plane and ignores this control")
+    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="oja", help="basis update law. oja (default) updates the one live frame from every full gradient with fixed step 0.01; eigh is the fixed-.25 boundary position-control ablation; tangent is the historical SubTrack ablation")
+    parser.add_argument("--basis-refresh-interval", type=int, default=10, help="ablation-only cadence for EIGH/tangent boundary updates; Oja updates every gradient and ignores this interval")
     parser.add_argument(
         "--basis-refresh-schedule",
         choices=("burst", "layer-staggered"),
         default="burst",
-        help="basis refresh timing; burst preserves the default all-due refresh, layer-staggered offsets refresh by transformer layer index",
+        help="ablation-only EIGH/tangent boundary timing; Oja updates every gradient and ignores this schedule",
     )
     parser.add_argument("--aurora-pp-iterations", type=int, default=2)
     parser.add_argument("--polar-ns-steps", type=int, default=5)
@@ -1236,13 +1241,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run", default="", help="wandb run name; empty disables wandb")
     parser.add_argument("--wandb-entity", default="pink-marker")
     parser.add_argument("--wandb-project", default="usuitrack")
-    parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and core grad/update norms every N measured steps; basis_capture is measured before a refresh, so logging at the refresh cadence consistently samples the held basis")
+    parser.add_argument("--wandb-log-every", type=int, default=10, help="log train loss and optimizer diagnostics every N measured steps; basis_capture always measures the held frame before that step's basis movement")
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    validate_projected_activation_contract(args)
 
     if args.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
@@ -1355,8 +1361,8 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
-        f"basis_init={args.basis_init} basis_refresh_interval={args.basis_refresh_interval} basis_refresh_schedule={args.basis_refresh_schedule} "
-        f"grassmann_aim={args.grassmann_aim} "
+        f"basis_init={args.basis_init} grassmann_aim={args.grassmann_aim} "
+        f"boundary_ablation_refresh_interval={args.basis_refresh_interval} boundary_ablation_refresh_schedule={args.basis_refresh_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "

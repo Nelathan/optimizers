@@ -7,7 +7,7 @@ import torch
 
 import usuitrack
 from usuitrack import SubspaceProjector, UsuiTrack, optimizer_state_bytes_by_category
-from usuitrack.optimizer import OJA_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
+from usuitrack.optimizer import MatrixUpdate, OJA_STEP_SIZE, ORTHOGONALIZATION_SCALE_MODE
 
 
 class UsuiTrackTest(unittest.TestCase):
@@ -24,6 +24,7 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertEqual(ORTHOGONALIZATION_SCALE_MODE, "muon")
         self.assertEqual(opt.param_groups[0]["aurora_pp_iterations"], 2)
         self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 5)
+        self.assertEqual(opt.param_groups[0]["grassmann_aim"], "oja")
 
     def test_step_updates_matrix_and_fallback_params(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
@@ -62,6 +63,7 @@ class UsuiTrackTest(unittest.TestCase):
             moment_mode="ema",
             basis_refresh_interval=1,
             grassmann_step_size=0.25,
+            grassmann_aim="eigh",
         )
         opt.diagnostics_enabled = True
 
@@ -184,6 +186,72 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertFalse(torch.equal(state["basis"], old_basis))
         torch.testing.assert_close(state["projected_exp_avg"], 0.9 * old_moment + 0.1 * held_projection)
 
+    def test_oja_batches_same_rank_eigendecompositions(self):
+        torch.manual_seed(61)
+        weights = [torch.nn.Parameter(torch.randn(10, 6)), torch.nn.Parameter(torch.randn(8, 7))]
+        opt = UsuiTrack(
+            weights,
+            lr=0.01,
+            rank=3,
+            side="right",
+            moment_mode="ema",
+            grad_clip_norm=None,
+            grassmann_aim="oja",
+        )
+
+        for weight in weights:
+            weight.grad = torch.randn_like(weight)
+        opt.step()
+
+        for weight in weights:
+            weight.grad = torch.randn_like(weight)
+        with mock.patch("torch.linalg.eigh", wraps=torch.linalg.eigh) as eigh:
+            opt.step()
+
+        self.assertEqual(eigh.call_count, 1)
+        self.assertEqual(tuple(eigh.call_args.args[0].shape), (2, 3, 3))
+
+    def test_deferred_batched_oja_matches_sequential_parameter_groups(self):
+        torch.manual_seed(63)
+        initial = [torch.randn(10, 6), torch.randn(7, 11)]  # auto resolves right, then left
+        batched_params = [torch.nn.Parameter(value.clone()) for value in initial]
+        sequential_params = [torch.nn.Parameter(value.clone()) for value in initial]
+        kwargs = dict(
+            lr=0.01,
+            beta=0.9,
+            rank=3,
+            side="auto",
+            moment_mode="adafactor_ema",
+            grad_clip_norm=None,
+            grassmann_aim="oja",
+        )
+        batched = UsuiTrack(batched_params, **kwargs)
+        sequential = UsuiTrack([{"params": [param]} for param in sequential_params], **kwargs)
+
+        for _ in range(6):
+            gradients = [torch.randn_like(value) for value in initial]
+            for param, gradient in zip(batched_params, gradients, strict=True):
+                param.grad = gradient.clone()
+            for param, gradient in zip(sequential_params, gradients, strict=True):
+                param.grad = gradient.clone()
+            batched.step()
+            sequential.step()
+
+        tensor_state = (
+            "basis",
+            "projected_exp_avg",
+            "adafactor_row_var",
+            "adafactor_col_var",
+        )
+        for batched_param, sequential_param in zip(batched_params, sequential_params, strict=True):
+            torch.testing.assert_close(batched_param, sequential_param, atol=3e-5, rtol=3e-5)
+            batched_state = batched.state[batched_param]
+            sequential_state = sequential.state[sequential_param]
+            for key in tensor_state:
+                torch.testing.assert_close(batched_state[key], sequential_state[key], atol=3e-5, rtol=3e-5)
+            self.assertEqual(batched_state["step"], sequential_state["step"])
+            self.assertEqual(batched_state["adafactor_step"], sequential_state["adafactor_step"])
+
     def test_oja_state_dict_continuation_is_deterministic(self):
         torch.manual_seed(67)
         first = torch.nn.Parameter(torch.randn(10, 6, dtype=torch.bfloat16))
@@ -221,7 +289,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_projected_grad_clip_bounds_each_projected_matrix_input(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = UsuiTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100, moment_mode="ema")
+        opt = UsuiTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_norm=1.0, basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -238,7 +306,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_projected_grad_ratio_clip_bounds_gradient_relative_to_moment(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = UsuiTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_ratio=2.0, basis_refresh_interval=100, moment_mode="ema")
+        opt = UsuiTrack([weight], lr=0.01, beta=0.0, rank=2, side="right", projected_grad_clip_ratio=2.0, basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -286,8 +354,8 @@ class UsuiTrackTest(unittest.TestCase):
         # grad_clip_norm=None: the raw-grad clip lives upstream of projection, so the
         # full-grad path clips while the queued-projected path structurally cannot --
         # this test asserts the projection equivalence, so keep the clip out of it.
-        full_opt = UsuiTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None)
-        queued_opt = UsuiTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None)
+        full_opt = UsuiTrack([full_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None, grassmann_aim="eigh")
+        queued_opt = UsuiTrack([queued_weight], lr=0.01, beta=0.9, rank=3, side="right", basis_refresh_interval=100, moment_mode="ema", grad_clip_norm=None, grassmann_aim="eigh")
 
         full_weight.grad = warm_grad.clone()
         queued_weight.grad = warm_grad.clone()
@@ -309,7 +377,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_queued_projected_grad_requires_initialized_basis(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = UsuiTrack([weight], lr=0.01, rank=2, side="right", moment_mode="ema")
+        opt = UsuiTrack([weight], lr=0.01, rank=2, side="right", moment_mode="ema", grassmann_aim="eigh")
 
         opt.queue_projected_grad(weight, torch.randn(6, 2))
 
@@ -318,7 +386,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_queued_projected_grad_rejects_refresh_step_without_full_grad(self):
         weight = torch.nn.Parameter(torch.randn(6, 4))
-        opt = UsuiTrack([weight], lr=0.01, rank=2, side="right", basis_refresh_interval=1, moment_mode="ema")
+        opt = UsuiTrack([weight], lr=0.01, rank=2, side="right", basis_refresh_interval=1, moment_mode="ema", grassmann_aim="eigh")
         weight.grad = torch.randn_like(weight)
         opt.step()
         projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
@@ -328,11 +396,22 @@ class UsuiTrackTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "refresh"):
             opt.step()
 
+    def test_default_oja_rejects_queued_projected_grad(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = UsuiTrack([weight], lr=0.01, rank=2, side="right", moment_mode="ema")
+        weight.grad = torch.randn_like(weight)
+        opt.step()
+        projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
+        opt.queue_projected_grad(weight, projector.project(torch.randn_like(weight)))
+
+        with self.assertRaisesRegex(RuntimeError, "full matrix gradient on every step"):
+            opt.step()
+
     def test_basis_refresh_offsets_stagger_due_params_after_first_interval(self):
         first = torch.nn.Parameter(torch.randn(6, 4))
         second = torch.nn.Parameter(torch.randn(6, 4))
         group = {"params": [first, second], "basis_refresh_offsets": {id(first): 0, id(second): 1}}
-        opt = UsuiTrack([group], lr=0.01, rank=2, side="right", basis_refresh_interval=3)
+        opt = UsuiTrack([group], lr=0.01, rank=2, side="right", basis_refresh_interval=3, grassmann_aim="eigh")
         matrix_params = [first, second]
 
         self.assertEqual(opt._refresh_param_ids(opt.param_groups[0], matrix_params), set())
@@ -597,7 +676,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_refresh_interval_updates_all_bases_on_interval_step(self):
         params = [torch.nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
-        opt = UsuiTrack(params, basis_refresh_interval=2)
+        opt = UsuiTrack(params, basis_refresh_interval=2, grassmann_aim="eigh")
         group = opt.param_groups[0]
 
         first = opt._refresh_param_ids(group, params)
@@ -625,7 +704,7 @@ class UsuiTrackTest(unittest.TestCase):
     def test_basis_refresh_diagnostics_measure_rotation(self):
         torch.manual_seed(6)
         weight = torch.nn.Parameter(torch.randn(16, 8))
-        opt = UsuiTrack([weight], lr=0.01, rank=4, basis_refresh_interval=1)
+        opt = UsuiTrack([weight], lr=0.01, rank=4, basis_refresh_interval=1, grassmann_aim="eigh")
 
         weight.grad = torch.randn_like(weight)
         opt.step()
@@ -660,6 +739,7 @@ class UsuiTrackTest(unittest.TestCase):
             # per-tensor clip out of the way (a randn(8,5) grad's norm ~6 exceeds
             # the 2.5 default rail).
             grad_clip_norm=None,
+            grassmann_aim="eigh",
         )
 
         weight.grad = torch.randn_like(weight)
@@ -679,7 +759,7 @@ class UsuiTrackTest(unittest.TestCase):
 
     def test_nonfinite_grad_is_zeroed_not_propagated(self):
         weight = torch.nn.Parameter(torch.randn(8, 4))
-        opt = UsuiTrack([weight], lr=0.01, rank=2, basis_refresh_interval=3)
+        opt = UsuiTrack([weight], lr=0.01, rank=2, basis_refresh_interval=3, grassmann_aim="eigh")
         opt.diagnostics_enabled = True
 
         weight.grad = torch.randn_like(weight)
@@ -706,6 +786,47 @@ class UsuiTrackTest(unittest.TestCase):
         projector = opt._projector_from_state(weight, opt.param_groups[0], opt.state[weight])
         self.assertTrue(torch.isfinite(projector.basis).all())
         self.assertLess(float(projector.orthonormality_error()), 1e-4)
+
+    def test_adafactor_broadcast_scaling_matches_outer_product_reconstruction(self):
+        torch.manual_seed(89)
+        grad = torch.randn(13, 7)
+        state = {}
+        group = {"adafactor_beta2": 0.99, "adafactor_eps": 1e-30}
+
+        actual = UsuiTrack._adafactor_dampen_full_grad(grad, group, state)
+
+        grad_sq = grad.float().square() + group["adafactor_eps"]
+        row_hat = grad_sq.mean(dim=1)
+        col_hat = grad_sq.mean(dim=0)
+        factor = (row_hat.unsqueeze(1) @ col_hat.unsqueeze(0)) / row_hat.mean()
+        expected = grad.float() / factor.sqrt()
+        expected.mul_(grad.float().square().mean().sqrt())
+
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+    def test_batched_aurora_health_matches_scalar_diagnostics(self):
+        torch.manual_seed(97)
+        params = [torch.nn.Parameter(torch.randn(8, 6)) for _ in range(3)]
+        opt = UsuiTrack(params, rank=3, side="right", moment_mode="ema", grad_clip_norm=None)
+        entries = []
+        updates = []
+        for param in params:
+            projector = SubspaceProjector(rank=3, side="right")
+            projector.fit(torch.randn_like(param))
+            moment = torch.randn(8, 3)
+            entries.append(MatrixUpdate(param, projector, moment, moment, tuple(param.shape)))
+            updates.append(torch.randn_like(moment))
+        opt.diagnostics_enabled = True
+        diagnostics = opt._new_diagnostics()
+        assert diagnostics is not None
+
+        opt._accumulate_aurora_health(diagnostics, entries, updates)
+
+        expected_alignment = sum(opt._aurora_alignment(entry.projected_exp_avg, update) for entry, update in zip(entries, updates, strict=True))
+        expected_erank = sum(opt._effective_rank(entry.projected_exp_avg) for entry in entries)
+        self.assertAlmostEqual(float(diagnostics["aurora_alignment_sum"]), expected_alignment, places=5)
+        self.assertAlmostEqual(float(diagnostics["aurora_erank_sum"]), expected_erank, places=5)
+        self.assertEqual(diagnostics["aurora_health_tensors"], 3)
 
 
 if __name__ == "__main__":

@@ -206,6 +206,52 @@ class SubspaceProjectorTest(unittest.TestCase):
             self.assertLess(after, before * 0.75, msg=f"side={side}")
             self.assertLess(float(projector.orthonormality_error()), 1e-5, msg=f"side={side}")
 
+    def test_oja_rank_space_geodesic_matches_svd_reference(self):
+        torch.manual_seed(33)
+        for shape, side in (((18, 12), "right"), ((12, 18), "left")):
+            gradient = torch.randn(*shape)
+            candidate = SubspaceProjector(rank=4, side=side)
+            candidate.fit(gradient)
+            reference = SubspaceProjector(rank=4, side=side)
+            reference.basis = candidate.basis.clone()
+            reference.resolved_side = candidate.resolved_side
+
+            refresh = torch.randn_like(gradient)
+            projected = candidate.project(refresh)
+            tangent = candidate.oja_tangent(refresh, projected=projected)
+            reference.update_grassmann_from_tangent(-tangent, step_size=0.03, rotate_rank=4)
+            candidate.update_oja(refresh, step_size=0.03, projected=projected)
+
+            self.assertTrue(torch.allclose(candidate.basis, reference.basis, atol=2e-5, rtol=2e-5), msg=f"side={side}")
+
+    def test_polar_express_stiefel_correction_preserves_subspace(self):
+        torch.manual_seed(35)
+        q, _r = torch.linalg.qr(torch.randn(32, 6), mode="reduced")
+        distortion = torch.eye(6) + 0.01 * torch.randn(6, 6)
+        frame = q @ distortion
+
+        corrected = SubspaceProjector._polar_express_stiefel_correction(frame)
+        error = (corrected.mT @ corrected - torch.eye(6)).abs().max()
+        angle_mass = SubspaceProjector.principal_angles_sine(q, corrected).sum()
+
+        self.assertLess(float(error), 1e-4)
+        self.assertLess(float(angle_mass), 1e-3)
+
+    def test_polar_express_stiefel_correction_supports_batches(self):
+        torch.manual_seed(36)
+        frames = []
+        for _ in range(5):
+            q, _r = torch.linalg.qr(torch.randn(32, 6), mode="reduced")
+            frames.append(q @ (torch.eye(6) + 0.01 * torch.randn(6, 6)))
+        batch = torch.stack(frames)
+
+        corrected = SubspaceProjector._polar_express_stiefel_correction(batch)
+        references = torch.stack([SubspaceProjector._polar_express_stiefel_correction(frame) for frame in frames])
+
+        torch.testing.assert_close(corrected, references)
+        eye = torch.eye(6).expand(5, -1, -1)
+        self.assertLess(float((corrected.mT @ corrected - eye).abs().max()), 2e-4)
+
     def test_repeated_oja_keeps_bf16_basis_stable(self):
         torch.manual_seed(37)
         gradient = torch.randn(24, 16, dtype=torch.bfloat16)
@@ -224,6 +270,24 @@ class SubspaceProjectorTest(unittest.TestCase):
         self.assertLess(float(bf16.orthonormality_error()), 2e-2)
         angle_mass = SubspaceProjector.principal_angles_sine(fp32.canonical_basis(), bf16.canonical_basis()).sum()
         self.assertLess(float(angle_mass), 0.2)
+
+    def test_oja_is_finite_for_zero_and_rank_deficient_tangents(self):
+        torch.manual_seed(39)
+        for shape, side in (((18, 12), "right"), ((12, 18), "left")):
+            projector = SubspaceProjector(rank=4, side=side)
+            projector.fit(torch.randn(*shape))
+
+            zero = torch.zeros(*shape)
+            projector.update_oja(zero, step_size=0.01, projected=projector.project(zero))
+            self.assertTrue(bool(torch.isfinite(projector.basis).all()))
+            self.assertLess(float(projector.orthonormality_error()), 1e-5)
+
+            left = torch.randn(shape[0], 1)
+            right = torch.randn(1, shape[1])
+            rank_one = left @ right
+            projector.update_oja(rank_one, step_size=0.01, projected=projector.project(rank_one))
+            self.assertTrue(bool(torch.isfinite(projector.basis).all()))
+            self.assertLess(float(projector.orthonormality_error()), 1e-5)
 
     @staticmethod
     def _canon_basis(projector: SubspaceProjector) -> torch.Tensor:

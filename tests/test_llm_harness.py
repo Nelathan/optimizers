@@ -7,7 +7,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, wandb_log
+from experiments.llm_synth_smoke import DEFAULT_MODEL, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -147,10 +147,8 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.projected_grad_clip_norm, 0.0)
         self.assertEqual(args.projected_grad_clip_ratio, 0.0)
         self.assertEqual(args.grad_clip_norm, 2.5)
-        # Position-control defaults (Q14 promotion): eigh aim, full-spectrum
-        # rotation, EMA constant at the measured knee.
-        self.assertEqual(args.grassmann_aim, "eigh")
-        self.assertEqual(build_parser().parse_args(["--grassmann-aim", "oja"]).grassmann_aim, "oja")
+        self.assertEqual(args.grassmann_aim, "oja")
+        self.assertEqual(build_parser().parse_args(["--grassmann-aim", "eigh"]).grassmann_aim, "eigh")
         self.assertIsNone(args.grassmann_rotate_rank)
         self.assertEqual(args.grassmann_step_size, 0.25)
         self.assertFalse(hasattr(args, "grassmann_step_schedule"))
@@ -167,6 +165,14 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
         self.assertFalse(hasattr(args, "shadow_target_probe"))
+
+    def test_oja_rejects_projected_activation_backend_before_setup(self):
+        args = build_parser().parse_args(["--projected-activation-backend", "lfm"])
+
+        with self.assertRaisesRegex(ValueError, "requires full matrix gradients"):
+            validate_projected_activation_contract(args)
+
+        validate_projected_activation_contract(build_parser().parse_args(["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"]))
 
     def test_cli_has_no_loss_or_padding_option_garden(self):
         option_strings = {option for action in build_parser()._actions for option in action.option_strings}
@@ -332,7 +338,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             projection_side_policy="right",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema")
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 
@@ -374,7 +380,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
         install_projected_activation_backend(model, opt, "lfm")
         x = torch.randn(3, 5, 4, dtype=torch.float64)
 
@@ -402,7 +408,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 
@@ -438,7 +444,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             projection_side_policy="residual-facing",
             activation_projected_param_ids=activation_projected_ids,
         )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100)
+        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
 
         installed = install_projected_activation_backend(model, opt, "lfm")
 

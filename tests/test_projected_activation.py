@@ -114,8 +114,8 @@ class ProjectedActivationTest(unittest.TestCase):
         reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected.load_state_dict(reference.state_dict())
-        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
-        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema")
+        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
+        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="right", basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
 
         (reference(warm_x) - warm_target).square().mean().backward()
         (projected(warm_x) - warm_target).square().mean().backward()
@@ -147,8 +147,8 @@ class ProjectedActivationTest(unittest.TestCase):
         reference = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
         projected.load_state_dict(reference.state_dict())
-        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
-        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema")
+        reference_opt = UsuiTrack([reference.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
+        projected_opt = UsuiTrack([projected.weight], lr=0.01, rank=rank, side="left", basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
 
         (reference(warm_x) - warm_target).square().mean().backward()
         (projected(warm_x) - warm_target).square().mean().backward()

@@ -339,6 +339,7 @@ def main() -> None:
         lr=args.lr,
         beta=args.beta,
         basis_init="eigh",
+        grassmann_aim="eigh",
         basis_refresh_interval=100,
         projected_grad_clip_norm=args.projected_grad_clip_norm if args.projected_grad_clip_norm > 0 else None,
         projected_grad_clip_ratio=args.projected_grad_clip_ratio if args.projected_grad_clip_ratio > 0 else None,

@@ -23,7 +23,9 @@ The active optimizer class is `UsuiTrack`.
 Current quality/diagnostic harness defaults are broad no-embedding training,
 uniform rank `64`, stable side-Gram `eigh` basis initialization, residual-facing
 one-sided projection, faithful SYNTH right-padded no-mask batches, CCE loss,
-position-controlled Grassmann burst refresh, and Aurora/Muon update geometry.
+one-state Oja tracking from every full gradient, and Aurora/Muon update geometry.
+The fixed `.25` boundary EIGH controller and tangent tracker remain explicit
+ablations; their interval, step, and rotation controls do not govern Oja.
 
 Read in this order: `SPEC.md`, `PLAN.md`, then the specialized live ledger. Enter
 `archive/` only when the provenance of a decision matters.

@@ -84,16 +84,17 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 - Orthogonalization happens in projected space.
 - Aurora with Muon scale semantics is the forward projected direction.
 - HeavyBall Newton-Schulz is the internal polar primitive inside Aurora.
-- Position control is the forward basis-update path after initialization: `eigh` target frame from the dampened boundary grad, full-spectrum fractional geodesic toward it (`grassmann_aim="eigh"`, all planes, step 0.25 = the EMA constant). Tangent aim survives only as the SubTrack-faithful single-grad ablation; the C1 window accumulator was deleted.
+- One-state Oja is the forward basis-update path after stable EIGH initialization: every conditioned full gradient moves the live frame through an all-plane exact rank-space geodesic at fixed step `0.01`, followed by Polar Express correction. It stores no second frame. Full-gradient input is mandatory; projected-activation backward is incompatible.
+- Fixed `.25` boundary EIGH position control and tangent velocity control remain explicit ablations. `grassmann_step_size`, `grassmann_rotate_rank`, refresh interval, and refresh schedule govern those ablations only and are inert under Oja.
 - The projected first moment parallel-transports through every geodesic refresh as the identity in projected coordinates (the retraction is a rigid frame rotation; pinned by test). Do not reintroduce project-back/re-project transfer — its cos-tax feeds Aurora's polar map shrunken, noise-dominated directions that NS re-amplifies.
-- Burst refresh is the basis schedule; round-robin was removed as complexity rent.
+- Burst refresh is the default schedule for boundary ablations; round-robin was removed as complexity rent.
 - Two-sided square-core projection was removed from the active path.
 - Unsupported ECC/param-ECC fails loudly.
 - Basis initialization uses stable side-Gram `eigh`: fp32 finite check, Frobenius normalization, symmetric Gram, and trace-scaled jitter retry on backend failure. Exact SVD was removed from the default/init path after being slower and less robust for this one-sided subspace contract.
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, and position-controlled burst refresh every 10 steps. Constructor defaults are a separate API contract; inspect `SPEC.md` or code rather than assuming the harness and optimizer constructor are identical. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
+The LLM harness defaults to broad no-embedding training, uniform rank 64, stable `eigh` basis init, residual-facing projection side, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, and one-state per-gradient Oja tracking. Constructor and harness both default to Oja. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
 For expensive 1k-quality runs, use `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Record compile state in results so throughput comparisons stay honest.
 

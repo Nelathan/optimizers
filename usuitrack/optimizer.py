@@ -30,6 +30,7 @@ class MatrixUpdate:
     projected_grad: Tensor
     projected_exp_avg: Tensor
     original_shape: tuple[int, ...]
+    oja_tangent: Tensor | None = None
 
 
 class UsuiTrack(Optimizer):
@@ -38,7 +39,10 @@ class UsuiTrack(Optimizer):
     Matrix parameters keep optimizer state in projected space: an orthonormal
     basis plus a projected first moment. Non-matrix parameters use HeavyBall's
     fused AdamW update path so biases/norms still train without contaminating
-    the matrix state invariant.
+    the matrix state invariant. The default one-state Oja tracker updates its
+    live basis from every full matrix gradient. ``grassmann_step_size``,
+    ``grassmann_rotate_rank``, and ``basis_refresh_interval`` govern only the
+    explicit ``eigh`` and ``tangent`` boundary-update ablations.
     """
 
     def __init__(
@@ -58,7 +62,7 @@ class UsuiTrack(Optimizer):
         grad_clip_norm: float | None = 2.5,
         grassmann_step_size: float = 0.25,
         grassmann_rotate_rank: int | None = None,
-        grassmann_aim: str = "eigh",
+        grassmann_aim: str = "oja",
         basis_refresh_interval: int = 100,
         aurora_pp_iterations: int = AURORA_PP_ITERATIONS,
         polar_ns_steps: int = len(NEWTON_SCHULZ_COEFFICIENTS),
@@ -152,7 +156,9 @@ class UsuiTrack(Optimizer):
 
         This is the explicit ingress for custom projected-activation backward
         paths. The queued tensor must already live in UsuiTrack's current basis;
-        basis initialization and refresh still require a full matrix gradient.
+        basis initialization and boundary refresh still require a full matrix
+        gradient. The default Oja tracker requires a full matrix gradient on
+        every step, so queued projected gradients are incompatible with Oja.
         """
 
         if not self._owns_param(param):
@@ -215,6 +221,7 @@ class UsuiTrack(Optimizer):
                     self._step_fallback_param(p, grad, group, diagnostics)
                     if group["consume_grad"]:
                         p.grad = None
+            self._apply_oja_basis_updates(matrix_updates, group, diagnostics)
             self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
 
         self.last_step_diagnostics = self._finalize_diagnostics(diagnostics)
@@ -325,6 +332,7 @@ class UsuiTrack(Optimizer):
 
         state = self.state[p]
         projector = self._projector_from_state(p, group, state)
+        oja_tangent = None
         if queued_projected_grad is not None:
             if group["grassmann_aim"] == "oja":
                 raise RuntimeError("Oja basis updates require a full matrix gradient on every step")
@@ -392,17 +400,10 @@ class UsuiTrack(Optimizer):
                 basis_moved = self._refresh_projector(projector, grad, group, state, diagnostics)
             else:
                 if aim == "oja":
-                    basis_moved = self._refresh_projector(
-                        projector,
-                        grad,
-                        group,
-                        state,
-                        diagnostics,
-                        projected_grad=held_projected_grad,
-                    )
+                    oja_tangent = projector.oja_tangent(grad, projected=held_projected_grad)
                 elif refresh_basis:
                     basis_moved = self._refresh_projector(projector, grad, group, state, diagnostics)
-            # Direct Oja consumes GQ to steer Q, then carries those projected
+            # One-state Oja consumes GQ to steer Q, then carries those projected
             # coordinates through the rigid frame move unchanged. This avoids a
             # second full projection and matches the moving-frame moment contract.
             if aim == "oja" and held_projected_grad is not None:
@@ -438,7 +439,7 @@ class UsuiTrack(Optimizer):
         moment_mode = group["moment_mode"]
         if moment_mode in ("ema", "adafactor_ema"):
             # adafactor_ema applies the same full-gradient Adafactor dampening
-            # above (before basis refresh and projection); the dampened,
+            # above (before basis tracking and projection); the dampened,
             # projected gradient still feeds this same first-moment EMA rather
             # than replacing the moment slot outright.
             if projected_exp_avg is None:
@@ -454,12 +455,13 @@ class UsuiTrack(Optimizer):
             projected_grad=projected_grad,
             projected_exp_avg=projected_exp_avg,
             original_shape=tuple(p.shape),
+            oja_tangent=oja_tangent,
         )
 
     @staticmethod
     def _adafactor_dampen_full_grad(grad: Tensor, group: dict, state: dict) -> Tensor:
         """Adafactor-style row/col factored second moment on the full gradient,
-        applied before basis refresh and before projection so the same dampened
+        applied before basis tracking and before projection so the same dampened
         gradient feeds both consumers, then still passed through the same
         first-moment EMA as ema mode.
         """
@@ -487,8 +489,14 @@ class UsuiTrack(Optimizer):
         # Shazeer & Stern (2018) factored second-moment reconstruction: R C^T / sum(R).
         # row_hat/col_hat are stored as per-row/per-column means (not sums), so the
         # sum-based normalizer is row_hat.mean() (mean of means == sum/n cancelling n).
-        factor = (row_hat.unsqueeze(1) @ col_hat.unsqueeze(0)) / row_hat.mean().clamp_min(eps)
-        dampened = grad32 / factor.sqrt().clamp_min(eps)
+        # Algebraically identical to reconstructing the full outer-product
+        # factor, but avoids allocating and reading a second matrix-sized
+        # temporary. The broadcast scales satisfy
+        # sqrt(mean(R) / (R_i C_j)) == 1 / sqrt(R_i C_j / mean(R)).
+        mean_row = row_hat.mean().clamp_min(eps)
+        row_scale = (mean_row / row_hat.clamp_min(eps)).sqrt().unsqueeze(1)
+        col_scale = col_hat.clamp_min(eps).rsqrt().unsqueeze(0)
+        dampened = grad32 * row_scale * col_scale
         # Restore the raw gradient's scale. The factored second moment normalizes each
         # element to RMS~1, which is Adafactor's *direction* convention but blows the
         # magnitude up: an RMS-1 [m,n] matrix has Frobenius norm sqrt(m*n) (e.g. ~2610
@@ -527,8 +535,87 @@ class UsuiTrack(Optimizer):
                 stacked = torch.stack([entry.projected_exp_avg for entry in bucket_entries])
                 stacked_update_hats = self._orthogonalize_update_runtime(stacked, group, bucket_entries[0].original_shape)
                 update_hats = list(stacked_update_hats.unbind(0))
+            if diagnostics is not None and self.diagnostics_aurora_health_enabled:
+                self._accumulate_aurora_health(diagnostics, bucket_entries, update_hats)
             for entry, update_hat in zip(bucket_entries, update_hats, strict=True):
                 self._apply_matrix_update(entry, update_hat, group, diagnostics)
+
+    @staticmethod
+    def _accumulate_aurora_health(
+        diagnostics: dict,
+        entries: list[MatrixUpdate],
+        update_hats: list[Tensor],
+        eps: float = 1e-12,
+    ) -> None:
+        moments = torch.stack([entry.projected_exp_avg for entry in entries]).float()
+        updates = torch.stack(update_hats).float()
+        inner = (moments * updates).sum(dim=(-2, -1))
+        alignment = inner / (moments.norm(dim=(-2, -1)) * updates.norm(dim=(-2, -1))).clamp_min(eps)
+
+        gram = moments @ moments.mT if moments.shape[-2] <= moments.shape[-1] else moments.mT @ moments
+        singular_values = torch.linalg.eigvalsh(gram).clamp_min(0.0).sqrt()
+        probabilities = singular_values / singular_values.sum(dim=-1, keepdim=True).clamp_min(eps)
+        entropy = -(probabilities * probabilities.clamp_min(eps).log()).sum(dim=-1)
+        effective_rank = entropy.exp()
+
+        diagnostics["aurora_alignment_sum"] += alignment.sum()
+        diagnostics["aurora_erank_sum"] += effective_rank.sum()
+        diagnostics["aurora_erank_pct_sum"] += (effective_rank / min(moments.shape[-2:])).sum()
+        diagnostics["aurora_health_tensors"] += len(entries)
+
+    def _apply_oja_basis_updates(self, entries: list[MatrixUpdate], group: dict, diagnostics: dict | None) -> None:
+        pending = [entry for entry in entries if entry.oja_tangent is not None]
+        if not pending:
+            return
+
+        buckets: dict[tuple, list[MatrixUpdate]] = {}
+        for entry in pending:
+            tangent = entry.oja_tangent
+            assert tangent is not None
+            key = (tangent.device, tangent.dtype, tangent.shape[1])
+            buckets.setdefault(key, []).append(entry)
+
+        record_rotation = diagnostics is not None and self.diagnostics_basis_enabled
+        for bucket_entries in buckets.values():
+            tangents = [entry.oja_tangent for entry in bucket_entries]
+            assert all(tangent is not None for tangent in tangents)
+            grams = torch.stack([tangent.mT @ tangent for tangent in tangents if tangent is not None])
+            grams = 0.5 * (grams + grams.mT)
+            eigenvalues, eigenvectors = torch.linalg.eigh(grams)
+            geometry_buckets: dict[tuple, list[int]] = {}
+            for index, entry in enumerate(bucket_entries):
+                tangent = entry.oja_tangent
+                assert tangent is not None
+                geometry_buckets.setdefault((tuple(tangent.shape), entry.projector._basis_side()), []).append(index)
+            for (_shape, side), indices in geometry_buckets.items():
+                selected_entries = [bucket_entries[index] for index in indices]
+                frames = torch.stack([entry.projector.canonical_basis() for entry in selected_entries])
+                selected_tangents = torch.stack([entry.oja_tangent for entry in selected_entries if entry.oja_tangent is not None])
+                selected_values = eigenvalues[indices]
+                selected_vectors = eigenvectors[indices]
+                new_frames = SubspaceProjector.oja_geodesic_from_eigh(
+                    frames,
+                    selected_tangents,
+                    selected_values,
+                    selected_vectors,
+                    OJA_STEP_SIZE,
+                )
+                rotation_angles = None
+                if record_rotation:
+                    rotation_angles = (OJA_STEP_SIZE * selected_values.clamp_min(0.0).sqrt()).abs().sum(dim=-1).detach().cpu()
+                for local_index, (entry, new_frame) in enumerate(zip(selected_entries, new_frames, strict=True)):
+                    basis = new_frame.mT if side is ProjectionSide.RIGHT else new_frame
+                    entry.projector.basis = basis.to(
+                        device=entry.projector.basis.device,
+                        dtype=entry.projector.basis.dtype,
+                    ).contiguous()
+                    entry.projector.resolved_side = side
+                    state = self.state[entry.param]
+                    if rotation_angles is not None and diagnostics is not None:
+                        entry.projector.last_rotation_angle = float(rotation_angles[local_index])
+                        self._record_basis_motion(diagnostics, entry.projector, state, group["basis_refresh_step"])
+                    state["basis"] = entry.projector.basis
+                    state["projection_side_is_right"] = side is ProjectionSide.RIGHT
 
     def _apply_matrix_update(self, entry: MatrixUpdate, update_hat: Tensor, group: dict, diagnostics: dict | None) -> None:
         if diagnostics is not None:
@@ -538,13 +625,6 @@ class UsuiTrack(Optimizer):
                 diagnostics["projected_leverage_min_ratio_sum"] += min_ratio
                 diagnostics["projected_leverage_max_ratio_sum"] += max_ratio
                 diagnostics["projected_leverage_tensors"] += 1
-            if self.diagnostics_aurora_health_enabled:
-                alignment = self._aurora_alignment(entry.projected_exp_avg, update_hat)
-                erank = self._effective_rank(entry.projected_exp_avg)
-                diagnostics["aurora_alignment_sum"] += alignment
-                diagnostics["aurora_erank_sum"] += erank
-                diagnostics["aurora_erank_pct_sum"] += erank / min(entry.projected_exp_avg.shape)
-                diagnostics["aurora_health_tensors"] += 1
         update = entry.projector.project_back(update_hat).to(dtype=entry.param.dtype)
 
         if group["weight_decay"]:
@@ -598,7 +678,7 @@ class UsuiTrack(Optimizer):
             diagnostics["fallback_params"] += p.numel()
 
     # Lag between basis snapshots over a fixed optimizer-step horizon. Using a
-    # refresh count made direct Oja's five-gradient lag incomparable with EIGH's
+    # refresh count made Oja's five-gradient lag incomparable with EIGH's
     # five-boundary (50-step) lag. The instantaneous
     # angles (rotation_angle, target self-angle) are floored by target noise and
     # structurally cannot show convergence; the angle of the basis against its
@@ -616,10 +696,11 @@ class UsuiTrack(Optimizer):
     ) -> bool:
         was_initialized = projector.is_initialized
         aim = group["grassmann_aim"]
+        record_rotation = was_initialized and diagnostics is not None and self.diagnostics_basis_enabled
         if not was_initialized:
             projector.fit(grad)
         elif aim == "eigh":
-            # Position control (the default path): eigh target frame from the
+            # Position-control ablation: eigh target frame from the
             # dampened boundary grad names WHERE the signal subspace is; the
             # geodesic contracts a fraction step_size of every principal angle
             # toward it. Target noise decays geometrically instead of integrating
@@ -637,9 +718,15 @@ class UsuiTrack(Optimizer):
                 tangent,
                 step_size=group["grassmann_step_size"],
                 rotate_rank=rotate_rank,
+                record_rotation=record_rotation,
             )
         elif aim == "oja":
-            projector.update_oja(grad, step_size=OJA_STEP_SIZE, projected=projected_grad)
+            projector.update_oja(
+                grad,
+                step_size=OJA_STEP_SIZE,
+                projected=projected_grad,
+                record_rotation=record_rotation,
+            )
         else:
             # Velocity control (SubTrack-faithful single-grad tangent step): kept as
             # the reference/ablation arm. The C1 window accumulator was deleted when
@@ -650,26 +737,11 @@ class UsuiTrack(Optimizer):
                 grad,
                 step_size=group["grassmann_step_size"],
                 rotate_rank=self._resolve_rotate_rank(group, projector, grad),
+                record_rotation=record_rotation,
             )
 
         if was_initialized and diagnostics is not None and self.diagnostics_basis_enabled:
-            self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle)
-            # Convergence metric: principal angles between the basis and its own
-            # snapshot from BASIS_LAG_STEPS optimizer steps ago. Principal-angle
-            # mass is total motion per matrix, then averaged across the model.
-            snapshot = state.get("basis_lag_snapshot")
-            current_step = group["basis_refresh_step"]
-            snapshot_step = state.get("basis_lag_snapshot_step")
-            if snapshot is None:
-                state["basis_lag_snapshot"] = projector.canonical_basis().detach().clone()
-                state["basis_lag_snapshot_step"] = current_step
-            elif snapshot_step is None or current_step - snapshot_step >= self.BASIS_LAG_STEPS:
-                current = projector.canonical_basis()
-                lag_angles = SubspaceProjector.principal_angles_sine(snapshot, current)
-                diagnostics["basis_lag_angle_mass_sum"] += float(lag_angles.sum().detach().cpu())
-                diagnostics["basis_lag_tensors"] += 1
-                state["basis_lag_snapshot"] = current.detach().clone()
-                state["basis_lag_snapshot_step"] = current_step
+            self._record_basis_motion(diagnostics, projector, state, group["basis_refresh_step"])
         state["basis"] = projector.basis
         resolved_side = projector.resolved_side if projector.resolved_side is not None else projector.side
         state["projection_side_is_right"] = resolved_side is ProjectionSide.RIGHT
@@ -713,6 +785,24 @@ class UsuiTrack(Optimizer):
     def _accumulate_basis_diagnostics(diagnostics: dict, rotation_angle: float) -> None:
         diagnostics["rotation_angle_sum"] += rotation_angle
         diagnostics["basis_refresh_tensors"] += 1
+
+    def _record_basis_motion(self, diagnostics: dict, projector: SubspaceProjector, state: dict, current_step: int) -> None:
+        self._accumulate_basis_diagnostics(diagnostics, projector.last_rotation_angle)
+        # Convergence metric: principal angles between the basis and its own
+        # snapshot from BASIS_LAG_STEPS optimizer steps ago. Principal-angle
+        # mass is total motion per matrix, then averaged across the model.
+        snapshot = state.get("basis_lag_snapshot")
+        snapshot_step = state.get("basis_lag_snapshot_step")
+        if snapshot is None:
+            state["basis_lag_snapshot"] = projector.canonical_basis().detach().clone()
+            state["basis_lag_snapshot_step"] = current_step
+        elif snapshot_step is None or current_step - snapshot_step >= self.BASIS_LAG_STEPS:
+            current = projector.canonical_basis()
+            lag_angles = SubspaceProjector.principal_angles_sine(snapshot, current)
+            diagnostics["basis_lag_angle_mass_sum"] += float(lag_angles.sum().detach().cpu())
+            diagnostics["basis_lag_tensors"] += 1
+            state["basis_lag_snapshot"] = current.detach().clone()
+            state["basis_lag_snapshot_step"] = current_step
 
     @staticmethod
     def _orthogonalize_update(update: Tensor, group: dict, original_shape: tuple[int, ...] | None = None) -> Tensor:

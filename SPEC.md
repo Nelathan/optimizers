@@ -8,8 +8,9 @@ Current matrix-update design. Direction and unresolved questions live in
 - **Basis != subspace.** `Q` and `QH` span the same subspace, but coordinates in
   those frames differ.
 - **Left != right with renamed shapes.** Derive each projection and lift.
-- **A tangent != a position target.** Tangent integration is velocity control;
-  fractional motion toward an `eigh` frame is position control.
+- **Oja != a boundary controller.** Oja updates from every full gradient with its
+  fixed step. Refresh interval, rotation rank, and boundary step configure only
+  the explicit `eigh` and `tangent` ablations.
 - **Overlap reprojection != parallel transport.** Reprojection preserves the
   least-squares part of a fixed ambient vector. UsuiTrack carries momentum with
   its moving frame, so its stored coordinates do not change at refresh.
@@ -43,13 +44,14 @@ residual-facing policy instead. Spectral work promotes fp16/bf16 inputs to fp32.
 raw gradient G
   -> sanitize and raw clip
   -> Adafactor SNR conditioning (default)
-  -> initialize or refresh frame Q
-  -> projected gradient Z
+  -> stable EIGH initialization, otherwise one-state Oja tangent
+  -> held-frame projected gradient Z
   -> optional projected clip
   -> projected EMA M
+  -> identity-coordinate Oja frame move
   -> Aurora leverage balance + HeavyBall polar map
   -> full-parameter Muon scale
-  -> lift through Q
+  -> lift through the moved frame Q+
   -> decoupled weight decay and parameter update
 ```
 
@@ -97,34 +99,50 @@ $$K\leftarrow K+10^{-6}\max(\operatorname{tr}(K)/d,10^{-12})I.$$
 An exactly zero gradient uses a random QR frame. Random initialization otherwise
 remains an ablation.
 
-### 4. Refresh by position control
+### 4. Track with one-state Oja
 
-After initialization, burst-refresh eligible matrix parameters every
-`basis_refresh_interval` group steps (`100` API default). Compute a transient
-top-`r` `eigh` target frame `T`, then
+After EIGH initialization, default `grassmann_aim="oja"` updates the live frame
+from every conditioned full gradient. Let the covariance action be
 
-$$Q^\top T=U\operatorname{diag}(c_i)V^\top,$$
-$$h_i=Tv_i-c_iQu_i,\qquad s_i=\|h_i\|_2,\qquad
-\theta_i=\operatorname{atan2}(s_i,c_i),\qquad w_i=h_i/s_i.$$
+$$A=\widetilde G^\top(\widetilde GQ)\quad\text{(right)},\qquad
+A=\widetilde G( Q^\top\widetilde G)^\top\quad\text{(left)},$$
 
-The zero-angle limit uses `theta_i / s_i -> 1`. For fractional step
-`eta=0.25` by default,
+and form the symmetrized Rayleigh matrix and horizontal tangent
 
-$$Q_+=\sum_i
-\left(Qu_i\cos(\eta\theta_i)+w_i\sin(\eta\theta_i)\right)u_i^\top
-+Q(I-UU^\top).$$
+$$R=\operatorname{sym}(Q^\top A),\qquad
+\Delta=\frac{A-QR}{\operatorname{mean}(\operatorname{diag}R)}.$$
 
-The default rotates every principal plane. A configured `rotate_rank` keeps the
-largest-angle planes. `eta=1` reaches the target subspace when all planes are used
-and the selected shortest path is unique.
+The denominator is floored at `1e-12`. With
 
-**Decision — position control:** the target says where the signal subspace is;
-fractional motion geometrically forgets target noise. Integrating a noisy tangent
-instead accumulates velocity error without a restoring position.
+$$\Delta^\top\Delta=V\operatorname{diag}(\sigma_i^2)V^\top,$$
+
+the exact full-rank Grassmann step at fixed `eta_oja=0.01` is
+
+$$Q_{raw}=\left[(QV)\operatorname{diag}(\cos(\eta_{oja}\sigma_i))
++(\Delta V)\operatorname{diag}
+\left(\frac{\sin(\eta_{oja}\sigma_i)}{\sigma_i}\right)\right]V^\top.$$
+
+The zero-singular-value limit is `sin(eta_oja sigma) / sigma -> eta_oja`.
+Equal-rank tangent-Gram eigendecompositions are batched. With
+`S=Q_raw^T Q_raw`, one near-identity Polar Express step using the final stable
+HeavyBall coefficient triple retracts before storage:
+
+$$Q_+=Q_{raw}(aI+bS+cS^2).$$
+
+Oja rotates every tracked plane, stores no target frame or second tracker state, and requires the
+full matrix gradient on every step; queued projected-activation gradients are
+therefore incompatible.
+
+The `grassmann_step_size`, `grassmann_rotate_rank`, and
+`basis_refresh_interval` controls are inert under Oja and remain only for Phase 1
+ablation compatibility. Explicit `grassmann_aim="eigh"` retains the measured
+boundary position controller: every interval it moves all configured principal
+planes `0.25` of the geodesic toward the conditioned gradient's top-r EIGH frame.
+Explicit `tangent` retains the historical SubTrack-faithful velocity ablation.
 
 ### 5. Project and accumulate momentum
 
-Using the refreshed frame,
+Using the held frame before the current Oja move,
 
 $$Z_t=\Pi_{Q_t}(\widetilde G_t).$$
 
@@ -136,7 +154,7 @@ $$M_t=\beta M_{t-1}+(1-\beta)Z_t,\qquad \beta=0.9.$$
 
 There is no EMA bias correction.
 
-### 6. Transport momentum through refresh
+### 6. Transport momentum through frame motion
 
 The geodesic chooses an ambient rotation `R` with `Q_+ = RQ`. UsuiTrack defines
 momentum as moving with that frame:
@@ -148,7 +166,8 @@ Thus its stored coordinates and singular spectrum are unchanged:
 
 $$M_+=M.$$
 
-This is parallel transport along the selected lifted path. Multiplication by the
+This is parallel transport along the selected lifted path for Oja and both
+boundary ablations. Multiplication by the
 old/new frame overlap would answer a different question: represent the surviving
 projection of a fixed old ambient vector. It contracts each rotated plane by a
 principal-angle cosine before Aurora.
@@ -198,7 +217,7 @@ weight decay.
 Muon scale uses the original parameter shape, not the projected shape:
 
 $$\widehat U_t=O_t\sqrt{\max(1,m/n)},
-U_t=\Lambda_{Q_t}(\widehat U_t).$$
+U_t=\Lambda_{Q_{t+}}(\widehat U_t).$$
 
 Apply decoupled weight decay and learning rate:
 
@@ -238,9 +257,8 @@ These choices define the current design; they are redesignable.
    and attention-output use storage-left. Generic `auto` remains shape-only.
 3. **Side-Gram `eigh` initialization:** directly solves the one-sided target and
    has explicit fp32, finite-input, symmetrization, and jitter behavior.
-4. **Full-spectrum fractional position control:** the instantaneous spectral
-   target supplies displacement; fractional motion supplies temporal averaging
-   without state.
+4. **One-state full-gradient Oja tracking:** the live frame follows conditioned
+   covariance action every step with fixed `0.01` motion and no second basis.
 5. **Moving-frame momentum:** identity coordinates preserve the projected
    moment's spectrum through the chosen frame rotation.
 6. **Adafactor before tracking and projection:** both consumers see the same
@@ -249,8 +267,8 @@ These choices define the current design; they are redesignable.
    transient basis targets, not just momentum.
 8. **Aurora plus full-shape Muon scale:** direction belongs to projected geometry;
    scale remains tied to parameter geometry.
-9. **Burst refresh:** one explicit boundary is simpler than round-robin state and
-   scheduling.
+9. **Boundary controls are ablation-only:** burst cadence, EIGH fraction, and
+   rotate rank remain for explicit EIGH/tangent comparisons and do not govern Oja.
 10. **AdamW fallback:** non-matrix tensors remain trainable, with their full state
     exposed separately rather than hidden in the matrix claim.
 
@@ -260,14 +278,15 @@ These choices define the current design; they are redesignable.
 |---|---|
 | gauge change `Q -> QH` with matching coordinate change | same ambient update |
 | transpose problem and swap left/right | transposed projected and ambient update |
-| target equals current subspace | zero frame motion |
-| conceptual refresh fraction `eta=0` | frozen frame and unchanged moment coordinates |
-| `eta=1`, all planes | target subspace along the selected shortest path |
+| Oja covariance action lies inside the current subspace | zero frame motion |
+| Oja tangent is rank-deficient | zero singular planes remain fixed |
+| EIGH ablation target equals current subspace | zero frame motion |
+| EIGH ablation fraction `eta=1`, all planes | target subspace along the selected shortest path |
 | full rank | projection/lift loses no component; Aurora can still alter direction |
-| gradient rescaling below raw clipping and away from epsilon floors | basis target unchanged; pre-Aurora magnitude follows the stated conditioning |
+| gradient rescaling below raw clipping and away from epsilon floors | normalized Oja tangent unchanged; pre-Aurora magnitude follows the stated conditioning |
 | geodesic frame rotation | stored moment coordinates and singular values unchanged |
 | disable Adafactor | row/column state vanishes; clipped raw gradient feeds tracking |
 
-At a principal angle near 90 degrees, a shortest Grassmann path may be non-unique.
-Transport is exact along the overlap SVD's selected path; that does not guarantee
-the noisy target selects a temporally stable path.
+At a principal angle near 90 degrees, the EIGH ablation's shortest Grassmann path
+may be non-unique. Transport is exact along the selected path; that does not
+guarantee a noisy boundary target selects a temporally stable path.
