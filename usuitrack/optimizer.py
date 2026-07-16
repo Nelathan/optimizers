@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -28,10 +29,10 @@ OJA_STEP_SCHEDULES = ("fixed", "mature")
 class MatrixUpdate:
     param: Tensor
     projector: SubspaceProjector
-    projected_grad: Tensor
     projected_exp_avg: Tensor
     original_shape: tuple[int, ...]
     oja_tangent: Tensor | None = None
+    raw_grad_norm: Tensor | None = None
 
 
 class UsuiTrack(Optimizer):
@@ -50,7 +51,7 @@ class UsuiTrack(Optimizer):
         self,
         params: Iterable[Tensor],
         lr: float = 1e-3,
-        beta: float = 0.9,
+        beta: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.99),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -71,6 +72,7 @@ class UsuiTrack(Optimizer):
         projected_grad_clip_norm: float | None = None,
         projected_grad_clip_ratio: float | None = None,
         consume_grad: bool = True,
+        release_matrix_grads: bool = False,
         compile_tensor_kernels: bool = False,
         ecc: str | None = None,
         param_ecc: str | None = None,
@@ -119,6 +121,8 @@ class UsuiTrack(Optimizer):
             raise ValueError(f"projected_grad_clip_norm must be positive when set, got {projected_grad_clip_norm}")
         if projected_grad_clip_ratio is not None and projected_grad_clip_ratio <= 0:
             raise ValueError(f"projected_grad_clip_ratio must be positive when set, got {projected_grad_clip_ratio}")
+        if release_matrix_grads and not consume_grad:
+            raise ValueError("release_matrix_grads requires consume_grad=True")
 
         defaults = dict(
             lr=lr,
@@ -154,6 +158,29 @@ class UsuiTrack(Optimizer):
         self.last_step_diagnostics: dict[str, float] = {}
         self._compiled_orthogonalize_update = torch.compile(UsuiTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
         self._queued_projected_grads: dict[Tensor, Tensor] = {}
+        self._pending_matrix_updates: dict[Tensor, MatrixUpdate] = {}
+        self._pending_diagnostics: dict[str, Any] | None = None
+        self._matrix_grad_hook_handles = []
+        self._matrix_param_groups: dict[Tensor, dict] = {}
+        self.release_matrix_grads = release_matrix_grads
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.ndim == 2:
+                    self._matrix_param_groups[param] = group
+        if release_matrix_grads:
+            optimizer_ref = weakref.ref(self)
+
+            def release_grad(param: Tensor) -> None:
+                optimizer = optimizer_ref()
+                if optimizer is not None:
+                    optimizer.prepare(param)
+
+            for group in self.param_groups:
+                if not group["consume_grad"] and any(param.ndim == 2 for param in group["params"]):
+                    raise ValueError("release_matrix_grads requires consume_grad=True for every matrix parameter group")
+                for param in group["params"]:
+                    if param.ndim == 2 and param.requires_grad:
+                        self._matrix_grad_hook_handles.append(param.register_post_accumulate_grad_hook(release_grad))
 
     @torch.no_grad()
     def queue_projected_grad(self, param: Tensor, projected_grad: Tensor) -> None:
@@ -166,6 +193,8 @@ class UsuiTrack(Optimizer):
         every step, so queued projected gradients are incompatible with Oja.
         """
 
+        if self.release_matrix_grads:
+            raise RuntimeError("queued projected gradients are incompatible with release_matrix_grads")
         if not self._owns_param(param):
             raise ValueError("cannot queue a projected gradient for a parameter not owned by this optimizer")
         if param.ndim != 2:
@@ -174,6 +203,8 @@ class UsuiTrack(Optimizer):
             raise ValueError(f"projected gradient must be 2D, got shape {tuple(projected_grad.shape)}")
         if projected_grad.is_sparse:
             raise RuntimeError("UsuiTrack does not support sparse projected gradients")
+        if param in self._pending_matrix_updates:
+            raise RuntimeError("cannot queue a projected gradient for a matrix parameter that is already prepared")
 
         projected_grad = projected_grad.detach()
         existing = self._queued_projected_grads.get(param)
@@ -188,48 +219,158 @@ class UsuiTrack(Optimizer):
         self._queued_projected_grads.clear()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        if self._pending_matrix_updates:
+            raise RuntimeError(
+                "cannot discard released matrix updates or explicitly prepared matrix updates with zero_grad(); preparation has already mutated "
+                "optimizer state, so the pending updates must be consumed by step()"
+            )
         super().zero_grad(set_to_none=set_to_none)
         self.clear_projected_grads()
+        if self.release_matrix_grads:
+            self._pending_diagnostics = self._new_diagnostics()
+
+    @torch.no_grad()
+    def prepare(self, param: Tensor) -> None:
+        """Consume and prepare one owned full matrix gradient exactly once."""
+
+        group = self._matrix_group(param)
+        if group is None:
+            if not self._owns_param(param):
+                raise ValueError("cannot prepare a parameter not owned by this optimizer")
+            raise ValueError(f"prepare() only supports 2D matrix parameters, got shape {tuple(param.shape)}")
+        if not group["consume_grad"]:
+            raise RuntimeError("prepare() requires consume_grad=True for the parameter group")
+        self._prepare_matrix_param(param, require_full_grad=True)
+
+    @torch.no_grad()
+    def _prepare_matrix_param(
+        self,
+        param: Tensor,
+        *,
+        refresh_basis: bool | None = None,
+        require_full_grad: bool = False,
+    ) -> MatrixUpdate:
+        if param in self._pending_matrix_updates:
+            raise RuntimeError(
+                "matrix parameter is already prepared; prepare/release does not support gradient accumulation before step()"
+            )
+        grad = param.grad
+        queued = param in self._queued_projected_grads
+        if grad is not None and queued:
+            raise RuntimeError("a matrix parameter cannot have both a full grad and a queued projected grad")
+        if require_full_grad and grad is None:
+            raise RuntimeError("prepare() requires a live full matrix gradient")
+        if require_full_grad and queued:
+            raise RuntimeError("prepare() requires a full matrix gradient, not a queued projected gradient")
+        if grad is None and not queued:
+            raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+        if grad is not None and grad.is_sparse:
+            raise RuntimeError("UsuiTrack does not support sparse gradients")
+        group = self._matrix_group(param)
+        if group is None:
+            raise ValueError("cannot prepare a matrix parameter not owned by this optimizer")
+        if self._pending_diagnostics is None:
+            self._pending_diagnostics = self._new_diagnostics()
+        if refresh_basis is None:
+            refresh_basis = id(param) in self._refresh_param_ids_at_current_step(group, [param])
+        update = self._prepare_matrix_update(
+            param, grad, group, refresh_basis, self._pending_diagnostics
+        )
+        self._pending_matrix_updates[param] = update
+        if group["consume_grad"]:
+            param.grad = None
+        return update
+
+    def released_matrix_grad_norms(self) -> tuple[Tensor, ...]:
+        """Raw full-gradient norms retained for telemetry after matrix grads are released."""
+
+        return tuple(
+            self._pending_matrix_updates[param].raw_grad_norm
+            for group in self.param_groups
+            for param in group["params"]
+            if param in self._pending_matrix_updates
+            and self._pending_matrix_updates[param].raw_grad_norm is not None
+        )
+
+    def _matrix_group(self, param: Tensor) -> dict | None:
+        group = self._matrix_param_groups.get(param)
+        if group is not None:
+            return group
+        if param.ndim != 2:
+            return None
+        for candidate_group in self.param_groups:
+            if any(param is candidate for candidate in candidate_group["params"]):
+                self._matrix_param_groups[param] = candidate_group
+                return candidate_group
+        return None
 
     def _owns_param(self, param: Tensor) -> bool:
         return any(param is candidate for group in self.param_groups for candidate in group["params"])
 
+    def _validate_step_inputs(self) -> None:
+        for group in self.param_groups:
+            for param in group["params"]:
+                pending = param in self._pending_matrix_updates
+                queued = param in self._queued_projected_grads
+                grad = param.grad
+                if pending and (grad is not None or queued):
+                    raise RuntimeError("a prepared matrix parameter cannot also have a new live or queued gradient")
+                if self.release_matrix_grads and param.ndim == 2 and grad is not None:
+                    raise RuntimeError("release_matrix_grads requires matrix gradients to be produced by backward hooks")
+                if grad is not None and grad.is_sparse:
+                    raise RuntimeError("UsuiTrack does not support sparse gradients")
+                if queued and param.ndim != 2:
+                    raise RuntimeError("queued projected gradients are only supported for 2D matrix parameters")
+                if grad is not None and queued:
+                    raise RuntimeError("a matrix parameter cannot have both a full grad and a queued projected grad")
+
     @torch.no_grad()
     def step(self, closure=None):
+        if closure is not None and (self.release_matrix_grads or self._pending_matrix_updates):
+            raise RuntimeError("optimizer closures cannot run while matrix updates are pending")
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        diagnostics = self._new_diagnostics()
+        self._validate_step_inputs()
+        diagnostics = self._pending_diagnostics if self._pending_diagnostics is not None else self._new_diagnostics()
+        self._pending_diagnostics = diagnostics
 
         for group in self.param_groups:
-            matrix_params = [p for p in group["params"] if p.ndim == 2 and (p.grad is not None or p in self._queued_projected_grads)]
-            refresh_ids = self._refresh_param_ids(group, matrix_params)
+            matrix_params = [
+                p for p in group["params"]
+                if p.ndim == 2
+                and (p in self._pending_matrix_updates or p.grad is not None or p in self._queued_projected_grads)
+            ]
+            refresh_ids = self._refresh_param_ids_at_current_step(group, matrix_params)
             matrix_updates = []
 
             for p in group["params"]:
+                if p in self._pending_matrix_updates:
+                    matrix_updates.append(self._pending_matrix_updates[p])
+                    continue
                 has_queued_projected_grad = p in self._queued_projected_grads
                 if p.grad is None and not has_queued_projected_grad:
                     continue
                 grad = p.grad
-                if grad is not None and grad.is_sparse:
-                    raise RuntimeError("UsuiTrack does not support sparse gradients")
                 if p.ndim == 2:
-                    matrix_updates.append(self._prepare_matrix_update(p, grad, group, id(p) in refresh_ids, diagnostics))
-                    if group["consume_grad"]:
-                        p.grad = None
+                    matrix_updates.append(
+                        self._prepare_matrix_param(p, refresh_basis=id(p) in refresh_ids)
+                    )
                 else:
-                    if has_queued_projected_grad:
-                        raise RuntimeError("queued projected gradients are only supported for 2D matrix parameters")
                     assert grad is not None
                     self._step_fallback_param(p, grad, group, diagnostics)
                     if group["consume_grad"]:
                         p.grad = None
+            if matrix_updates:
+                group["basis_refresh_step"] += 1
             self._apply_oja_basis_updates(matrix_updates, group, diagnostics)
             self._apply_matrix_update_buckets(matrix_updates, group, diagnostics)
 
         self.last_step_diagnostics = self._finalize_diagnostics(diagnostics)
+        self._pending_matrix_updates.clear()
+        self._pending_diagnostics = None
         return loss
 
     def _new_diagnostics(self) -> dict[str, Any] | None:
@@ -308,8 +449,13 @@ class UsuiTrack(Optimizer):
     def _refresh_param_ids(self, group: dict, matrix_params: list[Tensor]) -> set[int]:
         if not matrix_params:
             return set()
+        refresh_ids = self._refresh_param_ids_at_current_step(group, matrix_params)
+        group["basis_refresh_step"] += 1
+        return refresh_ids
+
+    @staticmethod
+    def _refresh_param_ids_at_current_step(group: dict, matrix_params: list[Tensor]) -> set[int]:
         step = group["basis_refresh_step"]
-        group["basis_refresh_step"] = step + 1
         interval = group["basis_refresh_interval"]
         refresh_offsets = group.get("basis_refresh_offsets")
         if step > 0:
@@ -334,6 +480,7 @@ class UsuiTrack(Optimizer):
         state = self.state[p]
         projector = self._projector_from_state(p, group, state)
         oja_tangent = None
+        raw_grad_norm = None
         if queued_projected_grad is not None:
             if group["grassmann_aim"] == "oja":
                 raise RuntimeError("Oja basis updates require a full matrix gradient on every step")
@@ -376,10 +523,10 @@ class UsuiTrack(Optimizer):
             # run). Clipping here protects adafactor's state, the basis refresh, and
             # the projection in one place -- upstream of everything, which is why the
             # projected-grad clip (downstream, moment-only) could not stop it.
+            raw_grad_norm = grad.float().norm().detach()
             grad_clip_norm = group.get("grad_clip_norm")
             if grad_clip_norm is not None:
-                raw_norm = grad.float().norm()
-                clip_scale = (grad.new_tensor(float(grad_clip_norm)) / raw_norm.clamp_min(1e-12)).clamp(max=1.0)
+                clip_scale = (grad.new_tensor(float(grad_clip_norm)) / raw_grad_norm.clamp_min(1e-12)).clamp(max=1.0)
                 grad = grad.mul(clip_scale)
             moment_mode = group["moment_mode"]
             if moment_mode == "adafactor_ema":
@@ -453,10 +600,10 @@ class UsuiTrack(Optimizer):
         return MatrixUpdate(
             param=p,
             projector=projector,
-            projected_grad=projected_grad,
             projected_exp_avg=projected_exp_avg,
             original_shape=tuple(p.shape),
             oja_tangent=oja_tangent,
+            raw_grad_norm=raw_grad_norm,
         )
 
     @staticmethod

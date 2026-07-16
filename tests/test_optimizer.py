@@ -348,6 +348,221 @@ class UsuiTrackTest(unittest.TestCase):
 
         self.assertIsNotNone(weight.grad)
 
+    def test_hook_and_ordinary_step_share_matrix_preparation_seam(self):
+        ordinary_weight = torch.nn.Parameter(torch.randn(6, 4))
+        released_weight = torch.nn.Parameter(ordinary_weight.detach().clone())
+        ordinary = UsuiTrack([ordinary_weight], rank=2)
+        released = UsuiTrack([released_weight], rank=2, release_matrix_grads=True)
+
+        with mock.patch.object(ordinary, "_prepare_matrix_param", wraps=ordinary._prepare_matrix_param) as ordinary_prepare:
+            ordinary_weight.grad = torch.randn_like(ordinary_weight)
+            ordinary.step()
+        with mock.patch.object(released, "_prepare_matrix_param", wraps=released._prepare_matrix_param) as released_prepare:
+            released_weight.square().sum().backward()
+
+        self.assertEqual(ordinary_prepare.call_count, 1)
+        self.assertEqual(released_prepare.call_count, 1)
+
+    def test_explicit_prepare_is_reused_by_step_without_recomputation(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = UsuiTrack([weight], lr=0.01, rank=2)
+        weight.grad = torch.randn_like(weight)
+
+        with mock.patch.object(opt, "_prepare_matrix_update", wraps=opt._prepare_matrix_update) as compute:
+            opt.prepare(weight)
+            prepared = opt._pending_matrix_updates[weight]
+            self.assertIsNone(weight.grad)
+            opt.step()
+
+        self.assertEqual(compute.call_count, 1)
+        self.assertNotIn(weight, opt._pending_matrix_updates)
+        self.assertIsNotNone(prepared.projected_exp_avg)
+
+    def test_mixed_pending_and_fresh_matches_all_fresh_with_one_group_advance(self):
+        torch.manual_seed(71)
+        initial = [torch.randn(8, 5), torch.randn(8, 5)]
+        mixed_params = [torch.nn.Parameter(value.clone()) for value in initial]
+        fresh_params = [torch.nn.Parameter(value.clone()) for value in initial]
+        kwargs = dict(lr=0.01, beta=0.9, rank=3, side="right", moment_mode="ema", grad_clip_norm=None)
+        mixed = UsuiTrack(mixed_params, **kwargs)
+        fresh = UsuiTrack(fresh_params, **kwargs)
+
+        for _ in range(2):
+            gradients = [torch.randn_like(value) for value in initial]
+            for param, gradient in zip(mixed_params, gradients, strict=True):
+                param.grad = gradient.clone()
+            for param, gradient in zip(fresh_params, gradients, strict=True):
+                param.grad = gradient.clone()
+            if mixed.param_groups[0]["basis_refresh_step"]:
+                mixed.prepare(mixed_params[0])
+            mixed.step()
+            fresh.step()
+
+        self.assertEqual(mixed.param_groups[0]["basis_refresh_step"], 2)
+        self.assertEqual(mixed.param_groups[0]["basis_refresh_step"], fresh.param_groups[0]["basis_refresh_step"])
+        for mixed_param, fresh_param in zip(mixed_params, fresh_params, strict=True):
+            torch.testing.assert_close(mixed_param, fresh_param, rtol=0, atol=0)
+            for key, fresh_value in fresh.state[fresh_param].items():
+                mixed_value = mixed.state[mixed_param][key]
+                if isinstance(fresh_value, torch.Tensor):
+                    torch.testing.assert_close(mixed_value, fresh_value, rtol=0, atol=0)
+                else:
+                    self.assertEqual(mixed_value, fresh_value)
+
+    def test_duplicate_prepare_raises_before_mutating_state(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = UsuiTrack([weight], rank=2)
+        weight.grad = torch.randn_like(weight)
+        opt.prepare(weight)
+        state_before = copy.deepcopy(opt.state[weight])
+        pending_before = opt._pending_matrix_updates[weight]
+        with self.assertRaisesRegex(RuntimeError, "already prepared"):
+            opt.queue_projected_grad(weight, torch.randn(6, 2))
+        closure = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "closures cannot run"):
+            opt.step(closure)
+        closure.assert_not_called()
+        new_grad = torch.randn_like(weight)
+        weight.grad = new_grad
+
+        with self.assertRaisesRegex(RuntimeError, "already prepared"):
+            opt.prepare(weight)
+
+        self.assertIs(opt._pending_matrix_updates[weight], pending_before)
+        self.assertIs(weight.grad, new_grad)
+        self.assertEqual(opt.state[weight].keys(), state_before.keys())
+        for key, before in state_before.items():
+            after = opt.state[weight][key]
+            if isinstance(before, torch.Tensor):
+                torch.testing.assert_close(after, before, rtol=0, atol=0)
+            else:
+                self.assertEqual(after, before)
+
+    def test_step_validates_all_groups_before_applying_any_update(self):
+        first = torch.nn.Parameter(torch.randn(6, 4))
+        second = torch.nn.Parameter(torch.randn(5, 3))
+        opt = UsuiTrack([{"params": [first]}, {"params": [second]}], lr=0.01, rank=2)
+        first.grad = torch.randn_like(first)
+        second.grad = torch.randn_like(second)
+        opt.prepare(second)
+        second.grad = torch.randn_like(second)
+        first_before = first.detach().clone()
+        first_step_before = opt.param_groups[0]["basis_refresh_step"]
+
+        with self.assertRaisesRegex(RuntimeError, "already prepared|prepared matrix parameter"):
+            opt.step()
+
+        torch.testing.assert_close(first, first_before, rtol=0, atol=0)
+        self.assertEqual(opt.param_groups[0]["basis_refresh_step"], first_step_before)
+        self.assertNotIn("step", opt.state[first])
+
+    def test_matrix_group_lookup_supports_params_added_after_construction(self):
+        first = torch.nn.Parameter(torch.randn(6, 4))
+        second = torch.nn.Parameter(torch.randn(5, 3))
+        opt = UsuiTrack([first], lr=0.01, rank=2)
+        opt.add_param_group({"params": [second]})
+        second.grad = torch.randn_like(second)
+
+        opt.prepare(second)
+        self.assertIn(second, opt._pending_matrix_updates)
+        opt.step()
+
+        self.assertIn("step", opt.state[second])
+
+    def test_prepare_rejects_foreign_non_matrix_and_non_consumable_params(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        frozen = torch.nn.Parameter(torch.randn(4, 3), requires_grad=False)
+        bias = torch.nn.Parameter(torch.randn(4))
+        foreign = torch.nn.Parameter(torch.randn(6, 4))
+        opt = UsuiTrack([weight, frozen, bias], rank=2)
+
+        self.assertIs(opt._matrix_param_groups[weight], opt.param_groups[0])
+        self.assertIs(opt._matrix_param_groups[frozen], opt.param_groups[0])
+
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            opt.prepare(foreign)
+        with self.assertRaisesRegex(ValueError, "only supports 2D"):
+            opt.prepare(bias)
+
+        retained = UsuiTrack([weight], rank=2, consume_grad=False)
+        weight.grad = torch.randn_like(weight)
+        with self.assertRaisesRegex(RuntimeError, "requires consume_grad=True"):
+            retained.prepare(weight)
+
+    def test_released_matrix_grads_match_ordinary_batched_step_and_state(self):
+        torch.manual_seed(73)
+        ordinary_model = torch.nn.Sequential(
+            torch.nn.Linear(7, 9),
+            torch.nn.SiLU(),
+            torch.nn.Linear(9, 5),
+        )
+        released_model = copy.deepcopy(ordinary_model)
+        kwargs = dict(
+            lr=0.01,
+            rank=3,
+            side="auto",
+            moment_mode="adafactor_ema",
+            grad_clip_norm=1.0,
+            grassmann_aim="oja",
+        )
+        ordinary = UsuiTrack(ordinary_model.parameters(), **kwargs)
+        released = UsuiTrack(released_model.parameters(), release_matrix_grads=True, **kwargs)
+        ordinary.diagnostics_enabled = True
+        released.diagnostics_enabled = True
+
+        for _ in range(4):
+            inputs = torch.randn(6, 7)
+            targets = torch.randn(6, 5)
+            ordinary.zero_grad()
+            released.zero_grad()
+            torch.nn.functional.mse_loss(ordinary_model(inputs), targets).backward()
+            torch.nn.functional.mse_loss(released_model(inputs), targets).backward()
+
+            released_params = list(released_model.parameters())
+            self.assertIsNone(released_params[0].grad)
+            self.assertIsNotNone(released_params[1].grad)
+            self.assertIsNone(released_params[2].grad)
+            self.assertIsNotNone(released_params[3].grad)
+            self.assertEqual(len(released._pending_matrix_updates), 2)
+
+            ordinary.step()
+            released.step()
+
+            for ordinary_param, released_param in zip(ordinary_model.parameters(), released_model.parameters(), strict=True):
+                torch.testing.assert_close(released_param, ordinary_param, rtol=0, atol=0)
+                ordinary_state = ordinary.state[ordinary_param]
+                released_state = released.state[released_param]
+                self.assertEqual(ordinary_state.keys(), released_state.keys())
+                for key, ordinary_value in ordinary_state.items():
+                    released_value = released_state[key]
+                    if isinstance(ordinary_value, torch.Tensor):
+                        torch.testing.assert_close(released_value, ordinary_value, rtol=0, atol=0)
+                    else:
+                        self.assertEqual(released_value, ordinary_value)
+            self.assertEqual(released.param_groups[0]["basis_refresh_step"], ordinary.param_groups[0]["basis_refresh_step"])
+            self.assertEqual(released._pending_matrix_updates, {})
+
+    def test_released_matrix_grads_reject_accumulation_and_discard(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        opt = UsuiTrack([weight], lr=0.01, rank=2, release_matrix_grads=True)
+        opt.zero_grad()
+        weight.square().mean().backward()
+
+        with self.assertRaisesRegex(RuntimeError, "cannot discard released matrix updates"):
+            opt.zero_grad()
+        with self.assertRaisesRegex(RuntimeError, "does not support gradient accumulation"):
+            weight.square().mean().backward()
+
+    def test_released_matrix_grads_require_consumed_backward_grads(self):
+        weight = torch.nn.Parameter(torch.randn(6, 4))
+        with self.assertRaisesRegex(ValueError, "requires consume_grad=True"):
+            UsuiTrack([weight], release_matrix_grads=True, consume_grad=False)
+
+        opt = UsuiTrack([weight], release_matrix_grads=True)
+        weight.grad = torch.randn_like(weight)
+        with self.assertRaisesRegex(RuntimeError, "produced by backward hooks"):
+            opt.step()
+
     def test_queued_projected_grad_matches_full_gradient_step(self):
         torch.manual_seed(24)
         base = torch.randn(7, 5, dtype=torch.float64)
@@ -760,7 +975,8 @@ class UsuiTrackTest(unittest.TestCase):
 
         new_basis = state["basis"]
         self.assertFalse(torch.allclose(new_basis, old_basis))
-        self.assertTrue(torch.allclose(state["projected_exp_avg"], 0.9 * old_moment + 0.1 * (second_grad @ new_basis.mT), atol=1e-5))
+        beta = opt.param_groups[0]["beta"]
+        self.assertTrue(torch.allclose(state["projected_exp_avg"], beta * old_moment + (1.0 - beta) * (second_grad @ new_basis.mT), atol=1e-5))
         self.assertEqual(tuple(state["projected_exp_avg"].shape), (8, 2))
 
     def test_nonfinite_grad_is_zeroed_not_propagated(self):
@@ -820,7 +1036,7 @@ class UsuiTrackTest(unittest.TestCase):
             projector = SubspaceProjector(rank=3, side="right")
             projector.fit(torch.randn_like(param))
             moment = torch.randn(8, 3)
-            entries.append(MatrixUpdate(param, projector, moment, moment, tuple(param.shape)))
+            entries.append(MatrixUpdate(param, projector, moment, tuple(param.shape)))
             updates.append(torch.randn_like(moment))
         opt.diagnostics_enabled = True
         diagnostics = opt._new_diagnostics()

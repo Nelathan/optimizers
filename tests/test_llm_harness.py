@@ -7,7 +7,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FALLBACK_LR_RATIO, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -98,6 +98,61 @@ class TinyLfmForCausalLM(torch.nn.Module):
 
 
 class LlmHarnessParamScopeTest(unittest.TestCase):
+    def test_usuitrack_partition_leaves_only_matrices_in_matrix_optimizer(self):
+        model = TinyTopology()
+        named = [(name, param) for name, param in model.named_parameters()]
+
+        matrix, fallback = partition_usuitrack_params(named)
+
+        self.assertTrue(matrix)
+        self.assertTrue(fallback)
+        self.assertTrue(all(param.ndim == 2 for _name, param in matrix))
+        self.assertTrue(all(param.ndim != 2 for _name, param in fallback))
+        self.assertEqual({id(param) for _name, param in named}, {id(param) for _name, param in matrix + fallback})
+
+    def test_fp32_state_adamw_matches_existing_fallback_math(self):
+        torch.manual_seed(91)
+        initial = torch.randn(7, dtype=torch.bfloat16)
+        old_param = torch.nn.Parameter(initial.clone())
+        split_param = torch.nn.Parameter(initial.clone())
+        lr = 1.5e-4
+        old = UsuiTrack([old_param], lr=lr, fallback_betas=(0.9, 0.99))
+        split = FP32StateAdamW([split_param], lr=lr, betas=(0.9, 0.99))
+
+        for _ in range(3):
+            grad = torch.randn_like(initial)
+            old_param.grad = grad.clone()
+            split_param.grad = grad.clone()
+            old.step()
+            split.step()
+
+        torch.testing.assert_close(split_param, old_param, rtol=0, atol=0)
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(split.state[split_param][key], old.state[old_param][key], rtol=0, atol=0)
+        self.assertEqual(split.state[split_param]["exp_avg"].dtype, torch.float32)
+        self.assertEqual(split.state[split_param]["exp_avg_sq"].dtype, torch.float32)
+        self.assertEqual(FALLBACK_LR_RATIO, 0.5)
+
+    def test_backward_memory_trace_brackets_registered_preparation_hook(self):
+        param = torch.nn.Parameter(torch.randn(3, 2))
+        trace = BackwardMemoryTrace(torch.device("cpu"))
+        trace.install_before([("weight", param)])
+        middle = param.register_post_accumulate_grad_hook(lambda completed: setattr(completed, "grad", None))
+        trace.install_after([("weight", param)])
+
+        trace.start()
+        param.square().sum().backward()
+        trace.stop()
+
+        self.assertEqual([event["phase"] for event in trace.events], ["before_prepare", "after_prepare"])
+        self.assertTrue(trace.events[0]["grad_present"])
+        self.assertFalse(trace.events[1]["grad_present"])
+        self.assertGreater(trace.events[0]["grad_bytes"], 0)
+        self.assertEqual(trace.events[1]["grad_bytes"], 0)
+        self.assertEqual(trace.summary()["memory_trace_event_count"], 2)
+        middle.remove()
+        trace.close()
+
     def test_gradient_norm_statistics_describe_the_per_tensor_clip_population(self):
         first = torch.nn.Parameter(torch.zeros(2))
         second = torch.nn.Parameter(torch.zeros(1))
@@ -142,7 +197,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.projection_side_policy, "residual-facing")
         self.assertEqual(args.usuitrack_lr, 3e-4)
         self.assertEqual(args.lr_warmup_steps, 50)
-        self.assertEqual(args.beta, 0.9)
+        self.assertEqual(args.beta, 0.95)
         self.assertEqual(args.projected_activation_backend, "off")
         self.assertEqual(args.basis_refresh_schedule, "burst")
         self.assertEqual(args.moment_mode, "adafactor_ema")
@@ -171,6 +226,8 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(build_parser().parse_args(["--no-torch-compile"]).torch_compile)
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
+        self.assertFalse(args.release_matrix_grads)
+        self.assertFalse(args.trace_backward_memory)
         self.assertFalse(hasattr(args, "shadow_target_probe"))
 
     def test_oja_rejects_projected_activation_backend_before_setup(self):
@@ -180,6 +237,25 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             validate_projected_activation_contract(args)
 
         validate_projected_activation_contract(build_parser().parse_args(["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"]))
+
+    def test_gradient_release_rejects_incompatible_harness_contracts(self):
+        validate_gradient_release_contract(build_parser().parse_args(["--release-matrix-grads"]))
+        for incompatible in (
+            ["--release-matrix-grads", "--grad-accum-steps", "2"],
+            ["--release-matrix-grads", "--keep-grads-after-step"],
+            ["--release-matrix-grads", "--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"],
+        ):
+            with self.assertRaises(ValueError):
+                validate_gradient_release_contract(build_parser().parse_args(incompatible))
+
+    def test_gradient_statistics_include_released_matrix_norms(self):
+        live = torch.nn.Parameter(torch.zeros(3))
+        live.grad = torch.tensor([3.0, 4.0, 0.0])
+        total, median, clipped = gradient_norm_statistics([live], 4.0, (torch.tensor(12.0),))
+
+        self.assertEqual(float(total), 13.0)
+        self.assertEqual(float(median), 5.0)
+        self.assertEqual(float(clipped), 1.0)
 
     def test_cli_has_no_loss_or_padding_option_garden(self):
         option_strings = {option for action in build_parser()._actions for option in action.option_strings}

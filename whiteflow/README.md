@@ -4,7 +4,7 @@ Status: historical design sketch.
 
 This document is preserved as optimizer-idea archaeology. It is not the active direction of this repo, and it should not be read as a current implementation contract, benchmark plan, or product thesis.
 
-The active optimizer line is **UsuiTrack**. Current direction and durable facts live in `../PLAN.md`; superseded experiment records live in `../archive/RESULTS.md`.
+The active optimizer line is **UsuiTrack**. Current direction and durable facts live in `../docs/PLAN.md`; superseded experiment records live in `../docs/archive/RESULTS.md`.
 
 ## Historical idea
 

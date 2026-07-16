@@ -156,7 +156,7 @@ Optional projected clipping limits `||Z_t||_F` by an absolute threshold, a ratio
 times `||M_{t-1}||_F`, or their minimum. Both controls default off. It protects
 only the projected EMA:
 
-$$M_t=\beta M_{t-1}+(1-\beta)Z_t,\qquad \beta=0.9.$$
+$$M_t=\beta M_{t-1}+(1-\beta)Z_t,\qquad \beta=0.95.$$
 
 There is no EMA bias correction.
 

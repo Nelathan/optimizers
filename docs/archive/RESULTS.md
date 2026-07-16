@@ -2,7 +2,7 @@
 
 Short empirical notes from local runs. Treat these as terrain markers, not claims of optimizer quality.
 
-This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
+This file is chronological experiment history. Older entries may describe defaults, flags, model choices, or harness behavior that have since been superseded. The current contract and durable facts distilled from these runs are in `../PLAN.md`. When an old run used SVD init, packed SYNTH formatting, random init, HF loss, or a now-stale LR prior, read it as dated evidence for that specific setup, not as current guidance.
 
 ## 2026-07-05: Side-aware fused MLP fails the microbench gate
 
@@ -989,7 +989,7 @@ Notes:
 Why: single-batch tangents made the tracker's aim noisy (slow erank/alignment
 decay). C1 = buffer the full tangent per step at the frozen basis, retract once
 per interval from the mean. Full detail and question-ledger updates in
-`SUBSPACE_TRACKING.md`; this is the run record.
+`../SUBSPACE_TRACKING.md`; this is the run record.
 
 What changed in code: C1 implemented and defaulted (`grassmann_accumulate=True`,
 fp32 `[dim,rank]` buffer in optimizer state, divide by true count);
@@ -999,7 +999,7 @@ sync-free `nan_to_num` raw-grad guard + `nonfinite_grad_tensors` diagnostic;
 activation checkpointing ON, raw grad clip 2.5 per tensor, log-every 10,
 `grassmann_step_size` 1.0. All 200-step LFM2.5-350M SYNTH pairs, eager, eval on.
 
-Measured (details in SUBSPACE_TRACKING.md):
+Measured (details in `../SUBSPACE_TRACKING.md`):
 - Accumulation removes the σ noise wall: floor drops ~√window (0.054→0.014 at
   interval 10); grad/moment coherence up; eval loss unchanged vs single-grad.
 - Random-init stress: acquisition is dead in both regimes — step 5 limit-cycles
@@ -1030,7 +1030,7 @@ Why: two pre-registered questions from the A′ design space. Q13: does
 full-spectrum rotation of the C1 window-mean tangent beat rank-1? A′1/Q10/Q11:
 does a zero-state boundary-eigh target (rotate along the largest principal
 angle toward SVD(QᵀQ_target)) beat tangent tracking, and how noisy is a
-single-batch target? Full detail in `SUBSPACE_TRACKING.md`.
+single-batch target? Full detail in `../SUBSPACE_TRACKING.md`.
 
 What changed in code: `grassmann_rotate_rank` threaded through the retraction;
 `grassmann_aim {tangent,eigh}` with `eigh_target_frame` + `tangent_toward`
@@ -1106,7 +1106,7 @@ Why: the arc's synthesis (user-approved). Eigh aim is closed-loop POSITION
 control — target noise decays geometrically instead of integrating — while
 tangent tracking is open-loop velocity control whose noise random-walks; that
 asymmetry, not step tuning, is why fractional eigh aim beat every buffered
-arm. Full rationale in SUBSPACE_TRACKING.md (centerpiece section).
+arm. Full rationale in `../SUBSPACE_TRACKING.md` (centerpiece section).
 
 What changed in code:
 - Defaults promoted: grassmann_aim=eigh, rotate_rank=None (all planes),

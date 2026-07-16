@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
+import math
 import sys
 import time
 import types
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,6 +30,7 @@ from usuitrack.projected_activation import (
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
 DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled"
+FALLBACK_LR_RATIO = 0.5
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing", "right"]
@@ -36,6 +40,180 @@ BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
 PROFILE_TEXT_DIVIDER = "\n\n---\n\n"
+
+
+class FP32StateAdamW(torch.optim.Optimizer):
+    """AdamW for the small fallback set, with moments kept in fp32."""
+
+    def __init__(self, params, *, lr: float, betas=(0.9, 0.99), eps: float = 1e-8, weight_decay: float = 0.0):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("FP32StateAdamW does not support sparse gradients")
+                state = self.state[param]
+                if not state:
+                    state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
+                    state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+                torch.optim._functional.adamw(
+                    [param],
+                    [grad.detach().float()],
+                    [state["exp_avg"]],
+                    [state["exp_avg_sq"]],
+                    [],
+                    [state["step"]],
+                    foreach=False,
+                    capturable=False,
+                    differentiable=False,
+                    fused=False,
+                    grad_scale=None,
+                    found_inf=None,
+                    has_complex=False,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                )
+        return loss
+
+
+@dataclass(frozen=True)
+class CudaMemoryReading:
+    current_allocated: int
+    peak_allocated: int
+    current_reserved: int
+    peak_reserved: int
+
+
+class CudaMemorySensors:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.readings: dict[str, CudaMemoryReading] = {}
+        self.prior_peak_allocated = 0
+        self.prior_peak_reserved = 0
+
+    def start(self) -> None:
+        torch.cuda.synchronize(self.device)
+        self.prior_peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        self.prior_peak_reserved = torch.cuda.max_memory_reserved(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self._record("baseline")
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def mark(self, name: str) -> None:
+        torch.cuda.synchronize(self.device)
+        self._record(name)
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _record(self, name: str) -> None:
+        self.readings[name] = CudaMemoryReading(
+            current_allocated=torch.cuda.memory_allocated(self.device),
+            peak_allocated=torch.cuda.max_memory_allocated(self.device),
+            current_reserved=torch.cuda.memory_reserved(self.device),
+            peak_reserved=torch.cuda.max_memory_reserved(self.device),
+        )
+
+
+class BackwardMemoryTrace:
+    """Buffer allocator readings around leaf post-accumulate hooks."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.active = False
+        self.events: list[dict[str, Any]] = []
+        self.handles = []
+
+    def install_before(self, named_params: Sequence[tuple[str, torch.nn.Parameter]]) -> None:
+        self._install(named_params, "before_prepare")
+
+    def install_after(self, named_params: Sequence[tuple[str, torch.nn.Parameter]]) -> None:
+        self._install(named_params, "after_prepare")
+
+    def _install(self, named_params: Sequence[tuple[str, torch.nn.Parameter]], phase: str) -> None:
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+
+            def record(completed: torch.Tensor, *, param_name=name, event_phase=phase) -> None:
+                if self.active:
+                    self._record(event_phase, param_name, completed)
+
+            self.handles.append(param.register_post_accumulate_grad_hook(record))
+
+    def start(self) -> None:
+        self.events.clear()
+        self.active = True
+
+    def stop(self) -> None:
+        self.active = False
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def _record(self, phase: str, name: str, param: torch.Tensor) -> None:
+        grad = param.grad
+        if self.device.type == "cuda":
+            current_allocated = torch.cuda.memory_allocated(self.device)
+            peak_allocated = torch.cuda.max_memory_allocated(self.device)
+            current_reserved = torch.cuda.memory_reserved(self.device)
+        else:
+            current_allocated = peak_allocated = current_reserved = 0
+        self.events.append(
+            {
+                "index": len(self.events),
+                "phase": phase,
+                "name": name,
+                "shape": list(param.shape),
+                "param_bytes": param.numel() * param.element_size(),
+                "grad_present": grad is not None,
+                "grad_bytes": grad.numel() * grad.element_size() if grad is not None else 0,
+                "current_allocated": current_allocated,
+                "peak_allocated": peak_allocated,
+                "current_reserved": current_reserved,
+            }
+        )
+
+    def summary(self) -> dict[str, int | str]:
+        if not self.events:
+            return {
+                "memory_trace_event_count": 0,
+                "memory_trace_peak_current_allocated": 0,
+                "memory_trace_peak_current_event": "none",
+                "memory_trace_peak_cumulative_allocated": 0,
+                "memory_trace_peak_cumulative_event": "none",
+                "memory_trace_events": "[]",
+            }
+        peak_current = max(self.events, key=lambda event: int(event["current_allocated"]))
+        peak_cumulative = max(self.events, key=lambda event: int(event["peak_allocated"]))
+
+        def event_name(event: dict[str, Any]) -> str:
+            return f'{event["index"]}:{event["phase"]}:{event["name"]}'
+
+        return {
+            "memory_trace_event_count": len(self.events),
+            "memory_trace_peak_current_allocated": int(peak_current["current_allocated"]),
+            "memory_trace_peak_current_event": event_name(peak_current),
+            "memory_trace_peak_cumulative_allocated": int(peak_cumulative["peak_allocated"]),
+            "memory_trace_peak_cumulative_event": event_name(peak_cumulative),
+            "memory_trace_events": json.dumps(self.events, separators=(",", ":")),
+        }
 
 
 @torch.no_grad()
@@ -63,9 +241,12 @@ def gradient_norm(params: list[torch.nn.Parameter]) -> torch.Tensor:
 
 @torch.no_grad()
 def gradient_norm_statistics(
-    params: list[torch.nn.Parameter], clip_norm: float
+    params: list[torch.nn.Parameter], clip_norm: float, extra_norms=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    norms = torch.stack([param.grad.detach().float().norm() for param in params if param.grad is not None])
+    norms = torch.stack(
+        [param.grad.detach().float().norm() for param in params if param.grad is not None]
+        + [norm.detach().float() for norm in extra_norms]
+    )
     clipped_fraction = (norms > clip_norm).float().mean() if clip_norm > 0 else None
     return norms.norm(), norms.median(), clipped_fraction
 
@@ -76,6 +257,11 @@ def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float | None:
         return None
     value = diagnostics.get("update_norm")
     return float(value) if value is not None else None
+
+
+@torch.no_grad()
+def parameter_delta_norm(params: Sequence[torch.nn.Parameter], before: Sequence[torch.Tensor]) -> torch.Tensor:
+    return tensor_global_norm(param.detach().float() - old.float() for param, old in zip(params, before, strict=True))
 
 
 def scalar(value: float | int | torch.Tensor) -> float:
@@ -313,6 +499,14 @@ def select_trainable_named_params(model: torch.nn.Module, param_scope: ParamScop
 def select_trainable_params(model: torch.nn.Module, param_scope: ParamScope) -> tuple[list[torch.nn.Parameter], dict[str, int]]:
     trainable, stats = select_trainable_named_params(model, param_scope)
     return [param for _name, param in trainable], stats
+
+
+def partition_usuitrack_params(
+    named_params: Sequence[tuple[str, torch.nn.Parameter]],
+) -> tuple[list[tuple[str, torch.nn.Parameter]], list[tuple[str, torch.nn.Parameter]]]:
+    matrix = [(name, param) for name, param in named_params if param.ndim == 2]
+    fallback = [(name, param) for name, param in named_params if param.ndim != 2]
+    return matrix, fallback
 
 
 def transformer_matrix_role(name: str, param: torch.nn.Parameter) -> str:
@@ -782,6 +976,11 @@ def train_step(
     grad_clip_norm: float,
     collect_norms: bool,
     collect_basis: bool,
+    fallback_optimizer: torch.optim.Optimizer | None = None,
+    fallback_params: Sequence[torch.nn.Parameter] = (),
+    consume_fallback_grads: bool = True,
+    collect_memory: bool = False,
+    backward_memory_trace: BackwardMemoryTrace | None = None,
 ) -> dict[str, float | torch.Tensor | None]:
     if hasattr(optimizer, "diagnostics_enabled"):
         optimizer.diagnostics_enabled = collect_norms or collect_basis
@@ -792,23 +991,55 @@ def train_step(
     if hasattr(optimizer, "diagnostics_aurora_health_enabled"):
         optimizer.diagnostics_aurora_health_enabled = collect_norms
     optimizer.zero_grad(set_to_none=True)
+    if fallback_optimizer is not None:
+        fallback_optimizer.zero_grad(set_to_none=True)
+    sensors = CudaMemorySensors(trainable[0].device) if collect_memory and trainable and trainable[0].is_cuda else None
+    if sensors is not None:
+        sensors.start()
     losses = []
     for offset in range(grad_accum_steps):
         batch = batches[(start_index + offset) % len(batches)]
         loss = cce_causal_lm_loss(model, batch)
+        if sensors is not None and offset == grad_accum_steps - 1:
+            sensors.mark("forward")
+        if backward_memory_trace is not None and offset == grad_accum_steps - 1:
+            backward_memory_trace.start()
         (loss / grad_accum_steps).backward()
+        if backward_memory_trace is not None and offset == grad_accum_steps - 1:
+            backward_memory_trace.stop()
+        if sensors is not None and offset == grad_accum_steps - 1:
+            sensors.mark("backward")
         losses.append(loss.detach().float())
     if collect_norms:
+        released_grad_norms = optimizer.released_matrix_grad_norms() if hasattr(optimizer, "released_matrix_grad_norms") else ()
         grad_norm, grad_norm_median_tensor, grad_clip_fraction = gradient_norm_statistics(
-            trainable, grad_clip_norm
+            trainable, grad_clip_norm, released_grad_norms
         )
     else:
         grad_norm = float("nan")
         grad_norm_median_tensor = float("nan")
         grad_clip_fraction = None
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
+    fallback_before = [param.detach().clone() for param in fallback_params] if collect_norms and fallback_optimizer is not None else []
     optimizer.step()
-    update_norm = optimizer_update_norm(optimizer) if collect_norms else float("nan")
+    if fallback_optimizer is not None:
+        fallback_optimizer.step()
+        if consume_fallback_grads:
+            for param in fallback_params:
+                param.grad = None
+    if sensors is not None:
+        sensors.mark("optimizer")
+    if collect_norms:
+        matrix_update_norm = optimizer_update_norm(optimizer)
+        fallback_update_norm = parameter_delta_norm(fallback_params, fallback_before) if fallback_optimizer is not None and fallback_params else None
+        if matrix_update_norm is None:
+            update_norm = scalar(fallback_update_norm) if fallback_update_norm is not None else None
+        elif fallback_update_norm is None:
+            update_norm = matrix_update_norm
+        else:
+            update_norm = math.sqrt(matrix_update_norm**2 + scalar(fallback_update_norm) ** 2)
+    else:
+        update_norm = float("nan")
     projected_grad_norm = optimizer_diagnostic(optimizer, "mean_projected_grad_norm") if collect_norms else float("nan")
     projected_grad_to_moment_ratio = optimizer_diagnostic(optimizer, "mean_projected_grad_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
@@ -820,7 +1051,7 @@ def train_step(
     moment_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
     param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
     update_to_param_ratio = update_norm / param_norm_scalar if update_norm is not None and param_norm_scalar > 0 else None
-    return {
+    result = {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
         "grad_norm_median_tensor": grad_norm_median_tensor,
@@ -837,6 +1068,15 @@ def train_step(
         "moment_erank": moment_erank,
         "moment_erank_pct": moment_erank_pct,
     }
+    if sensors is not None:
+        for phase, reading in sensors.readings.items():
+            result[f"memory_{phase}_current_allocated"] = reading.current_allocated
+            result[f"memory_{phase}_peak_allocated"] = reading.peak_allocated
+            result[f"memory_{phase}_current_reserved"] = reading.current_reserved
+            result[f"memory_{phase}_peak_reserved"] = reading.peak_reserved
+        result["_memory_prior_peak_allocated"] = sensors.prior_peak_allocated
+        result["_memory_prior_peak_reserved"] = sensors.prior_peak_reserved
+    return result
 
 
 def wandb_log(wandb_run: Any | None, data: Mapping[str, float | int | str | None], step: int) -> None:
@@ -869,6 +1109,17 @@ def validate_projected_activation_contract(args) -> None:
         raise ValueError("--projected-activation-backend is incompatible with --grassmann-aim oja, which requires full matrix gradients every step")
 
 
+def validate_gradient_release_contract(args) -> None:
+    if not args.release_matrix_grads:
+        return
+    if args.grad_accum_steps != 1:
+        raise ValueError("--release-matrix-grads requires --grad-accum-steps 1")
+    if args.keep_grads_after_step:
+        raise ValueError("--release-matrix-grads is incompatible with --keep-grads-after-step")
+    if args.projected_activation_backend != "off":
+        raise ValueError("--release-matrix-grads is incompatible with --projected-activation-backend")
+
+
 def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
     """Compile the module that the CCE training loss actually calls.
 
@@ -899,6 +1150,7 @@ def run_optimizer(
 ) -> dict[str, float | int | str]:
     if optimizer_name == "usuitrack":
         validate_projected_activation_contract(args)
+        validate_gradient_release_contract(args)
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -906,9 +1158,14 @@ def run_optimizer(
     model, tokenizer = load_model_and_tokenizer(model_name, device, args.activation_checkpointing, args.attn_implementation)
     trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
     trainable = [param for _name, param in trainable_named]
+    matrix_named, fallback_named = partition_usuitrack_params(trainable_named)
+    fallback_params = [param for _name, param in fallback_named]
+    backward_memory_trace = BackwardMemoryTrace(device) if args.trace_backward_memory and optimizer_name == "usuitrack" else None
+    if backward_memory_trace is not None:
+        backward_memory_trace.install_before(matrix_named)
     activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend)
     usuitrack_param_groups, policy_stats = build_usuitrack_param_groups(
-        trainable_named,
+        matrix_named if optimizer_name == "usuitrack" else trainable_named,
         args.rank,
         args.projection_side_policy,
         activation_projected_param_ids,
@@ -920,6 +1177,7 @@ def run_optimizer(
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
     set_projected_activation_compile(should_compile_projected_activation(args, optimizer_name))
+    fallback_optimizer = None
     if optimizer_name == "usuitrack":
         optimizer = UsuiTrack(
             usuitrack_param_groups,
@@ -939,8 +1197,19 @@ def run_optimizer(
             projected_grad_clip_norm=args.projected_grad_clip_norm if args.projected_grad_clip_norm > 0 else None,
             projected_grad_clip_ratio=args.projected_grad_clip_ratio if args.projected_grad_clip_ratio > 0 else None,
             consume_grad=not args.keep_grads_after_step,
+            release_matrix_grads=args.release_matrix_grads,
             compile_tensor_kernels=args.torch_compile,
         )
+        if fallback_params:
+            fallback_optimizer = FP32StateAdamW(
+                fallback_params,
+                lr=args.usuitrack_lr * FALLBACK_LR_RATIO,
+                betas=(0.9, 0.99),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+        if backward_memory_trace is not None:
+            backward_memory_trace.install_after(matrix_named)
         projected_activation_modules = install_projected_activation_backend(model, optimizer, args.projected_activation_backend)
         model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name in {"adamw", "torch_adamw"}:
@@ -952,6 +1221,7 @@ def run_optimizer(
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
     base_lrs = optimizer_base_lrs(optimizer)
+    fallback_base_lrs = optimizer_base_lrs(fallback_optimizer) if fallback_optimizer is not None else []
 
     initial_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     initial_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
@@ -972,7 +1242,22 @@ def run_optimizer(
     for step in range(args.warmup_steps):
         batch_index = step * args.grad_accum_steps
         apply_lr_warmup(optimizer, base_lrs, step + 1, args.lr_warmup_steps)
-        train_step(model, optimizer, trainable, train_batches, batch_index, args.grad_accum_steps, args.grad_clip_norm, False, False)
+        if fallback_optimizer is not None:
+            apply_lr_warmup(fallback_optimizer, fallback_base_lrs, step + 1, args.lr_warmup_steps)
+        train_step(
+            model,
+            optimizer,
+            trainable,
+            train_batches,
+            batch_index,
+            args.grad_accum_steps,
+            args.grad_clip_norm,
+            False,
+            False,
+            fallback_optimizer,
+            fallback_params,
+            not args.keep_grads_after_step,
+        )
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -983,6 +1268,8 @@ def run_optimizer(
         batch_index = (args.warmup_steps + step) * args.grad_accum_steps
         global_step = step + 1
         apply_lr_warmup(optimizer, base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
+        if fallback_optimizer is not None:
+            apply_lr_warmup(fallback_optimizer, fallback_base_lrs, args.warmup_steps + global_step, args.lr_warmup_steps)
         should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
         should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
         collect_norms = should_log_train
@@ -997,6 +1284,11 @@ def run_optimizer(
             args.grad_clip_norm,
             collect_norms,
             collect_basis,
+            fallback_optimizer,
+            fallback_params,
+            not args.keep_grads_after_step,
+            global_step == args.max_steps,
+            backward_memory_trace if global_step == args.max_steps else None,
         )
         measured_steps.append(step_result)
         loss_window.append(step_result["loss"])
@@ -1062,6 +1354,18 @@ def run_optimizer(
     training_elapsed = measured_elapsed - eval_elapsed
     training_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     training_peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
+    memory_result = measured_steps[-1] if measured_steps else {}
+    if device.type == "cuda" and memory_result:
+        training_peak = max(
+            training_peak,
+            int(memory_result.get("_memory_prior_peak_allocated", 0)),
+            *(int(value) for key, value in memory_result.items() if key.endswith("_peak_allocated")),
+        )
+        training_peak_reserved = max(
+            training_peak_reserved,
+            int(memory_result.get("_memory_prior_peak_reserved", 0)),
+            *(int(value) for key, value in memory_result.items() if key.endswith("_peak_reserved")),
+        )
     final_val = evaluate_loss(model, val_batches) if not args.skip_validation else float("nan")
     final_retention_val = evaluate_loss(model, retention_batches) if retention_batches is not None and not args.skip_validation else float("nan")
     if not args.skip_validation:
@@ -1076,6 +1380,8 @@ def run_optimizer(
         )
     post_eval_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     post_eval_peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
+    post_eval_peak = max(post_eval_peak, training_peak)
+    post_eval_peak_reserved = max(post_eval_peak_reserved, training_peak_reserved)
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
     measured_param_norms = [step["param_norm"] for step in measured_steps]
@@ -1090,6 +1396,9 @@ def run_optimizer(
     measured_moment_erank = [step["moment_erank"] for step in measured_steps]
     measured_moment_erank_pct = [step["moment_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
+    fallback_state_bytes = optimizer_state_bytes_by_category(fallback_optimizer)["total"] if fallback_optimizer is not None else state_bytes["fallback"]
+    matrix_state_bytes = state_bytes["matrix"]
+    total_state_bytes = matrix_state_bytes + fallback_state_bytes if optimizer_name == "usuitrack" else state_bytes["total"]
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
@@ -1112,6 +1421,9 @@ def run_optimizer(
         "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "usuitrack" else 0.0,
         "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "usuitrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
+        "release_matrix_grads": args.release_matrix_grads if optimizer_name == "usuitrack" else False,
+        "fallback_lr": args.usuitrack_lr * FALLBACK_LR_RATIO if optimizer_name == "usuitrack" and fallback_params else 0.0,
+        "fallback_state_dtype": "fp32" if optimizer_name == "usuitrack" and fallback_params else "n/a",
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
@@ -1124,9 +1436,9 @@ def run_optimizer(
         "supervised_tokens_per_optimizer_step": batch_supervised_tokens(train_batches[0]) * args.grad_accum_steps,
         "measured_tokens_per_second": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.max_steps) / training_elapsed,
         "measured_tokens_per_second_with_eval": (batch_tokens(train_batches[0]) * args.grad_accum_steps * args.max_steps) / measured_elapsed,
-        "matrix_state_bytes": state_bytes["matrix"],
-        "fallback_state_bytes": state_bytes["fallback"],
-        "state_bytes": state_bytes["total"],
+        "matrix_state_bytes": matrix_state_bytes,
+        "fallback_state_bytes": fallback_state_bytes,
+        "state_bytes": total_state_bytes,
         "initial_val_loss": initial_val,
         "final_val_loss": final_val,
         "initial_retention_val_loss": initial_retention_val,
@@ -1155,7 +1467,13 @@ def run_optimizer(
         "post_eval_peak_cuda_bytes": post_eval_peak,
         "post_eval_peak_cuda_reserved_bytes": post_eval_peak_reserved,
     }
-    del optimizer, model, tokenizer, train_batches, val_batches, retention_batches
+    for phase in ("baseline", "forward", "backward", "optimizer"):
+        for kind in ("current_allocated", "peak_allocated", "current_reserved", "peak_reserved"):
+            result[f"memory_{phase}_{kind}"] = int(memory_result.get(f"memory_{phase}_{kind}", 0))
+    if backward_memory_trace is not None:
+        result.update(backward_memory_trace.summary())
+        backward_memory_trace.close()
+    del optimizer, fallback_optimizer, model, tokenizer, train_batches, val_batches, retention_batches
     if device.type == "cuda":
         torch.cuda.empty_cache()
     gc.collect()
@@ -1193,7 +1511,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--usuitrack-lr", type=float, default=3e-4)
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
-    parser.add_argument("--beta", type=float, default=0.9)
+    parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument(
         "--moment-mode",
         choices=("ema", "adafactor_ema"),
@@ -1227,6 +1545,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn-implementation", default="sdpa", help="Transformers attention implementation; local default is sdpa until real flash kernels are available")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
+    parser.add_argument(
+        "--release-matrix-grads",
+        action="store_true",
+        help="experimental no-accumulation path: prepare each full matrix gradient in a post-accumulate backward hook, release it immediately, then retain ordinary batched Oja/Aurora application in optimizer.step()",
+    )
+    parser.add_argument(
+        "--trace-backward-memory",
+        action="store_true",
+        help="probe-only: buffer per-matrix CUDA allocator readings immediately before and after gradient preparation on the final measured backward",
+    )
     parser.add_argument("--eval-every", type=int, default=100, help="periodically log target/source validation loss every N measured steps; default 100 for the 1k quality contract; use 50 for a 200-step sensor; 0 disables")
     parser.add_argument("--no-final-sample", dest="final_sample", action="store_false", help="disable final qualitative generation from a target eval prompt")
     parser.set_defaults(final_sample=True)
@@ -1248,6 +1576,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     validate_projected_activation_contract(args)
+    validate_gradient_release_contract(args)
 
     if args.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
@@ -1365,7 +1694,7 @@ def main() -> None:
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
-        f"batching={args.batching} loss_impl=cce "
+        f"batching={args.batching} loss_impl=cce release_matrix_grads={args.release_matrix_grads} trace_backward_memory={args.trace_backward_memory} "
         f"skip_validation={args.skip_validation} eval_every={args.eval_every} "
         f"final_sample={args.final_sample} final_sample_max_seq_len={args.final_sample_max_seq_len} "
         f"final_sample_temperature={args.final_sample_temperature} final_sample_top_k={args.final_sample_top_k} final_sample_top_p={args.final_sample_top_p} "

@@ -1,12 +1,12 @@
 # Subspace Tracking Sidequest
 
-Deep-dive companion to `PLAN.md`. Scope: how UsuiTrack's projection basis is
+Deep-dive companion to `../PLAN.md`. Scope: how UsuiTrack's projection basis is
 refreshed over training — the Grassmann geodesic tracker, what we fixed, what we
 measured, and the masterplan for making tracking actually *earn* its place. This
 started as "audit basis-update fidelity vs SubTrack" and grew large enough to
 deserve its own file.
 
-`PLAN.md` remains the top-level direction map; this file owns the tracking arc.
+`../PLAN.md` remains the top-level direction map; this file owns the tracking arc.
 Read the Masterplan section for where we're going; the rest is the terrain we
 already crossed so we don't re-derive it.
 

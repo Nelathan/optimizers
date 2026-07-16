@@ -1,10 +1,21 @@
 # AGENTS.md
 
 This file is the operating contract for agents working in this repo.
-- The current optimizer is defined by `SPEC.md`; do not reconstruct it from prose or old commands.
-- Current direction, evidence, and research axes live in `PLAN.md`.
-- Current geometry questions live in `SUBSPACE_TRACKING.md`.
-- Superseded experiments and design arcs live under `archive/`. They are provenance, not current guidance.
+
+## Documentation map
+
+- `README.md` — repository orientation and reading order; start here when the repo is unfamiliar.
+- `docs/SPEC.md` — authoritative optimizer mathematics and invariants; read before changing algorithm semantics.
+- `docs/PLAN.md` — current direction, accepted evidence, benchmark contract, and release gates; read before proposing or running experiments.
+- `docs/SUBSPACE_TRACKING.md` — live basis-geometry question ledger; read for Oja, EIGH, capture, transport, or tracking work.
+- `docs/QUANTIZATION.md` — scoped, unimplemented rank-state quantization investigation; read only for reduced-precision state work.
+- `docs/compile-memory-research.md` — external survey of compiled gradient-release mechanisms and regional compilation; use as research input, not as an authoritative project decision.
+- `docs/LEGEND.md` — anthropomorphic design story; useful for intuition, never normative.
+- `docs/archive/RESULTS.md` — chronological superseded experiment record; consult for provenance, not current defaults.
+- `docs/archive/SUBSPACE_TRACKING_ARC.md` — completed historical subspace-tracking design arc and measurements.
+- `docs/archive/PROJECTED_ACTIVATION.md` — superseded projected-activation backward investigation.
+- `whiteflow/README.md` and `muonfactor/README.md` — historical optimizer sketches unrelated to the current contract.
+- `CLAUDE.md` — compatibility pointer back to this file; it contains no independent guidance.
 
 ## Naming lineage
 
@@ -14,7 +25,7 @@ This file is the operating contract for agents working in this repo.
 - **SumoTrack** was the immediately preceding implementation identity. Its
   package, API, CLI, and documentation references were migrated to UsuiTrack.
 - These names describe one evolving optimizer line, not three competing
-  algorithms. Do not infer a semantic distinction from the rename; `SPEC.md`
+  algorithms. Do not infer a semantic distinction from the rename; `docs/SPEC.md`
   remains authoritative for the actual design.
 
 ## Repo purpose
@@ -28,7 +39,7 @@ The product target is usable distribution adaptation under memory pressure: move
 
 Act as a partner, not an autopilot. The job is not to complete the requested command at all costs; the job is to preserve the question we are trying to answer. If the route stops answering that question, stop and say so before spending more compute or writing more code.
 
-Research is not software engineering, and the failure modes differ. In research work (subspace tracking, optimizer design, any open investigation) the artifact is the **question ledger**, not the code: the set of open questions, how each would be evaluated, and what evidence has moved each answer. The cardinal sins are forgetting a question, failing to note a new one, and failing to update an answer when evidence arrives. Maintain the live ledger explicitly (e.g. `SUBSPACE_TRACKING.md`), distill conclusions there, and move chronology into `archive/` rather than leaving superseded guidance in present tense.
+Research is not software engineering, and the failure modes differ. In research work (subspace tracking, optimizer design, any open investigation) the artifact is the **question ledger**, not the code: the set of open questions, how each would be evaluated, and what evidence has moved each answer. The cardinal sins are forgetting a question, failing to note a new one, and failing to update an answer when evidence arrives. Maintain the live ledger explicitly (e.g. `docs/SUBSPACE_TRACKING.md`), distill conclusions there, and move chronology into `docs/archive/` rather than leaving superseded guidance in present tense.
 
 Do not collapse an exploration space to a single point. When the user lays out a space of possibilities to evaluate — a lattice of designs, a set of candidate mechanisms — hold it open as a space. Turning "here are the axes we must evaluate" into "here is the one arm I'll build first" is the same failure as turning a discussed value into a solo goal: it discards the comparisons that reveal which axis dominates. The axes usually interact and the signs are usually unknown; that is *why* it is a space. Map it (a matrix of forms, with cost, prerequisites, and what each tests), note which questions each arm answers, and let the user choose the traversal. Recommend a first arm only when asked, and never prune a branch before a single one is measured.
 
@@ -94,7 +105,7 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to the current rank-128 1k quality contract: broad no-embedding training, stable `eigh` basis init, residual-facing projection, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, mature per-gradient Oja, LR `3e-4` with 50-step warmup, projected-moment beta `.9`, raw per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, `torch.compile`, evaluation every 100 steps, and telemetry every 25. Constructor and harness both default to Oja and one Aurora pass; model-scale/training defaults otherwise remain harness policy. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
+The LLM harness defaults to the current rank-128 1k quality contract: broad no-embedding training, stable `eigh` basis init, residual-facing projection, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, mature per-gradient Oja, matrix LR `3e-4` with 50-step warmup, projected-moment beta `.95`, raw per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, `torch.compile`, evaluation every 100 steps, and telemetry every 25. Non-2D fallback tensors are harness-owned by a separate fp32-state AdamW at half the matrix LR, with betas `.9/.99`, epsilon `1e-8`, and no weight decay. Constructor and harness both default to Oja and one Aurora pass; model-scale/training defaults otherwise remain harness policy. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
 For expensive 1k-quality runs, use `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Record compile state in results so throughput comparisons stay honest.
 
@@ -136,7 +147,7 @@ Avoid these traps:
 - repeating broad topology smokes after accounting already works,
 - polishing LR brackets before geometry is right,
 - treating AdamW as the opponent rather than a quality anchor,
-- adding HeavyBall-native/ECC plumbing outside the migration path named in `PLAN.md`,
+- adding HeavyBall-native/ECC plumbing outside the migration path named in `docs/PLAN.md`,
 - implementing projected-gradient hooks without tiny-model equivalence tests against ordinary full-gradient projection,
 - expanding harness ceremony without a sharper algorithm question.
 
@@ -165,8 +176,9 @@ uv run python experiments/<script>.py
 tool call is killed by the ~2-minute timeout, which severs the run mid-flight,
 wastes GPU compute, and loses the wandb summary. Any `llm_synth_smoke.py` run (even
 a 100-step probe) goes to `run_in_background: true`, one run per call — never a
-foreground `for` loop over runs. Read progress from the task output file or wandb
-while it runs; the harness notifies on completion.
+foreground `for` loop over runs. Read progress from the local `./wandb` run logs
+first (especially `wandb/latest-run/files/output.log`); use the remote API only
+when the needed history is absent locally. The harness notifies on completion.
 
 Useful checks include projector shape/orthonormality, state-dict restart, bf16 behavior, optimizer state accounting, loss curves, peak VRAM, step time, tokens/sec, and retention curves.
 

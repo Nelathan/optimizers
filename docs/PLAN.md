@@ -38,13 +38,15 @@ be expanded on consumer cards, likely beginning around the 4B class. Full
 gradients, not UsuiTrack's rank state, are expected to be the dominant VRAM tax.
 The current post-backward preparation already consumes each full gradient after
 forming its rank-sized pending update, which shortens optimizer-step residency but
-cannot lower the peak where backward has materialized all gradients. HeavyBall's
-`register_post_accumulate_grad_hook` pattern suggests the stronger lead: run the
-same preparation when each parameter gradient becomes complete, release that full
-gradient while backward continues, then batch the retained rank-space geometry
-and apply updates after backward. This could shrink the weights + activations +
-full-gradients overlap; it requires exact ordering/parity tests and explicit
-failure semantics before becoming a memory claim.
+cannot lower the peak where backward has materialized all gradients. A HeavyBall-
+inspired `register_post_accumulate_grad_hook` prototype moved the same preparation
+into backward, released each completed matrix gradient, and retained only the
+rank-space work for batched application. Exact update and optimizer-state parity
+held. At checkpointed LFM-1.2B, release removed about 1.97 GB of live state after
+backward. Eager peak allocated fell 13.3%, but the compiled peak did not move:
+AOTAutograd materialized its complete gradient-output pile before the first leaf
+post-accumulate callback. The mechanism is therefore a real eager memory lane, not
+a compiled-path memory optimization under the current graph boundary.
 
 ## Current design
 
@@ -180,11 +182,11 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Can Oja close its early post-EIGH lag without losing its settled stability? | rank-128 sensor `ytqnw1ip` changed only the schedule to `1/2, 1/3, ...` down to `.01`; target loss improved at every checkpoint and settled geometry also improved | yes: mature Oja is the released schedule; fixed `.01` remains the steady-step ablation |
 | Does the well-aligned projected moment still need Aurora `pp=2/ns=5`? | `pp=1/ns=2` under-stepped badly; `pp=1/ns=5` preserved update norm but adapted more gently at 200, and the chosen rank-128 `pp=1/ns=5`, LR `3e-4` configuration reached `1.693917 / 3.010227` target/source at 1k | use one Aurora pass with five NS steps; do not infer the separate effect of pass count from the chosen configuration run |
 | How much adaptation pressure should the rank-128 product lane use? | hold mature Oja and `pp=1/ns=5` fixed, then compare LR or horizon one axis at a time against the `3e-4` 1k reference `cqokmxft` | choose target/source operating point without laundering rank-256 capacity evidence into rank-128 tuning |
-| Does the repaired moving-frame moment benefit from longer memory? | strict beta `.95` sensor `5lkubxig`: at step 200 target improved `.007159` while source worsened `.006785`; it was slightly worse on both at step 100 | unresolved longer-horizon target/source trade; beta `.9` retains the proven 1k default, and any extension changes beta only |
-| Can projected second-moment conditioning replace full-gradient Adafactor? | hold the chosen training contract fixed and compare Adafactor-conditioned Oja/EMA against raw-gradient Oja plus a bf16 projected elementwise second moment | remove the largest optimizer stage only if loss, source, aim quality, state, and walltime survive |
+| Does the repaired moving-frame moment benefit from longer memory? | strict beta `.95` sensor `5lkubxig` was nearly tied through 200; the 1k replay `6gkm9k8h` remained healthy and monotonic, ending at `1.685367 / 3.022996` target/source versus beta `.9` control `cqokmxft` at `1.693917 / 3.010227` | yes: `.95` wins about as much target as it loses source, and its longer stable memory is now the constructor and harness default |
+| Can projected second-moment conditioning replace full-gradient Adafactor? | projected Adam m1/m2 runs `op5xujxd` (`3e-4`) and `t5wbbf9s` (`2e-4`) show a consistently stronger learner with more source loss: at `2e-4`, `1.763509 / 3.004049` target/source versus historical Adafactor `dpiwqydb` at `1.783078 / 2.973868`; raw-gradient Oja captures more energy (`.740349`), while Aurora alignment and moment rank are slightly lower and Oja step angle is unchanged. Matrix state rises from the current control's `92.93 MiB` to `160 MiB` because the third slot is a wide projected m2 while the basis is narrow. Compiled walltime did not establish the required win: one current replay tied Adafactor (`.7927` vs `.7919` sec/step), while the `2e-4` arm reached `.7800`; the historical `.8040` Adafactor comparator still included the deleted basis-lag diagnostic. | no: lower LR does not remove the stronger-adaptation trade, state rises substantially, and the expected compiled speedup was not demonstrated; implementation removed, evidence retained |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
-| Can full gradients be released during backward? | post-accumulate hook prototype measuring peak allocated VRAM and exact update parity | prepare each tensor's Adafactor/Oja/projected-moment state as soon as its gradient is complete, retain only rank-sized pending work, and release the full gradient before the rest of backward finishes |
+| Can full gradients be released during backward? | exact parameter/state parity held. At checkpointed LFM-1.2B, 92 matrix gradients total `2,071,986,176` bytes. Compiled AOT materialized the entire pile before the first traced leaf callback: callback residency was flat at `4,752,924,160` bytes in control, while release drained it to `2,780,337,664`; nevertheless peak stayed flat (`7,022,023,168` vs `7,025,431,040`). Eager callbacks interleaved with backward: release moved the peak from late layer-0 `w3` to the second matrix in backward, cutting allocated peak from `7,202,254,336` to `6,242,306,048` bytes (13.3%) and reserved from `7,503,609,856` to `6,698,303,488`. Post-backward current fell from `4,752,398,848` to `2,780,860,928`. Single traced-step timing was `2.512` vs `2.581` seconds compiled and `3.121` vs `3.221` eager; synchronized probe timing is directional, not a throughput benchmark. | keep optional as an eager, no-accumulation memory lane; do not promote it under the compiled quality default. A compiled win requires moving preparation inside the AOT backward graph or changing the compile boundary, not merely testing a larger model. Retain the non-transactional failure contract. |
 | Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
 
 Tracking work stops unless it deletes state or machinery, reduces measured tracking
@@ -274,10 +276,12 @@ fraction, and rotation rank are ablation-only under the released Oja path.
 The harness defaults to the current 1k quality contract: `LiquidAI/LFM2.5-350M-Base`,
 broad no-embedding training, uniform rank 128, residual-facing projection, stable
 `eigh` init, right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE,
-mature Oja, LR `3e-4` with 50-step warmup, projected-moment beta `.9`, raw
+mature Oja, matrix LR `3e-4` with 50-step warmup, projected-moment beta `.95`, raw
 per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, `torch.compile`, target
 and source evaluation every 100 steps, telemetry every 25, and a final qualitative
-sample. `experiments/llm_synth_smoke.py` is authoritative for CLI defaults; the
+sample. Non-2D fallback tensors use a separate fp32-state AdamW at half matrix LR,
+betas `.9/.99`, epsilon `1e-8`, and zero weight decay.
+`experiments/llm_synth_smoke.py` is authoritative for CLI defaults; the
 retained interval-10 burst settings apply only when an explicit EIGH/tangent
 boundary ablation is selected.
 

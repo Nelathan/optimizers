@@ -4,7 +4,7 @@ Status: historical design sketch.
 
 This document is preserved for reference. It is not the active optimizer direction, not a current benchmark contract, and not a specification for `UsuiTrack`.
 
-The active optimizer line is **UsuiTrack**. Current direction and durable facts live in `../PLAN.md`; superseded experiment records live in `../archive/RESULTS.md`.
+The active optimizer line is **UsuiTrack**. Current direction and durable facts live in `../docs/PLAN.md`; superseded experiment records live in `../docs/archive/RESULTS.md`.
 
 ## Historical idea
 
