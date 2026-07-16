@@ -8,7 +8,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_FALLBACK_LR, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_FALLBACK_LR, DEFAULT_LORA_ALPHA, DEFAULT_LORA_RANK, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, install_state_matched_lora, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_lora_optimizer_state_dtype, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -131,6 +131,35 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertTrue(all(param.ndim != 2 for _name, param in fallback))
         self.assertEqual({id(param) for _name, param in named}, {id(param) for _name, param in matrix + fallback})
 
+    def test_state_matched_lora_targets_selected_matrices_and_keeps_bf16_adam_state(self):
+        model = TinyTopology().to(dtype=torch.bfloat16)
+        adapter_named, fallback_named, stats = install_state_matched_lora(
+            model, "broad-no-embeddings", DEFAULT_LORA_RANK, DEFAULT_LORA_ALPHA
+        )
+
+        self.assertEqual(len(adapter_named), 2)
+        self.assertEqual(sum(param.numel() for _name, param in adapter_named), DEFAULT_LORA_RANK * 8)
+        self.assertTrue(all(param.dtype == torch.bfloat16 and param.requires_grad for _name, param in adapter_named))
+        self.assertFalse(model.linear.base_layer.weight.requires_grad)
+        self.assertTrue(fallback_named)
+        self.assertTrue(all(param.requires_grad for _name, param in fallback_named))
+        self.assertEqual(stats["selected_matrix_tensors"], 1)
+
+        optimizer = torch.optim.AdamW(
+            [param for _name, param in adapter_named],
+            lr=2e-4,
+            betas=(0.9, 0.99),
+            eps=1e-8,
+            weight_decay=0.0,
+            foreach=False,
+        )
+        for _name, param in adapter_named:
+            param.grad = torch.randn_like(param)
+        optimizer.step()
+        validate_lora_optimizer_state_dtype(optimizer, torch.bfloat16)
+        self.assertTrue(all(state["exp_avg"].dtype == torch.bfloat16 for state in optimizer.state.values()))
+        self.assertTrue(all(state["exp_avg_sq"].dtype == torch.bfloat16 for state in optimizer.state.values()))
+
     def test_fp32_state_adamw_matches_existing_fallback_math(self):
         torch.manual_seed(91)
         initial = torch.randn(7, dtype=torch.bfloat16)
@@ -218,6 +247,10 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.projection_side_policy, "residual-facing")
         self.assertEqual(args.usuitrack_lr, 4e-4)
         self.assertEqual(args.fallback_lr, 1e-4)
+        self.assertEqual(args.lora_rank, 44)
+        self.assertEqual(args.lora_alpha, 44)
+        self.assertEqual(args.lora_lr, 2e-4)
+        self.assertEqual(args.lora_grad_clip_norm, 1.0)
         self.assertEqual(args.lr_warmup_steps, 50)
         self.assertEqual(args.beta, 0.95)
         self.assertEqual(args.projected_activation_backend, "off")

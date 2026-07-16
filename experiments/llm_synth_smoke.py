@@ -31,6 +31,8 @@ from usuitrack.projected_activation import (
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
 DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled"
 DEFAULT_FALLBACK_LR = 1e-4
+DEFAULT_LORA_RANK = 44
+DEFAULT_LORA_ALPHA = 44
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing", "right"]
@@ -509,6 +511,74 @@ def partition_usuitrack_params(
     return matrix, fallback
 
 
+def install_state_matched_lora(
+    model: torch.nn.Module,
+    param_scope: ParamScope,
+    rank: int,
+    alpha: int,
+) -> tuple[list[tuple[str, torch.nn.Parameter]], list[tuple[str, torch.nn.Parameter]], dict[str, int]]:
+    """Inject LoRA into exactly the matrices selected by the harness policy."""
+
+    from peft import LoraConfig, inject_adapter_in_model
+
+    selected_named, stats = select_trainable_named_params(model, param_scope)
+    matrix_named, fallback_named = partition_usuitrack_params(selected_named)
+    modules = dict(model.named_modules())
+    target_modules = []
+    expected_adapter_params = 0
+    matrix_dtype = None
+    for name, param in matrix_named:
+        if not name.endswith(".weight"):
+            raise RuntimeError(f"LoRA target is not a module weight: {name}")
+        module_name = name.removesuffix(".weight")
+        module = modules.get(module_name)
+        if not isinstance(module, torch.nn.Linear):
+            raise RuntimeError(f"LoRA requires every selected matrix to be an nn.Linear weight, got {name} on {type(module).__name__}")
+        target_modules.append(module_name)
+        expected_adapter_params += rank * (param.shape[0] + param.shape[1])
+        if matrix_dtype is None:
+            matrix_dtype = param.dtype
+        elif param.dtype != matrix_dtype:
+            raise RuntimeError(f"LoRA matrix targets must share one dtype, got {matrix_dtype} and {param.dtype}")
+    if not target_modules:
+        raise RuntimeError(f"No matrix modules selected for LoRA with param_scope={param_scope}")
+
+    config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=0.0,
+        target_modules=target_modules,
+        bias="none",
+        init_lora_weights=True,
+    )
+    inject_adapter_in_model(config, model)
+
+    adapter_named = [(name, param) for name, param in model.named_parameters() if ".lora_A." in name or ".lora_B." in name]
+    if len(adapter_named) != 2 * len(matrix_named):
+        raise RuntimeError(f"LoRA injected {len(adapter_named)} adapter tensors for {len(matrix_named)} target matrices")
+    if sum(param.numel() for _name, param in adapter_named) != expected_adapter_params:
+        raise RuntimeError("LoRA adapter parameter count does not match the selected matrix shapes")
+    if any(param.dtype != matrix_dtype for _name, param in adapter_named):
+        raise RuntimeError(f"LoRA adapters must remain in the model dtype {matrix_dtype}")
+
+    for _name, param in fallback_named:
+        param.requires_grad_(True)
+    fallback_ids = {id(param) for _name, param in fallback_named}
+    adapter_ids = {id(param) for _name, param in adapter_named}
+    unexpected = [name for name, param in model.named_parameters() if param.requires_grad and id(param) not in adapter_ids and id(param) not in fallback_ids]
+    if unexpected:
+        raise RuntimeError(f"LoRA left unexpected base parameters trainable: {unexpected[:4]}")
+    return adapter_named, fallback_named, stats
+
+
+def validate_lora_optimizer_state_dtype(optimizer: torch.optim.Optimizer, dtype: torch.dtype) -> None:
+    for state in optimizer.state.values():
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = state.get(key)
+            if value is not None and value.dtype != dtype:
+                raise RuntimeError(f"LoRA AdamW {key} must use {dtype}, got {value.dtype}")
+
+
 def transformer_matrix_role(name: str, param: torch.nn.Parameter) -> str:
     lowered = name.lower()
     if param.ndim != 2:
@@ -981,6 +1051,8 @@ def train_step(
     consume_fallback_grads: bool = True,
     collect_memory: bool = False,
     backward_memory_trace: BackwardMemoryTrace | None = None,
+    global_clip_params: Sequence[torch.nn.Parameter] = (),
+    global_clip_norm: float | None = None,
 ) -> dict[str, float | torch.Tensor | None]:
     if hasattr(optimizer, "diagnostics_enabled"):
         optimizer.diagnostics_enabled = collect_norms or collect_basis
@@ -1019,8 +1091,11 @@ def train_step(
         grad_norm = float("nan")
         grad_norm_median_tensor = float("nan")
         grad_clip_fraction = None
+    if global_clip_norm is not None:
+        torch.nn.utils.clip_grad_norm_(global_clip_params, global_clip_norm)
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
-    fallback_before = [param.detach().clone() for param in fallback_params] if collect_norms and fallback_optimizer is not None else []
+    has_primary_update_diagnostics = hasattr(optimizer, "diagnostics_enabled")
+    fallback_before = [param.detach().clone() for param in fallback_params] if collect_norms and fallback_optimizer is not None and has_primary_update_diagnostics else []
     optimizer.step()
     if fallback_optimizer is not None:
         fallback_optimizer.step()
@@ -1031,9 +1106,9 @@ def train_step(
         sensors.mark("optimizer")
     if collect_norms:
         matrix_update_norm = optimizer_update_norm(optimizer)
-        fallback_update_norm = parameter_delta_norm(fallback_params, fallback_before) if fallback_optimizer is not None and fallback_params else None
+        fallback_update_norm = parameter_delta_norm(fallback_params, fallback_before) if fallback_before else None
         if matrix_update_norm is None:
-            update_norm = scalar(fallback_update_norm) if fallback_update_norm is not None else None
+            update_norm = None
         elif fallback_update_norm is None:
             update_norm = matrix_update_norm
         else:
@@ -1162,21 +1237,33 @@ def run_optimizer(
         torch.cuda.reset_peak_memory_stats(device)
     gc.collect()
     model, tokenizer = load_model_and_tokenizer(model_name, device, args.activation_checkpointing, args.attn_implementation)
-    trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
+    adapter_named: list[tuple[str, torch.nn.Parameter]] = []
+    if optimizer_name == "lora":
+        if args.projected_activation_backend != "off":
+            raise RuntimeError("projected activation backend requires the usuitrack optimizer")
+        adapter_named, fallback_named, param_stats = install_state_matched_lora(model, args.param_scope, args.lora_rank, args.lora_alpha)
+        trainable_named = adapter_named + fallback_named
+    else:
+        trainable_named, param_stats = select_trainable_named_params(model, args.param_scope)
+        _selected_matrix_named, fallback_named = partition_usuitrack_params(trainable_named)
     trainable = [param for _name, param in trainable_named]
-    matrix_named, fallback_named = partition_usuitrack_params(trainable_named)
+    matrix_named, _trainable_fallback_named = partition_usuitrack_params(trainable_named)
     fallback_params = [param for _name, param in fallback_named]
     backward_memory_trace = BackwardMemoryTrace(device) if args.trace_backward_memory and optimizer_name == "usuitrack" else None
     if backward_memory_trace is not None:
         backward_memory_trace.install_before(matrix_named)
-    activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend)
-    usuitrack_param_groups, policy_stats = build_usuitrack_param_groups(
-        matrix_named if optimizer_name == "usuitrack" else trainable_named,
-        args.rank,
-        args.projection_side_policy,
-        activation_projected_param_ids,
-        args.basis_refresh_schedule,
-    )
+    activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend) if optimizer_name == "usuitrack" else set()
+    if optimizer_name == "usuitrack":
+        usuitrack_param_groups, policy_stats = build_usuitrack_param_groups(
+            matrix_named,
+            args.rank,
+            args.projection_side_policy,
+            activation_projected_param_ids,
+            args.basis_refresh_schedule,
+        )
+    else:
+        usuitrack_param_groups = []
+        policy_stats = {"effective_rank_min": 0, "effective_rank_max": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
     train_batch_count = (args.warmup_steps + args.max_steps) * args.grad_accum_steps
     train_batches = make_batches(tokenizer, train_texts, device, args.batch_size, args.seq_len, train_batch_count, args.batching, "synth")
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
@@ -1224,6 +1311,26 @@ def run_optimizer(
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
         projected_activation_modules = 0
         model = maybe_compile_training_model(model, args.torch_compile)
+    elif optimizer_name == "lora":
+        adapter_params = [param for _name, param in adapter_named]
+        optimizer = torch.optim.AdamW(
+            adapter_params,
+            lr=args.lora_lr,
+            betas=(0.9, 0.99),
+            eps=1e-8,
+            weight_decay=0.0,
+            fused=device.type == "cuda",
+        )
+        if fallback_params:
+            fallback_optimizer = FP32StateAdamW(
+                fallback_params,
+                lr=fallback_lr,
+                betas=(0.9, 0.99),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+        projected_activation_modules = 0
+        model = maybe_compile_training_model(model, args.torch_compile)
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
     base_lrs = optimizer_base_lrs(optimizer)
@@ -1263,7 +1370,11 @@ def run_optimizer(
             fallback_optimizer,
             fallback_params,
             not args.keep_grads_after_step,
+            global_clip_params=[param for _name, param in adapter_named],
+            global_clip_norm=args.lora_grad_clip_norm if optimizer_name == "lora" else None,
         )
+    if optimizer_name == "lora":
+        validate_lora_optimizer_state_dtype(optimizer, adapter_named[0][1].dtype)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1295,6 +1406,8 @@ def run_optimizer(
             not args.keep_grads_after_step,
             global_step == args.max_steps,
             backward_memory_trace if global_step == args.max_steps else None,
+            [param for _name, param in adapter_named],
+            args.lora_grad_clip_norm if optimizer_name == "lora" else None,
         )
         measured_steps.append(step_result)
         loss_window.append(step_result["loss"])
@@ -1403,15 +1516,26 @@ def run_optimizer(
     measured_moment_erank_pct = [step["moment_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     fallback_state_bytes = optimizer_state_bytes_by_category(fallback_optimizer)["total"] if fallback_optimizer is not None else state_bytes["fallback"]
-    matrix_state_bytes = state_bytes["matrix"]
-    total_state_bytes = matrix_state_bytes + fallback_state_bytes if optimizer_name == "usuitrack" else state_bytes["total"]
+    adapter_param_bytes = sum(param.numel() * param.element_size() for _name, param in adapter_named)
+    adapter_optimizer_state_bytes = state_bytes["total"] if optimizer_name == "lora" else 0
+    matrix_state_bytes = adapter_param_bytes + adapter_optimizer_state_bytes if optimizer_name == "lora" else state_bytes["matrix"]
+    total_state_bytes = matrix_state_bytes + fallback_state_bytes if optimizer_name in {"usuitrack", "lora"} else state_bytes["total"]
     compiled_layer_count = int(getattr(getattr(model, "model", None), "_usuitrack_compiled_layer_count", 0))
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
         "projected_activation_backend": args.projected_activation_backend if optimizer_name == "usuitrack" else "n/a",
         "projected_activation_modules": projected_activation_modules if optimizer_name == "usuitrack" else 0,
-        "rank": args.rank if optimizer_name == "usuitrack" else 0,
+        "rank": args.rank if optimizer_name == "usuitrack" else args.lora_rank if optimizer_name == "lora" else 0,
+        "lora_alpha": args.lora_alpha if optimizer_name == "lora" else 0,
+        "lora_adapter_dtype": str(adapter_named[0][1].dtype).removeprefix("torch.") if optimizer_name == "lora" else "n/a",
+        "lora_optimizer_state_dtype": str(adapter_named[0][1].dtype).removeprefix("torch.") if optimizer_name == "lora" else "n/a",
+        "lora_adapter_param_bytes": adapter_param_bytes,
+        "lora_optimizer_state_bytes": adapter_optimizer_state_bytes,
+        "lora_lr": args.lora_lr if optimizer_name == "lora" else 0.0,
+        "lora_beta1": 0.9 if optimizer_name == "lora" else 0.0,
+        "lora_beta2": 0.99 if optimizer_name == "lora" else 0.0,
+        "lora_grad_clip_norm": args.lora_grad_clip_norm if optimizer_name == "lora" else 0.0,
         "effective_rank_min": policy_stats["effective_rank_min"] if optimizer_name == "usuitrack" else 0,
         "effective_rank_max": policy_stats["effective_rank_max"] if optimizer_name == "usuitrack" else 0,
         "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "usuitrack" else 0,
@@ -1429,8 +1553,8 @@ def run_optimizer(
         "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "usuitrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
         "release_matrix_grads": args.release_matrix_grads if optimizer_name == "usuitrack" else False,
-        "fallback_lr": fallback_lr if optimizer_name == "usuitrack" and fallback_params else 0.0,
-        "fallback_state_dtype": "fp32" if optimizer_name == "usuitrack" and fallback_params else "n/a",
+        "fallback_lr": fallback_lr if optimizer_name in {"usuitrack", "lora"} and fallback_params else 0.0,
+        "fallback_state_dtype": "fp32" if optimizer_name in {"usuitrack", "lora"} and fallback_params else "n/a",
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "compile_scope": "decoder_layer" if args.torch_compile else "off",
@@ -1498,7 +1622,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-val-offset", type=int, default=9000, help="row offset for validation when --target-hf-dataset is used")
     parser.add_argument("--retention-data-dir", default="", help="optional SYNTH-format source/retention parquet directory")
     parser.add_argument("--retention-hf-dataset", default=DEFAULT_SOURCE_HF_DATASET, help=f"Hugging Face source/retention dataset; first parquet shard only; default = {DEFAULT_SOURCE_HF_DATASET}; pass an empty string to disable")
-    parser.add_argument("--optimizers", default="usuitrack", help="comma-separated: usuitrack,torch_adamw")
+    parser.add_argument("--optimizers", default="usuitrack", help="comma-separated: usuitrack,lora,torch_adamw")
     parser.add_argument("--param-scope", choices=("full", "broad-no-embeddings", "matrices-no-embeddings"), default="broad-no-embeddings")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000, help="ceiling on measured optimizer steps; default is the current 1k quality contract; clamped down with a warning if the dataset can't supply this many rows")
@@ -1520,6 +1644,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--usuitrack-lr", type=float, default=4e-4)
     parser.add_argument("--fallback-lr", type=float, default=DEFAULT_FALLBACK_LR, help="Non-matrix AdamW LR")
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
+    parser.add_argument("--lora-rank", type=int, default=DEFAULT_LORA_RANK)
+    parser.add_argument("--lora-alpha", type=int, default=DEFAULT_LORA_ALPHA)
+    parser.add_argument("--lora-lr", type=float, default=2e-4)
+    parser.add_argument("--lora-grad-clip-norm", type=float, default=1.0, help="global gradient clip for LoRA adapter parameters")
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument(
@@ -1623,6 +1751,12 @@ def main() -> None:
         raise ValueError("Use either --retention-data-dir or --retention-hf-dataset, not both")
     if args.rank <= 0:
         raise ValueError("rank must be positive")
+    if args.lora_rank <= 0:
+        raise ValueError("lora_rank must be positive")
+    if args.lora_alpha <= 0:
+        raise ValueError("lora_alpha must be positive")
+    if args.lora_grad_clip_norm <= 0:
+        raise ValueError("lora_grad_clip_norm must be positive")
     if args.basis_refresh_interval <= 0:
         raise ValueError("basis_refresh_interval must be positive")
     if args.projected_grad_clip_norm < 0:
@@ -1700,6 +1834,7 @@ def main() -> None:
         f"seq_len={args.seq_len} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
+        f"lora_rank={args.lora_rank} lora_alpha={args.lora_alpha} lora_lr={args.lora_lr} lora_grad_clip_norm={args.lora_grad_clip_norm} "
         f"basis_init={args.basis_init} grassmann_aim={args.grassmann_aim} oja_step_schedule={args.oja_step_schedule} "
         f"boundary_ablation_refresh_interval={args.basis_refresh_interval} boundary_ablation_refresh_schedule={args.basis_refresh_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
