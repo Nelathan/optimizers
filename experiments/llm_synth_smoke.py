@@ -30,7 +30,7 @@ from usuitrack.projected_activation import (
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
 DEFAULT_SOURCE_HF_DATASET = "HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled"
-FALLBACK_LR_RATIO = 0.5
+DEFAULT_FALLBACK_LR = 1e-4
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing", "right"]
@@ -1153,6 +1153,7 @@ def run_optimizer(
     device: torch.device,
     wandb_run: Any | None = None,
 ) -> dict[str, float | int | str]:
+    fallback_lr = args.fallback_lr
     if optimizer_name == "usuitrack":
         validate_projected_activation_contract(args)
         validate_gradient_release_contract(args)
@@ -1208,7 +1209,7 @@ def run_optimizer(
         if fallback_params:
             fallback_optimizer = FP32StateAdamW(
                 fallback_params,
-                lr=args.usuitrack_lr * FALLBACK_LR_RATIO,
+                lr=fallback_lr,
                 betas=(0.9, 0.99),
                 eps=1e-8,
                 weight_decay=0.0,
@@ -1428,7 +1429,7 @@ def run_optimizer(
         "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "usuitrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
         "release_matrix_grads": args.release_matrix_grads if optimizer_name == "usuitrack" else False,
-        "fallback_lr": args.usuitrack_lr * FALLBACK_LR_RATIO if optimizer_name == "usuitrack" and fallback_params else 0.0,
+        "fallback_lr": fallback_lr if optimizer_name == "usuitrack" and fallback_params else 0.0,
         "fallback_state_dtype": "fp32" if optimizer_name == "usuitrack" and fallback_params else "n/a",
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
@@ -1516,7 +1517,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="experimental UsuiTrack-only activation-projected backward backend; incompatible with Oja because it queues projected gradients instead of supplying the full matrix gradients Oja requires every step",
     )
     parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
-    parser.add_argument("--usuitrack-lr", type=float, default=3e-4)
+    parser.add_argument("--usuitrack-lr", type=float, default=4e-4)
+    parser.add_argument("--fallback-lr", type=float, default=DEFAULT_FALLBACK_LR, help="Non-matrix AdamW LR")
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.95)

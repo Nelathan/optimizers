@@ -659,11 +659,11 @@ class UsuiTrackTest(unittest.TestCase):
         self.assertEqual(opt.param_groups[0]["polar_ns_steps"], 3)
         self.assertEqual(tuple(opt.state[weight]["projected_exp_avg"].shape), (8, 2))
 
-    def test_compile_tensor_kernels_targets_orthogonalization_only(self):
+    def test_compile_tensor_kernels_targets_orthogonalization_and_default_prepare(self):
         compiled_calls = []
 
-        def fake_compile(fn):
-            compiled_calls.append(fn)
+        def fake_compile(fn, **kwargs):
+            compiled_calls.append((fn, kwargs))
             return fn
 
         with mock.patch("torch.compile", side_effect=fake_compile):
@@ -671,8 +671,17 @@ class UsuiTrackTest(unittest.TestCase):
             bias = torch.nn.Parameter(torch.randn(5))
             opt = UsuiTrack([weight, bias], lr=0.01, rank=2, compile_tensor_kernels=True)
 
-        self.assertEqual(compiled_calls, [UsuiTrack._orthogonalize_aurora_muon_tensor])
+        self.assertEqual(
+            compiled_calls,
+            [
+                (UsuiTrack._orthogonalize_aurora_muon_tensor, {}),
+                (UsuiTrack._prepare_oja_adafactor_right_tensors, {"dynamic": True}),
+                (UsuiTrack._prepare_oja_adafactor_left_tensors, {"dynamic": True}),
+            ],
+        )
         self.assertIsNotNone(opt._compiled_orthogonalize_update)
+        self.assertIsNotNone(opt._compiled_prepare_oja_adafactor_right)
+        self.assertIsNotNone(opt._compiled_prepare_oja_adafactor_left)
 
         weight.grad = torch.randn_like(weight)
         bias.grad = torch.randn_like(bias)
@@ -1025,6 +1034,77 @@ class UsuiTrackTest(unittest.TestCase):
         expected.mul_(grad.float().square().mean().sqrt())
 
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+    def test_compilable_oja_adafactor_prepare_matches_component_math_on_both_sides(self):
+        torch.manual_seed(91)
+        grad = torch.randn(13, 7)
+        beta = 0.95
+        beta2 = 0.99
+        eps = 1e-30
+        clip_norm = 1.0
+        step = 4
+
+        for side in ("right", "left"):
+            rank = 3
+            if side == "right":
+                basis = torch.linalg.qr(torch.randn(grad.shape[1], rank), mode="reduced").Q.mT.contiguous()
+                moment = torch.randn(grad.shape[0], rank)
+                prepare = UsuiTrack._prepare_oja_adafactor_right_tensors
+            else:
+                basis = torch.linalg.qr(torch.randn(grad.shape[0], rank), mode="reduced").Q.contiguous()
+                moment = torch.randn(rank, grad.shape[1])
+                prepare = UsuiTrack._prepare_oja_adafactor_left_tensors
+            initial_moment = moment.clone()
+            row_var = torch.rand(grad.shape[0])
+            col_var = torch.rand(grad.shape[1])
+            expected_state = {
+                "adafactor_step": step - 1,
+                "adafactor_row_var": row_var.clone(),
+                "adafactor_col_var": col_var.clone(),
+            }
+
+            conditioned, tangent, raw_norm, projected_norm, moment_norm = prepare(
+                grad.clone(),
+                basis,
+                row_var,
+                col_var,
+                moment,
+                step,
+                clip_norm,
+                beta2,
+                eps,
+                beta,
+            )
+
+            sanitized = torch.nan_to_num(grad)
+            expected_raw_norm = sanitized.float().norm()
+            sanitized.mul_((sanitized.new_tensor(clip_norm) / expected_raw_norm).clamp(max=1.0))
+            expected_conditioned = UsuiTrack._adafactor_dampen_full_grad(
+                sanitized,
+                {"adafactor_beta2": beta2, "adafactor_eps": eps},
+                expected_state,
+            )
+            if side == "right":
+                frame = basis.float().mT
+                expected_projected = expected_conditioned @ basis.mT
+                action = expected_conditioned.float().mT @ expected_projected.float()
+            else:
+                frame = basis.float()
+                expected_projected = basis.mT @ expected_conditioned
+                action = expected_conditioned.float() @ expected_projected.float().mT
+            rayleigh = frame.mT @ action
+            rayleigh = 0.5 * (rayleigh + rayleigh.mT)
+            expected_tangent = (action - frame @ rayleigh) / rayleigh.diagonal().mean().clamp_min(1e-12)
+            expected_moment = initial_moment.mul(beta).add(expected_projected, alpha=1.0 - beta)
+
+            torch.testing.assert_close(conditioned, expected_conditioned)
+            torch.testing.assert_close(tangent, expected_tangent)
+            torch.testing.assert_close(raw_norm, expected_raw_norm)
+            torch.testing.assert_close(projected_norm, expected_projected.float().norm())
+            torch.testing.assert_close(moment_norm, initial_moment.float().norm())
+            torch.testing.assert_close(moment, expected_moment)
+            torch.testing.assert_close(row_var, expected_state["adafactor_row_var"])
+            torch.testing.assert_close(col_var, expected_state["adafactor_col_var"])
 
     def test_batched_aurora_health_matches_scalar_diagnostics(self):
         torch.manual_seed(97)

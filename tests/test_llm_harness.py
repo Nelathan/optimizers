@@ -8,7 +8,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FALLBACK_LR_RATIO, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_FALLBACK_LR, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -152,7 +152,7 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             torch.testing.assert_close(split.state[split_param][key], old.state[old_param][key], rtol=0, atol=0)
         self.assertEqual(split.state[split_param]["exp_avg"].dtype, torch.float32)
         self.assertEqual(split.state[split_param]["exp_avg_sq"].dtype, torch.float32)
-        self.assertEqual(FALLBACK_LR_RATIO, 0.5)
+        self.assertEqual(DEFAULT_FALLBACK_LR, 1e-4)
 
     def test_backward_memory_trace_brackets_registered_preparation_hook(self):
         param = torch.nn.Parameter(torch.randn(3, 2))
@@ -216,7 +216,8 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.retention_hf_dataset, DEFAULT_SOURCE_HF_DATASET)
         self.assertEqual(args.rank, 128)
         self.assertEqual(args.projection_side_policy, "residual-facing")
-        self.assertEqual(args.usuitrack_lr, 3e-4)
+        self.assertEqual(args.usuitrack_lr, 4e-4)
+        self.assertEqual(args.fallback_lr, 1e-4)
         self.assertEqual(args.lr_warmup_steps, 50)
         self.assertEqual(args.beta, 0.95)
         self.assertEqual(args.projected_activation_backend, "off")

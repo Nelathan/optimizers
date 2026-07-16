@@ -157,6 +157,16 @@ class UsuiTrack(Optimizer):
         self.diagnostics_aurora_health_enabled = False
         self.last_step_diagnostics: dict[str, float] = {}
         self._compiled_orthogonalize_update = torch.compile(UsuiTrack._orthogonalize_aurora_muon_tensor) if compile_tensor_kernels else None
+        self._compiled_prepare_oja_adafactor_right = (
+            torch.compile(UsuiTrack._prepare_oja_adafactor_right_tensors, dynamic=True)
+            if compile_tensor_kernels
+            else None
+        )
+        self._compiled_prepare_oja_adafactor_left = (
+            torch.compile(UsuiTrack._prepare_oja_adafactor_left_tensors, dynamic=True)
+            if compile_tensor_kernels
+            else None
+        )
         self._queued_projected_grads: dict[Tensor, Tensor] = {}
         self._pending_matrix_updates: dict[Tensor, MatrixUpdate] = {}
         self._pending_diagnostics: dict[str, Any] | None = None
@@ -501,6 +511,15 @@ class UsuiTrack(Optimizer):
         else:
             if grad is None:
                 raise RuntimeError("matrix update requires either a full grad or a queued projected grad")
+            if self._can_use_initialized_oja_adafactor_prepare(projector, state, group):
+                return self._prepare_initialized_oja_adafactor_update(
+                    p,
+                    grad,
+                    projector,
+                    state,
+                    group,
+                    diagnostics,
+                )
             # Sync-free non-finite guard. A NaN/inf batch otherwise poisons every
             # downstream consumer at once: the clip scale (NaN norm -> NaN scale ->
             # whole grad NaN), adafactor's row/col vars, the tangent buffer, and
@@ -607,6 +626,199 @@ class UsuiTrack(Optimizer):
         )
 
     @staticmethod
+    def _can_use_initialized_oja_adafactor_prepare(
+        projector: SubspaceProjector,
+        state: dict,
+        group: dict,
+    ) -> bool:
+        return (
+            projector.is_initialized
+            and group["grassmann_aim"] == "oja"
+            and group["moment_mode"] == "adafactor_ema"
+            and group.get("grad_clip_norm") is not None
+            and group.get("projected_grad_clip_norm") is None
+            and group.get("projected_grad_clip_ratio") is None
+            and state.get("adafactor_row_var") is not None
+            and state.get("adafactor_col_var") is not None
+            and state.get("projected_exp_avg") is not None
+        )
+
+    def _prepare_initialized_oja_adafactor_update(
+        self,
+        p: Tensor,
+        grad: Tensor,
+        projector: SubspaceProjector,
+        state: dict,
+        group: dict,
+        diagnostics: dict | None,
+    ) -> MatrixUpdate:
+        if diagnostics is not None:
+            nonfinite = (~torch.isfinite(grad)).any().detach()
+            current = diagnostics["nonfinite_grad_tensors"]
+            diagnostics["nonfinite_grad_tensors"] = nonfinite if current is None else current + nonfinite
+
+        adafactor_step = state.get("adafactor_step", 0) + 1
+        state["adafactor_step"] = adafactor_step
+        state["step"] = state.get("step", 0) + 1
+        basis = projector.basis
+        assert basis is not None
+        side = projector._basis_side()
+        prepare = (
+            self._compiled_prepare_oja_adafactor_right
+            if side is ProjectionSide.RIGHT
+            else self._compiled_prepare_oja_adafactor_left
+        )
+        if prepare is None:
+            prepare = (
+                self._prepare_oja_adafactor_right_tensors
+                if side is ProjectionSide.RIGHT
+                else self._prepare_oja_adafactor_left_tensors
+            )
+        conditioned_grad, oja_tangent, raw_grad_norm, projected_grad_norm, moment_norm = prepare(
+            grad,
+            basis,
+            state["adafactor_row_var"],
+            state["adafactor_col_var"],
+            state["projected_exp_avg"],
+            adafactor_step,
+            float(group["grad_clip_norm"]),
+            float(group["adafactor_beta2"]),
+            float(group["adafactor_eps"]),
+            float(group["beta"]),
+        )
+        projected_exp_avg = state["projected_exp_avg"]
+
+        if diagnostics is not None:
+            current_sum = diagnostics["projected_grad_norm_sum"]
+            diagnostics["projected_grad_norm_sum"] = (
+                projected_grad_norm if current_sum is None else current_sum + projected_grad_norm
+            )
+            diagnostics["projected_grad_norm_tensors"] += 1
+            ratio = projected_grad_norm / moment_norm.clamp_min(1e-12)
+            current_sum = diagnostics["projected_grad_to_moment_ratio_sum"]
+            diagnostics["projected_grad_to_moment_ratio_sum"] = ratio if current_sum is None else current_sum + ratio
+            diagnostics["projected_grad_to_moment_ratio_tensors"] += 1
+            capture = projected_grad_norm / conditioned_grad.float().norm().clamp_min(1e-12)
+            current_sum = diagnostics["basis_capture_sum"]
+            diagnostics["basis_capture_sum"] = capture if current_sum is None else current_sum + capture
+            diagnostics["basis_capture_tensors"] += 1
+
+        return MatrixUpdate(
+            param=p,
+            projector=projector,
+            projected_exp_avg=projected_exp_avg,
+            original_shape=tuple(p.shape),
+            oja_tangent=oja_tangent,
+            raw_grad_norm=raw_grad_norm,
+        )
+
+    @staticmethod
+    def _prepare_oja_adafactor_right_tensors(
+        grad: Tensor,
+        basis: Tensor,
+        row_var: Tensor,
+        col_var: Tensor,
+        projected_exp_avg: Tensor,
+        adafactor_step: int,
+        grad_clip_norm: float,
+        adafactor_beta2: float,
+        adafactor_eps: float,
+        beta: float,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        grad, raw_grad_norm = UsuiTrack._sanitize_and_clip_grad_tensors(grad, grad_clip_norm)
+        conditioned_grad = UsuiTrack._adafactor_dampen_tensors(
+            grad,
+            row_var,
+            col_var,
+            adafactor_step,
+            adafactor_beta2,
+            adafactor_eps,
+        )
+        projected_grad = conditioned_grad @ basis.mT
+        work = conditioned_grad.float()
+        frame = basis.float().mT
+        low = projected_grad.float()
+        action = work.mT @ low
+        rayleigh = frame.mT @ action
+        rayleigh = 0.5 * (rayleigh + rayleigh.mT)
+        tangent = action - frame @ rayleigh
+        tangent = tangent / rayleigh.diagonal().mean().clamp_min(1e-12)
+        projected_grad_norm = low.norm().detach()
+        moment_norm = projected_exp_avg.float().norm().detach()
+        projected_exp_avg.mul_(beta).add_(projected_grad, alpha=1.0 - beta)
+        return conditioned_grad, tangent, raw_grad_norm, projected_grad_norm, moment_norm
+
+    @staticmethod
+    def _prepare_oja_adafactor_left_tensors(
+        grad: Tensor,
+        basis: Tensor,
+        row_var: Tensor,
+        col_var: Tensor,
+        projected_exp_avg: Tensor,
+        adafactor_step: int,
+        grad_clip_norm: float,
+        adafactor_beta2: float,
+        adafactor_eps: float,
+        beta: float,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        grad, raw_grad_norm = UsuiTrack._sanitize_and_clip_grad_tensors(grad, grad_clip_norm)
+        conditioned_grad = UsuiTrack._adafactor_dampen_tensors(
+            grad,
+            row_var,
+            col_var,
+            adafactor_step,
+            adafactor_beta2,
+            adafactor_eps,
+        )
+        projected_grad = basis.mT @ conditioned_grad
+        work = conditioned_grad.float()
+        frame = basis.float()
+        low = projected_grad.float()
+        action = work @ low.mT
+        rayleigh = frame.mT @ action
+        rayleigh = 0.5 * (rayleigh + rayleigh.mT)
+        tangent = action - frame @ rayleigh
+        tangent = tangent / rayleigh.diagonal().mean().clamp_min(1e-12)
+        projected_grad_norm = low.norm().detach()
+        moment_norm = projected_exp_avg.float().norm().detach()
+        projected_exp_avg.mul_(beta).add_(projected_grad, alpha=1.0 - beta)
+        return conditioned_grad, tangent, raw_grad_norm, projected_grad_norm, moment_norm
+
+    @staticmethod
+    def _sanitize_and_clip_grad_tensors(grad: Tensor, grad_clip_norm: float) -> tuple[Tensor, Tensor]:
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_grad_norm = grad.float().norm().detach()
+        clip_scale = (grad.new_tensor(grad_clip_norm) / raw_grad_norm.clamp_min(1e-12)).clamp(max=1.0)
+        return grad.mul(clip_scale), raw_grad_norm
+
+    @staticmethod
+    def _adafactor_dampen_tensors(
+        grad: Tensor,
+        row_var: Tensor,
+        col_var: Tensor,
+        step: int,
+        beta2: float,
+        eps: float,
+    ) -> Tensor:
+        grad32 = grad.float()
+        grad_sq = grad32.square() + eps
+        row_var.mul_(beta2).add_(grad_sq.mean(dim=1), alpha=1.0 - beta2)
+        col_var.mul_(beta2).add_(grad_sq.mean(dim=0), alpha=1.0 - beta2)
+        bias_correction = 1.0 - beta2**step
+        row_hat = row_var / bias_correction
+        col_hat = col_var / bias_correction
+        # Reconstruct the inverse factored RMS as two broadcast vectors rather
+        # than a second matrix-sized tensor, then restore the raw gradient RMS.
+        # The latter keeps Oja's quadratic covariance scale comparable to the
+        # unconditioned gradient while retaining Adafactor's SNR reweighting.
+        mean_row = row_hat.mean().clamp_min(eps)
+        row_scale = (mean_row / row_hat.clamp_min(eps)).sqrt().unsqueeze(1)
+        col_scale = col_hat.clamp_min(eps).rsqrt().unsqueeze(0)
+        dampened = grad32 * row_scale * col_scale
+        grad_rms = grad32.square().mean().sqrt().clamp_min(eps)
+        return (dampened * grad_rms).to(dtype=grad.dtype)
+
+    @staticmethod
     def _adafactor_dampen_full_grad(grad: Tensor, group: dict, state: dict) -> Tensor:
         """Adafactor-style row/col factored second moment on the full gradient,
         applied before basis tracking and before projection so the same dampened
@@ -619,46 +831,14 @@ class UsuiTrack(Optimizer):
         step = state.get("adafactor_step", 0) + 1
         state["adafactor_step"] = step
 
-        grad32 = grad.float()
-        grad_sq = grad32.square() + eps
         row_var = state.get("adafactor_row_var")
         col_var = state.get("adafactor_col_var")
         if row_var is None:
-            row_var = torch.zeros(grad32.shape[0], device=grad32.device, dtype=torch.float32)
-            col_var = torch.zeros(grad32.shape[1], device=grad32.device, dtype=torch.float32)
-        row_var.mul_(beta2).add_(grad_sq.mean(dim=1), alpha=1.0 - beta2)
-        col_var.mul_(beta2).add_(grad_sq.mean(dim=0), alpha=1.0 - beta2)
+            row_var = torch.zeros(grad.shape[0], device=grad.device, dtype=torch.float32)
+            col_var = torch.zeros(grad.shape[1], device=grad.device, dtype=torch.float32)
         state["adafactor_row_var"] = row_var
         state["adafactor_col_var"] = col_var
-
-        bias_correction = 1.0 - beta2**step
-        row_hat = row_var / bias_correction
-        col_hat = col_var / bias_correction
-        # Shazeer & Stern (2018) factored second-moment reconstruction: R C^T / sum(R).
-        # row_hat/col_hat are stored as per-row/per-column means (not sums), so the
-        # sum-based normalizer is row_hat.mean() (mean of means == sum/n cancelling n).
-        # Algebraically identical to reconstructing the full outer-product
-        # factor, but avoids allocating and reading a second matrix-sized
-        # temporary. The broadcast scales satisfy
-        # sqrt(mean(R) / (R_i C_j)) == 1 / sqrt(R_i C_j / mean(R)).
-        mean_row = row_hat.mean().clamp_min(eps)
-        row_scale = (mean_row / row_hat.clamp_min(eps)).sqrt().unsqueeze(1)
-        col_scale = col_hat.clamp_min(eps).rsqrt().unsqueeze(0)
-        dampened = grad32 * row_scale * col_scale
-        # Restore the raw gradient's scale. The factored second moment normalizes each
-        # element to RMS~1, which is Adafactor's *direction* convention but blows the
-        # magnitude up: an RMS-1 [m,n] matrix has Frobenius norm sqrt(m*n) (e.g. ~2610
-        # for a 6656x1024 MLP grad, ~261x a norm-10 raw grad). Real Adafactor hides
-        # this behind the learning rate; we feed the dampened grad into the basis
-        # tracker's tangent/sigma path, where sigma scales *quadratically* with
-        # magnitude and so explodes (~1e5). Rescaling to the raw grad's RMS keeps
-        # Adafactor's SNR reweighting (the point) while restoring scale: dampened is
-        # RMS-1, so multiplying by grad's RMS makes it RMS-match the raw grad
-        # per-element. This returns projected-grad norm to the pre-Adafactor regime
-        # (~1.77 at rank 32), which is why the clip rail belongs back at ~2, not 2000.
-        grad_rms = grad32.square().mean().sqrt().clamp_min(eps)
-        dampened = dampened * grad_rms
-        return dampened.to(dtype=grad.dtype)
+        return UsuiTrack._adafactor_dampen_tensors(grad, row_var, col_var, step, beta2, eps)
 
     def _apply_matrix_update_buckets(self, entries: list[MatrixUpdate], group: dict, diagnostics: dict | None) -> None:
         if not entries:
