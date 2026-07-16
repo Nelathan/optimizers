@@ -1555,8 +1555,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-grads-after-step", action="store_true", help="leave p.grad populated after optimizer.step(); default consumes grads once projected")
     parser.add_argument(
         "--release-matrix-grads",
-        action="store_true",
-        help="experimental no-accumulation path: prepare each full matrix gradient in a post-accumulate backward hook, release it immediately, then retain ordinary batched Oja/Aurora application in optimizer.step()",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="prepare each full matrix gradient in a post-accumulate backward hook and release it immediately while retaining batched Oja/Aurora application in optimizer.step() (default on; requires no accumulation)",
     )
     parser.add_argument(
         "--trace-backward-memory",

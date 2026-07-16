@@ -49,9 +49,10 @@ peak allocated memory from `6,858,903,552` to `5,930,936,320` bytes (13.5%) and
 reserved memory from `7,333,740,544` to `6,528,434,176` bytes (11.0%) for a 1.0%
 step-time cost (`2.3611` to `2.3847` seconds), with matched loss and state bytes.
 This is a real compiled memory lane. Decoder-layer regional compilation is now
-the harness compile policy rather than another mode; matrix-gradient release stays
-an explicit no-accumulation option because its non-transactional contract remains
-real.
+the harness compile policy rather than another mode, and matrix-gradient release
+is the no-accumulation harness default. It remains explicitly disableable because
+its non-transactional contract is real; the public optimizer constructor stays
+conservative and does not install hooks by default.
 
 ## Current design
 
@@ -191,7 +192,7 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Can projected second-moment conditioning replace full-gradient Adafactor? | projected Adam m1/m2 runs `op5xujxd` (`3e-4`) and `t5wbbf9s` (`2e-4`) show a consistently stronger learner with more source loss: at `2e-4`, `1.763509 / 3.004049` target/source versus historical Adafactor `dpiwqydb` at `1.783078 / 2.973868`; raw-gradient Oja captures more energy (`.740349`), while Aurora alignment and moment rank are slightly lower and Oja step angle is unchanged. Matrix state rises from the current control's `92.93 MiB` to `160 MiB` because the third slot is a wide projected m2 while the basis is narrow. Compiled walltime did not establish the required win: one current replay tied Adafactor (`.7927` vs `.7919` sec/step), while the `2e-4` arm reached `.7800`; the historical `.8040` Adafactor comparator still included the deleted basis-lag diagnostic. | no: lower LR does not remove the stronger-adaptation trade, state rises substantially, and the expected compiled speedup was not demonstrated; implementation removed, evidence retained |
 | Do unstable cutoff planes harm useful planes? | per-plane target stability and capture | keep full spectrum or rotate a measured stable prefix |
 | Where does compiled optimizer walltime go? | launch and synchronization profile by stage | stable buckets, compiled tensor cuts, or a fused kernel |
-| Can full gradients be released during backward? | exact parameter/state parity held. At checkpointed LFM-1.2B, 92 matrix gradients total `2,071,986,176` bytes. Whole-model AOT materialized the entire pile before the first traced leaf callback: callback residency was flat at `4,752,924,160` bytes in control, while release drained it to `2,780,337,664`; peak stayed flat (`7,022,023,168` vs `7,025,431,040`). Eager release cut peak 13.3% (`7,202,254,336` to `6,242,306,048`). Decoder-layer regional compilation then exposed a layerwise gradient staircase: control callback residency rose from 3.754 GB at layer 15 to 4.753 GB at layer 0, while release drained each region and trended down to 2.780 GB. The traced regional pair cut peak from `6,833,147,392` to `5,904,918,016`; the decisive untraced 100-step pair reproduced the cut, `6,858,903,552` to `5,930,936,320` allocated and `7,333,740,544` to `6,528,434,176` reserved, while step time moved only from `2.3611` to `2.3847` seconds and losses/state bytes matched. | yes under decoder-layer regional compilation: release recovers about 0.93 GB at LFM-1.2B for 1% throughput rent. Regional compilation is the single harness compile policy; release remains an explicit no-accumulation option with its non-transactional failure contract. |
+| Can full gradients be released during backward? | exact parameter/state parity held. At checkpointed LFM-1.2B, 92 matrix gradients total `2,071,986,176` bytes. Whole-model AOT materialized the entire pile before the first traced leaf callback: callback residency was flat at `4,752,924,160` bytes in control, while release drained it to `2,780,337,664`; peak stayed flat (`7,022,023,168` vs `7,025,431,040`). Eager release cut peak 13.3% (`7,202,254,336` to `6,242,306,048`). Decoder-layer regional compilation then exposed a layerwise gradient staircase: control callback residency rose from 3.754 GB at layer 15 to 4.753 GB at layer 0, while release drained each region and trended down to 2.780 GB. The traced regional pair cut peak from `6,833,147,392` to `5,904,918,016`; the decisive untraced 100-step pair reproduced the cut, `6,858,903,552` to `5,930,936,320` allocated and `7,333,740,544` to `6,528,434,176` reserved, while step time moved only from `2.3611` to `2.3847` seconds and losses/state bytes matched. | yes under decoder-layer regional compilation: release recovers about 0.93 GB at LFM-1.2B for 1% throughput rent. Regional compilation and release are the single no-accumulation harness policy; release remains disableable and retains its non-transactional failure contract. |
 | Can rank-side rotation make basis or moment state safely low-bit? | rank-64 outlier anatomy, then subspace/Aurora fidelity | quantize a proven target or close the sidequest |
 
 Tracking work stops unless it deletes state or machinery, reduces measured tracking
@@ -283,7 +284,7 @@ broad no-embedding training, uniform rank 128, residual-facing projection, stabl
 `eigh` init, right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE,
 mature Oja, matrix LR `3e-4` with 50-step warmup, projected-moment beta `.95`, raw
 per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, decoder-layer regional
-`torch.compile`, target
+`torch.compile`, matrix-gradient release, target
 and source evaluation every 100 steps, telemetry every 25, and a final qualitative
 sample. Non-2D fallback tensors use a separate fp32-state AdamW at half matrix LR,
 betas `.9/.99`, epsilon `1e-8`, and zero weight decay.

@@ -247,7 +247,8 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(build_parser().parse_args(["--no-torch-compile"]).torch_compile)
         self.assertFalse(args.skip_validation)
         self.assertFalse(args.keep_grads_after_step)
-        self.assertFalse(args.release_matrix_grads)
+        self.assertTrue(args.release_matrix_grads)
+        self.assertFalse(build_parser().parse_args(["--no-release-matrix-grads"]).release_matrix_grads)
         self.assertFalse(args.trace_backward_memory)
         self.assertFalse(hasattr(args, "shadow_target_probe"))
 
@@ -260,11 +261,12 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         validate_projected_activation_contract(build_parser().parse_args(["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"]))
 
     def test_gradient_release_rejects_incompatible_harness_contracts(self):
-        validate_gradient_release_contract(build_parser().parse_args(["--release-matrix-grads"]))
+        validate_gradient_release_contract(build_parser().parse_args([]))
+        validate_gradient_release_contract(build_parser().parse_args(["--no-release-matrix-grads", "--grad-accum-steps", "2"]))
         for incompatible in (
-            ["--release-matrix-grads", "--grad-accum-steps", "2"],
-            ["--release-matrix-grads", "--keep-grads-after-step"],
-            ["--release-matrix-grads", "--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"],
+            ["--grad-accum-steps", "2"],
+            ["--keep-grads-after-step"],
+            ["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"],
         ):
             with self.assertRaises(ValueError):
                 validate_gradient_release_contract(build_parser().parse_args(incompatible))
