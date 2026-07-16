@@ -30,14 +30,14 @@ def make_problem() -> tuple[torch.Tensor, torch.Tensor]:
 def train(optimizer_name: str) -> tuple[float, float, int]:
     torch.manual_seed(1)
     model = torch.nn.Sequential(
-        torch.nn.Linear(16, 24),
+        torch.nn.Linear(16, 24, bias=False),
         torch.nn.Tanh(),
-        torch.nn.Linear(24, 8),
+        torch.nn.Linear(24, 8, bias=False),
     )
     x, y = make_problem()
 
     if optimizer_name == "usuitrack":
-        optimizer = UsuiTrack(model.parameters(), lr=0.01, rank=4, beta=0.9)
+        optimizer = UsuiTrack((p for p in model.parameters() if p.ndim == 2), lr=0.01, rank=4, beta=0.9)
     elif optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     else:  # pragma: no cover - local script guard

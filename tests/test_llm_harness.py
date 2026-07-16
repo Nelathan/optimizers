@@ -8,7 +8,7 @@ import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_FALLBACK_LR, DEFAULT_LORA_ALPHA, DEFAULT_LORA_RANK, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, install_state_matched_lora, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_lora_optimizer_state_dtype, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_FALLBACK_LR, DEFAULT_LORA_ALPHA, DEFAULT_LORA_RANK, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_state_matched_lora, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_lora_optimizer_state_dtype, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -20,14 +20,6 @@ def assert_param_membership(test_case, param, params, expected: bool) -> None:
         test_case.assertFalse(present)
 
 
-def expected_projected_grad(opt: UsuiTrack, param: torch.nn.Parameter, full_grad: torch.Tensor) -> torch.Tensor:
-    state = opt.state[param]
-    basis = state["basis"]
-    if state.get("projection_side_is_right", False):
-        return full_grad @ basis.mT
-    return basis.mT @ full_grad
-
-
 class TinyTopology(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -36,43 +28,6 @@ class TinyTopology(torch.nn.Module):
         self.norm = torch.nn.LayerNorm(4)
         self.conv = torch.nn.Conv1d(1, 2, 3)
         self.lm_head = torch.nn.Linear(4, 8, bias=False)
-
-
-class TinyLfmMlp(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.w1 = torch.nn.Linear(4, 6, bias=False, dtype=torch.float64)
-        self.w3 = torch.nn.Linear(4, 6, bias=False, dtype=torch.float64)
-        self.w2 = torch.nn.Linear(6, 4, bias=False, dtype=torch.float64)
-
-    def forward(self, x):
-        return self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
-
-
-class TinyLfmAttention(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.q_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
-        self.k_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
-        self.v_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
-        self.out_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
-
-    def forward(self, x):
-        return self.out_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
-
-
-class TinyLfmShortConv(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = torch.nn.Conv1d(4, 4, kernel_size=1, groups=4, bias=False, dtype=torch.float64)
-        self.in_proj = torch.nn.Linear(4, 12, bias=False, dtype=torch.float64)
-        self.out_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
-
-    def forward(self, x):
-        b, c, x_branch = self.in_proj(x).chunk(3, dim=-1)
-        conv_in = (b * x_branch).transpose(-1, -2)
-        conv_out = self.conv(conv_in).transpose(-1, -2)
-        return self.out_proj(c * conv_out)
 
 
 class CountingCheckpointLayer(torch.nn.Module):
@@ -160,27 +115,23 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertTrue(all(state["exp_avg"].dtype == torch.bfloat16 for state in optimizer.state.values()))
         self.assertTrue(all(state["exp_avg_sq"].dtype == torch.bfloat16 for state in optimizer.state.values()))
 
-    def test_fp32_state_adamw_matches_existing_fallback_math(self):
+    def test_fp32_state_adamw_keeps_fp32_moments(self):
         torch.manual_seed(91)
         initial = torch.randn(7, dtype=torch.bfloat16)
-        old_param = torch.nn.Parameter(initial.clone())
         split_param = torch.nn.Parameter(initial.clone())
         lr = 1.5e-4
-        old = UsuiTrack([old_param], lr=lr, fallback_betas=(0.9, 0.99))
         split = FP32StateAdamW([split_param], lr=lr, betas=(0.9, 0.99))
 
-        for _ in range(3):
-            grad = torch.randn_like(initial)
-            old_param.grad = grad.clone()
-            split_param.grad = grad.clone()
-            old.step()
-            split.step()
+        grad = torch.randn_like(initial)
+        split_param.grad = grad.clone()
+        split.step()
 
-        torch.testing.assert_close(split_param, old_param, rtol=0, atol=0)
-        for key in ("step", "exp_avg", "exp_avg_sq"):
-            torch.testing.assert_close(split.state[split_param][key], old.state[old_param][key], rtol=0, atol=0)
-        self.assertEqual(split.state[split_param]["exp_avg"].dtype, torch.float32)
-        self.assertEqual(split.state[split_param]["exp_avg_sq"].dtype, torch.float32)
+        state = split.state[split_param]
+        torch.testing.assert_close(state["exp_avg"], grad.float() * 0.1, rtol=0, atol=0)
+        torch.testing.assert_close(state["exp_avg_sq"], grad.float().square() * 0.01, rtol=1e-6, atol=0)
+        self.assertEqual(state["step"].item(), 1.0)
+        self.assertEqual(state["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
         self.assertEqual(DEFAULT_FALLBACK_LR, 1e-4)
 
     def test_backward_memory_trace_brackets_registered_preparation_hook(self):
@@ -253,28 +204,12 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(args.lora_grad_clip_norm, 1.0)
         self.assertEqual(args.lr_warmup_steps, 50)
         self.assertEqual(args.beta, 0.95)
-        self.assertEqual(args.projected_activation_backend, "off")
-        self.assertEqual(args.basis_refresh_schedule, "burst")
-        self.assertEqual(args.moment_mode, "adafactor_ema")
-        self.assertEqual(args.basis_refresh_interval, 10)
-        self.assertEqual(args.projected_grad_clip_norm, 0.0)
-        self.assertEqual(args.projected_grad_clip_ratio, 0.0)
+        self.assertEqual(args.basis_update_interval, 1)
         self.assertEqual(args.grad_clip_norm, 1.0)
-        self.assertEqual(args.grassmann_aim, "oja")
-        self.assertEqual(args.oja_step_schedule, "mature")
-        self.assertEqual(build_parser().parse_args(["--oja-step-schedule", "mature"]).oja_step_schedule, "mature")
-        self.assertEqual(build_parser().parse_args(["--grassmann-aim", "eigh"]).grassmann_aim, "eigh")
-        self.assertIsNone(args.grassmann_rotate_rank)
-        self.assertEqual(args.grassmann_step_size, 0.25)
-        self.assertFalse(hasattr(args, "grassmann_step_schedule"))
-        self.assertFalse(hasattr(args, "no_grassmann_accumulate"))
         self.assertEqual(args.val_blocks, 8)
         self.assertEqual(args.retention_val_blocks, 8)
         self.assertEqual(args.wandb_log_every, 25)
         self.assertEqual(args.eval_every, 100)
-        self.assertEqual(args.aurora_pp_iterations, 1)
-        self.assertEqual(args.polar_ns_steps, 5)
-        self.assertEqual(args.basis_init, "eigh")
         self.assertEqual(args.attn_implementation, "sdpa")
         self.assertTrue(args.activation_checkpointing)
         self.assertTrue(args.torch_compile)
@@ -286,21 +221,12 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertFalse(args.trace_backward_memory)
         self.assertFalse(hasattr(args, "shadow_target_probe"))
 
-    def test_oja_rejects_projected_activation_backend_before_setup(self):
-        args = build_parser().parse_args(["--projected-activation-backend", "lfm"])
-
-        with self.assertRaisesRegex(ValueError, "requires full matrix gradients"):
-            validate_projected_activation_contract(args)
-
-        validate_projected_activation_contract(build_parser().parse_args(["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"]))
-
     def test_gradient_release_rejects_incompatible_harness_contracts(self):
         validate_gradient_release_contract(build_parser().parse_args([]))
         validate_gradient_release_contract(build_parser().parse_args(["--no-release-matrix-grads", "--grad-accum-steps", "2"]))
         for incompatible in (
             ["--grad-accum-steps", "2"],
             ["--keep-grads-after-step"],
-            ["--projected-activation-backend", "lfm", "--grassmann-aim", "eigh"],
         ):
             with self.assertRaises(ValueError):
                 validate_gradient_release_contract(build_parser().parse_args(incompatible))
@@ -403,46 +329,6 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
         self.assertEqual(stats["side_policy_right_tensors"], 3)
         self.assertEqual(stats["side_policy_left_tensors"], 0)
 
-    def test_projected_activation_param_ids_do_not_override_residual_facing_side(self):
-        gate = torch.nn.Parameter(torch.randn(16, 4))
-        down = torch.nn.Parameter(torch.randn(4, 16))
-        named = [
-            ("model.layers.0.feed_forward.w1.weight", gate),
-            ("model.layers.0.feed_forward.w2.weight", down),
-        ]
-
-        groups, stats = build_usuitrack_param_groups(
-            named,
-            rank=4,
-            projection_side_policy="residual-facing",
-            activation_projected_param_ids={id(gate), id(down)},
-        )
-        group_by_param = {id(param): group for group in groups for param in group["params"]}
-
-        self.assertEqual(group_by_param[id(gate)]["side"], "right")
-        self.assertEqual(group_by_param[id(down)]["side"], "left")
-        self.assertEqual(stats["side_policy_right_tensors"], 1)
-        self.assertEqual(stats["side_policy_left_tensors"], 1)
-
-    def test_layer_staggered_refresh_schedule_adds_layer_offsets_without_changing_sides(self):
-        first = torch.nn.Parameter(torch.randn(16, 4))
-        second = torch.nn.Parameter(torch.randn(16, 4))
-        named = [
-            ("model.layers.2.feed_forward.w1.weight", first),
-            ("model.layers.5.feed_forward.w3.weight", second),
-        ]
-
-        groups, _stats = build_usuitrack_param_groups(
-            named,
-            rank=4,
-            projection_side_policy="right",
-            basis_refresh_schedule="layer-staggered",
-        )
-        group = groups[0]
-
-        self.assertEqual(group["side"], "right")
-        self.assertEqual(group["basis_refresh_offsets"], {id(first): 2, id(second): 5})
-
     def test_lfm2_gradient_checkpointing_repair_wraps_decoder_layers(self):
         model = TinyLfmForCausalLM()
 
@@ -466,149 +352,6 @@ class LlmHarnessParamScopeTest(unittest.TestCase):
             model.model.layers[0](torch.randn(4))
 
         self.assertEqual(model.model.layers[0].calls, 1)
-
-    def test_lfm_projected_activation_backend_falls_back_until_basis_ready_then_queues(self):
-        model = torch.nn.Module()
-        model.feed_forward = TinyLfmMlp()
-        named = list(model.named_parameters())
-        activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_usuitrack_param_groups(
-            named,
-            rank=2,
-            projection_side_policy="right",
-            activation_projected_param_ids=activation_projected_ids,
-        )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, moment_mode="ema", grassmann_aim="eigh")
-
-        installed = install_projected_activation_backend(model, opt, "lfm")
-
-        self.assertEqual(installed, 1)
-        x = torch.randn(3, 5, 4, dtype=torch.float64)
-        loss = model.feed_forward(x).square().mean()
-        loss.backward()
-        self.assertIsNotNone(model.feed_forward.w1.weight.grad)
-        self.assertIsNotNone(model.feed_forward.w2.weight.grad)
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-
-        reference = torch.nn.Module()
-        reference.feed_forward = TinyLfmMlp()
-        reference.load_state_dict(model.state_dict())
-        loss = model.feed_forward(x).square().mean()
-        reference_loss = reference.feed_forward(x).square().mean()
-        reference_loss.backward()
-        loss.backward()
-
-        self.assertIsNone(model.feed_forward.w1.weight.grad)
-        self.assertIsNone(model.feed_forward.w3.weight.grad)
-        self.assertIsNone(model.feed_forward.w2.weight.grad)
-        self.assertEqual(set(opt._queued_projected_grads), {model.feed_forward.w1.weight, model.feed_forward.w3.weight, model.feed_forward.w2.weight})
-        self.assertTrue(torch.allclose(opt._queued_projected_grads[model.feed_forward.w1.weight], reference.feed_forward.w1.weight.grad @ opt.state[model.feed_forward.w1.weight]["basis"].mT, atol=1e-12))
-        self.assertTrue(torch.allclose(opt._queued_projected_grads[model.feed_forward.w3.weight], reference.feed_forward.w3.weight.grad @ opt.state[model.feed_forward.w3.weight]["basis"].mT, atol=1e-12))
-        self.assertTrue(torch.allclose(opt._queued_projected_grads[model.feed_forward.w2.weight], reference.feed_forward.w2.weight.grad @ opt.state[model.feed_forward.w2.weight]["basis"].mT, atol=1e-12))
-        opt.step()
-        self.assertEqual(opt._queued_projected_grads, {})
-
-    def test_lfm_projected_activation_backend_falls_back_on_refresh_due_layer(self):
-        model = torch.nn.Module()
-        model.feed_forward = TinyLfmMlp()
-        named = list(model.named_parameters())
-        activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_usuitrack_param_groups(
-            named,
-            rank=2,
-            projection_side_policy="residual-facing",
-            activation_projected_param_ids=activation_projected_ids,
-        )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
-        install_projected_activation_backend(model, opt, "lfm")
-        x = torch.randn(3, 5, 4, dtype=torch.float64)
-
-        model.feed_forward(x).square().mean().backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        for group in opt.param_groups:
-            group["basis_refresh_step"] = 100
-
-        model.feed_forward(x).square().mean().backward()
-
-        self.assertIsNotNone(model.feed_forward.w1.weight.grad)
-        self.assertIsNotNone(model.feed_forward.w3.weight.grad)
-        self.assertIsNotNone(model.feed_forward.w2.weight.grad)
-        self.assertEqual(opt._queued_projected_grads, {})
-
-    def test_lfm_projected_activation_backend_wraps_standard_attention_linears(self):
-        model = torch.nn.Module()
-        model.self_attn = TinyLfmAttention()
-        named = list(model.named_parameters())
-        activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_usuitrack_param_groups(
-            named,
-            rank=2,
-            projection_side_policy="residual-facing",
-            activation_projected_param_ids=activation_projected_ids,
-        )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
-
-        installed = install_projected_activation_backend(model, opt, "lfm")
-
-        self.assertEqual(installed, 4)
-        x = torch.randn(3, 5, 4, dtype=torch.float64)
-        model.self_attn(x).square().mean().backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-
-        reference = torch.nn.Module()
-        reference.self_attn = TinyLfmAttention()
-        reference.load_state_dict(model.state_dict())
-        reference.self_attn(x).square().mean().backward()
-        model.self_attn(x).square().mean().backward()
-
-        weights = {model.self_attn.q_proj.weight, model.self_attn.k_proj.weight, model.self_attn.v_proj.weight, model.self_attn.out_proj.weight}
-        self.assertTrue(all(weight.grad is None for weight in weights))
-        self.assertEqual(set(opt._queued_projected_grads), weights)
-        for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
-            projected_weight = getattr(model.self_attn, name).weight
-            reference_weight = getattr(reference.self_attn, name).weight
-            expected = expected_projected_grad(opt, projected_weight, reference_weight.grad)
-            self.assertTrue(torch.allclose(opt._queued_projected_grads[projected_weight], expected, atol=1e-12))
-
-    def test_lfm_projected_activation_backend_wraps_short_conv_projection_linears(self):
-        model = torch.nn.Module()
-        model.conv = TinyLfmShortConv()
-        named = list(model.named_parameters())
-        activation_projected_ids = projected_activation_param_ids(model, "lfm")
-        groups, _stats = build_usuitrack_param_groups(
-            named,
-            rank=2,
-            projection_side_policy="residual-facing",
-            activation_projected_param_ids=activation_projected_ids,
-        )
-        opt = UsuiTrack(groups, lr=0.01, rank=2, basis_refresh_interval=100, grassmann_aim="eigh")
-
-        installed = install_projected_activation_backend(model, opt, "lfm")
-
-        self.assertEqual(installed, 2)
-        x = torch.randn(3, 5, 4, dtype=torch.float64)
-        model.conv(x).square().mean().backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-
-        reference = torch.nn.Module()
-        reference.conv = TinyLfmShortConv()
-        reference.load_state_dict(model.state_dict())
-        reference.conv(x).square().mean().backward()
-        model.conv(x).square().mean().backward()
-
-        projected_weights = {model.conv.in_proj.weight, model.conv.out_proj.weight}
-        self.assertTrue(all(weight.grad is None for weight in projected_weights))
-        self.assertIsNotNone(model.conv.conv.weight.grad)
-        self.assertEqual(set(opt._queued_projected_grads), projected_weights)
-        for name in ("in_proj", "out_proj"):
-            projected_weight = getattr(model.conv, name).weight
-            reference_weight = getattr(reference.conv, name).weight
-            expected = expected_projected_grad(opt, projected_weight, reference_weight.grad)
-            self.assertTrue(torch.allclose(opt._queued_projected_grads[projected_weight], expected, atol=1e-12))
 
     def test_uniform_rank_clamps_to_matrix_dimension(self):
         first = torch.nn.Parameter(torch.randn(16, 4))

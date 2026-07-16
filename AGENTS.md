@@ -90,26 +90,22 @@ The arc that produced the biggest win ran like this; reproduce the shape, not th
   `UsuiTrack`.
 - Matrix params do not store full-size first moments.
 - Matrix params do not store full-size second moments in the main path.
-- Non-2D params use boring fallback semantics or are frozen by task policy.
-- Fallback state is accounted separately.
+- UsuiTrack accepts only 2D parameters. Harness-owned AdamW or task policy owns
+  non-2D tensors; its state is accounted separately.
 - Orthogonalization happens in projected space.
 - Aurora with Muon scale semantics is the forward projected direction.
 - HeavyBall Newton-Schulz is the internal polar primitive inside Aurora.
-- One-state Oja is the forward basis-update path after stable EIGH initialization: every conditioned full gradient moves the live frame through an all-plane exact rank-space geodesic with harmonic steps `1/2, 1/3, ...` down to `0.01`, followed by Polar Express correction. It stores no second frame. Full-gradient input is mandatory; projected-activation backward is incompatible.
-- Fixed `.25` boundary EIGH position control and tangent velocity control remain explicit ablations. `grassmann_step_size`, `grassmann_rotate_rank`, refresh interval, and refresh schedule govern those ablations only and are inert under Oja.
+- UsuiTrack's one-state basis tracker uses Oja's covariance tangent after stable EIGH initialization. It moves the live frame through an all-plane exact rank-space geodesic with harmonic basis-update steps `1, 1/2, 1/3, ...` down to `0.01`, followed by Polar Express correction. `basis_update_interval` controls geodesic cadence and defaults to `1`; conditioning and projection still consume every full matrix gradient. It stores no second frame.
 - The projected first moment parallel-transports through every geodesic refresh as the identity in projected coordinates (the retraction is a rigid frame rotation; pinned by test). Do not reintroduce project-back/re-project transfer — its cos-tax feeds Aurora's polar map shrunken, noise-dominated directions that NS re-amplifies.
-- Burst refresh is the default schedule for boundary ablations; round-robin was removed as complexity rent.
 - Two-sided square-core projection was removed from the active path.
 - Unsupported ECC/param-ECC fails loudly.
 - Basis initialization uses stable side-Gram `eigh`: fp32 finite check, Frobenius normalization, symmetric Gram, and trace-scaled jitter retry on backend failure. Exact SVD was removed from the default/init path after being slower and less robust for this one-sided subspace contract.
 
 ## Harness defaults and coordinate convention
 
-The LLM harness defaults to the current rank-128 1k quality contract: broad no-embedding training, stable `eigh` basis init, residual-facing projection, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, mature per-gradient Oja, matrix LR `4e-4` with 50-step warmup, projected-moment beta `.95`, raw per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, decoder-layer regional `torch.compile`, matrix-gradient release, evaluation every 100 steps, and telemetry every 25. Non-2D fallback tensors are harness-owned by a separate fp32-state AdamW at LR `1e-4`, with betas `.9/.99`, epsilon `1e-8`, and no weight decay. Constructor and harness both default to Oja and one Aurora pass; model-scale/training defaults otherwise remain harness policy. The retained interval `10`, burst schedule, `.25` step, and all-plane rotate setting describe explicit boundary EIGH/tangent ablations, not Oja. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
+The LLM harness defaults to the current rank-128 1k quality contract: broad no-embedding training, stable `eigh` basis init, residual-facing projection, faithful SYNTH right-padded no-mask batches, `batch_size=16`, `seq_len=1024`, CCE loss, per-gradient basis updates, matrix LR `4e-4` with 50-step warmup, projected-moment beta `.95`, raw per-tensor clip `1`, fixed Aurora, source retention, decoder-layer regional `torch.compile`, matrix-gradient release, evaluation every 100 steps, and telemetry every 25. Non-2D fallback tensors are harness-owned by a separate fp32-state AdamW at LR `1e-4`, with betas `.9/.99`, epsilon `1e-8`, and no weight decay. Constructor and harness both default to a basis-update interval of `1`; model-scale/training defaults otherwise remain harness policy. Override only the axis being tested; do not cargo-cult long CLI invocations that restate defaults. EOS-packed no-mask remains available, but it is now an explicit throughput lane, not the default quality/diagnostic lane.
 
 For expensive 1k-quality runs, use decoder-layer regional `torch.compile` as run policy unless the run is explicitly measuring eager behavior, compile is unavailable, or compile breaks the benchmark contract. Do not whole-model compile the CCE base: whole-model AOTAutograd materializes the complete matrix-gradient output pile before eager leaf hooks can release it. Record compile scope and state in results so throughput comparisons stay honest. Matrix-gradient release is the harness default and requires one backward per optimizer step; disable it explicitly for accumulation or another incompatible ingress. The public optimizer constructor remains conservative and does not install hooks by default.
-
-Random basis init is an ablation/stress path, not the quality default. Do not use it merely to dodge initialization cost unless the run is explicitly measuring fit/performance rather than optimizer quality.
 
 CCE is the loss path because the HF full-logits route is strictly worse for the memory/throughput questions this repo is asking. If a run needs an unoptimized loss route, stop immediately and re-evaluate the plan. Continue only if the work is explicitly reframed as an ablation outside the faithful benchmark path.
 
@@ -161,7 +157,7 @@ Build on `../HeavyBall` directly. Use it as the primary optimizer substrate for 
 
 Do not fork HeavyBall unless explicitly asked. Do not vendor HeavyBall internals. Do not add a submodule casually.
 
-Aurora is a projected direction map inside UsuiTrack, not a wholesale optimizer replacement: UsuiTrack owns momentum, basis tracking, scaling, LR, fallback semantics, and accounting.
+Aurora is a projected direction map inside UsuiTrack, not a wholesale optimizer replacement: UsuiTrack owns matrix momentum, basis tracking, scaling, LR, and accounting.
 
 ## Validation expectations
 

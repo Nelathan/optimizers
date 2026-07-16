@@ -2,22 +2,20 @@
 
 Current matrix-update design. Direction and unresolved questions live in
 `PLAN.md` and `SUBSPACE_TRACKING.md`; superseded evidence lives under `archive/`.
+This document specifies only the selected basis-tracking path.
 
 ## Read these traps first
 
 - **Basis != subspace.** `Q` and `QH` span the same subspace, but coordinates in
   those frames differ.
 - **Left != right with renamed shapes.** Derive each projection and lift.
-- **Oja != a boundary controller.** Oja updates from every full gradient with its
-  harmonic-to-`.01` step schedule. Refresh interval, rotation rank, and boundary step configure only
-  the explicit `eigh` and `tangent` ablations.
 - **Overlap reprojection != parallel transport.** Reprojection preserves the
   least-squares part of a fixed ambient vector. UsuiTrack carries momentum with
   its moving frame, so its stored coordinates do not change at refresh.
 - **A healthy polar output can hide a sick input.** Newton--Schulz restores
   semi-orthogonal scale after weak directions have already become noise-dominated.
-- **A downstream clip cannot protect upstream state.** Projected clipping does
-  not protect Adafactor or the basis target.
+- **A downstream operation cannot protect upstream state.** Raw clipping must
+  precede Adafactor, held-frame projection, and Oja tangent construction.
 - **`side="auto"` knows shape, not architecture.** It cannot infer a transformer's
   residual-facing axis.
 - **Exact implementation of a formula does not validate the formula's premise.**
@@ -26,7 +24,10 @@ Current matrix-update design. Direction and unresolved questions live in
 
 Let a matrix parameter and gradient be
 
-$$W,G\in\mathbb R^{m\times n},\qquad r\le\min(m,n).$$
+$$W,G\in\mathbb R^{m\times n},\qquad 1\le r\le\min(m,n).$$
+
+The configured rank must satisfy this bound for every optimized matrix; the
+specified path does not define per-tensor rank truncation.
 
 `Q` is always the canonical column frame, `Q^T Q = I`:
 
@@ -43,31 +44,32 @@ residual-facing policy instead. Spectral work promotes fp16/bf16 inputs to fp32.
 ```text
 raw gradient G
   -> sanitize and raw clip
-  -> Adafactor SNR conditioning (default)
-  -> stable EIGH initialization, otherwise one-state Oja tangent
+  -> Adafactor SNR conditioning
+  -> stable EIGH initialization on the first step
   -> held-frame projected gradient Z
-  -> optional projected clip
+  -> Rayleigh-normalized one-state Oja tangent
   -> projected EMA M
-  -> identity-coordinate Oja frame move
+  -> release full gradient; retain rank-sized pending work
+  -> exact Oja frame move with identity moment coordinates
   -> Aurora leverage balance + HeavyBall polar map
   -> full-parameter Muon scale
   -> lift through the moved frame Q+
-  -> decoupled weight decay and parameter update
+  -> parameter update
 ```
 
 ### 1. Sanitize and raw clip
 
-Let `S(G)` replace each non-finite entry with zero. With threshold `c=2.5` by
+Let `S(G)` replace each non-finite entry with zero. With threshold `c=1` by
 default,
 
-$$G_c=S(G)\min\left(1,\frac{c}{\|S(G)\|_F}\right).$$
+$$G_c=S(G)\min\left(1,\frac{c}{\max(\|S(G)\|_F,10^{-12})}\right).$$
 
 This occurs before all matrix consumers. Disabling the threshold leaves only
 sanitization.
 
 ### 2. Adafactor SNR conditioning
 
-Default `moment_mode="adafactor_ema"` maintains row and column means of squared
+The selected path maintains row and column means of squared
 full-gradient entries (`beta2=0.99`, `epsilon_a=1e-30`):
 
 $$R_t=\beta_2R_{t-1}+(1-\beta_2)\operatorname{mean}_j(G_{c,ij}^2+\epsilon_a),$$
@@ -84,7 +86,7 @@ $$\widetilde G=\frac{G_c}{\sqrt{\widehat V}}\operatorname{RMS}(G_c).$$
 
 RMS restoration retains relative SNR weighting without feeding an RMS-one matrix
 into the tracker. Reconstruction denominators and square roots are floored by
-`epsilon_a`. In plain `moment_mode="ema"`, `G_tilde = G_c` and this state is absent.
+`epsilon_a`.
 
 ### 3. Initialize the frame
 
@@ -96,16 +98,23 @@ $$K=A^\top A\quad\text{(right)},\qquad K=AA^\top\quad\text{(left)}.$$
 
 $$K\leftarrow K+10^{-6}\max(\operatorname{tr}(K)/d,10^{-12})I.$$
 
-An exactly zero gradient uses a random QR frame. Random initialization otherwise
-remains an ablation.
+An exactly zero gradient produces the deterministic EIGH frame of the zero side
+Gram.
 
-### 4. Track with one-state Oja
+### 4. Project in the held frame
 
-After EIGH initialization, default `grassmann_aim="oja"` updates the live frame
-from every conditioned full gradient. Let the covariance action be
+Using the held frame before the current Oja move,
 
-$$A=\widetilde G^\top(\widetilde GQ)\quad\text{(right)},\qquad
-A=\widetilde G( Q^\top\widetilde G)^\top\quad\text{(left)},$$
+$$Z_t=\Pi_{Q_t}(\widetilde G_t).$$
+
+### 5. Track with one-state Oja
+
+After EIGH initialization, the live frame updates on the configured basis-update
+cadence (default every conditioned full gradient). Reuse the held-frame
+projection to form the covariance action:
+
+$$A=\widetilde G^\top Z\quad\text{(right)},\qquad
+A=\widetilde GZ^\top\quad\text{(left)},$$
 
 and form the symmetrized Rayleigh matrix and horizontal tangent
 
@@ -120,9 +129,11 @@ the exact full-rank Grassmann step uses
 
 $$\eta_t=\max(0.01, 1/t),$$
 
-where EIGH initialization is optimizer step one, so the first Oja move uses
-`1/2`. The released harmonic schedule reaches its steady `.01` floor at step
-100. The frame update is
+where `t` counts basis updates, including EIGH initialization. Thus the first
+geodesic uses `1/2`. With `basis_update_interval=k`, phase one still runs for
+every matrix gradient while geodesics occur only on matrix steps divisible by
+`k`; `t` still counts only basis updates. The released harmonic schedule reaches
+its steady `.01` floor at basis update 100. The frame update is
 
 $$Q_{raw}=\left[(QV)\operatorname{diag}(\cos(\eta_t\sigma_i))
 +(\Delta V)\operatorname{diag}
@@ -135,32 +146,16 @@ HeavyBall coefficient triple retracts before storage:
 
 $$Q_+=Q_{raw}(aI+bS+cS^2).$$
 
-Oja rotates every tracked plane, stores no target frame or second tracker state, and requires the
-full matrix gradient on every step; queued projected-activation gradients are
-therefore incompatible.
+The Oja tangent rotates every tracked plane. UsuiTrack stores no target frame or
+second tracker state and requires a full matrix gradient on every step.
 
-The `grassmann_step_size`, `grassmann_rotate_rank`, and
-`basis_refresh_interval` controls are inert under Oja and remain only for Phase 1
-ablation compatibility. Explicit `grassmann_aim="eigh"` retains the measured
-boundary position controller: every interval it moves all configured principal
-planes `0.25` of the geodesic toward the conditioned gradient's top-r EIGH frame.
-Explicit `tangent` retains the historical SubTrack-faithful velocity ablation.
-
-### 5. Project and accumulate momentum
-
-Using the held frame before the current Oja move,
-
-$$Z_t=\Pi_{Q_t}(\widetilde G_t).$$
-
-Optional projected clipping limits `||Z_t||_F` by an absolute threshold, a ratio
-times `||M_{t-1}||_F`, or their minimum. Both controls default off. It protects
-only the projected EMA:
+### 6. Accumulate momentum
 
 $$M_t=\beta M_{t-1}+(1-\beta)Z_t,\qquad \beta=0.95.$$
 
 There is no EMA bias correction.
 
-### 6. Transport momentum through frame motion
+### 7. Transport momentum through frame motion
 
 The geodesic chooses an ambient rotation `R` with `Q_+ = RQ`. UsuiTrack defines
 momentum as moving with that frame:
@@ -172,28 +167,26 @@ Thus its stored coordinates and singular spectrum are unchanged:
 
 $$M_+=M.$$
 
-This is parallel transport along the selected lifted path for Oja and both
-boundary ablations. Multiplication by the
+This is parallel transport along the selected lifted Oja path. Multiplication by the
 old/new frame overlap would answer a different question: represent the surviving
 projection of a fixed old ambient vector. It contracts each rotated plane by a
 principal-angle cosine before Aurora.
 
-### 7. Aurora direction
+### 8. Aurora direction
 
 Aurora acts only on `M`. For a rectangular tensor, orient it as
 `A:[p,q]`, `p >= q`, transposing if needed. Initialize row scaling
 
 $$D_{0,ii}=1/\|A_{i,:}\|_2.$$
 
-Run one leverage-balancing/polar iteration in the released path:
+Run one leverage-balancing/polar iteration:
 
 $$P_k=\operatorname{NS}(D_kA),$$
 $$D_{k+1,ii}=D_{k,ii}
 \left(\frac{q/p}{\|P_{k,i,:}\|_2^2}\right)^{1/2}$$
 
-with the diagonal update omitted after the final iteration. Additional passes
-remain an explicit Aurora-depth ablation. Transpose back. Square tensors skip
-leverage balancing and use `NS(M)` directly.
+with the diagonal update omitted after the iteration. Transpose back. Square
+tensors skip leverage balancing and use `NS(M)` directly.
 
 `NS` first divides by Frobenius norm and orients its input with rows no greater
 than columns. Five default HeavyBall polynomial steps apply
@@ -216,28 +209,52 @@ The result `O_t` is an approximate leverage-balanced polar direction, not an
 exact SVD polar factor.
 
 **Decision — projected Aurora:** Aurora chooses direction inside the retained
-update space. UsuiTrack, not Aurora, owns momentum, basis motion, scale, LR, and
-weight decay.
+update space. UsuiTrack, not Aurora, owns momentum, basis motion, scale, and LR.
 
-### 8. Scale, lift, and update
+### 9. Scale, lift, and update
 
 Muon scale uses the original parameter shape, not the projected shape:
 
 $$\widehat U_t=O_t\sqrt{\max(1,m/n)},
 U_t=\Lambda_{Q_{t+}}(\widehat U_t).$$
 
-Apply decoupled weight decay and learning rate:
+The selected contract has zero weight decay. Apply the learning rate:
 
-$$W_t=(1-\alpha\lambda)W_{t-1}-\alpha U_t.$$
+$$W_t=W_{t-1}-\alpha U_t.$$
 
 Matrix parameters retain no full-size first or second moment.
 
+## Two-phase execution
+
+For each matrix, phase one runs exactly once after its full gradient is complete:
+
+1. sanitize and clip `G`;
+2. update Adafactor state and form `G_tilde`;
+3. read `Z_t` and, after initialization, form `Delta_t` in the held frame `Q_t`;
+4. update `M_t`;
+5. retain `M_t`, the optional `Delta_t`, and the frame reference, then release `G`.
+
+Phase one does not move the basis or update the parameter. Phase two runs in
+`step()`: it batches tangent-Gram eigendecompositions, moves each frame to
+`Q_{t+}`, applies Aurora to `M_t`, lifts through `Q_{t+}`, and updates `W`.
+
+`prepare(param)` exposes phase one explicitly. The selected no-accumulation
+harness invokes it from a post-accumulate gradient hook. Preparation mutates
+Adafactor, projected-moment, initialization, and step state, so pending work is
+not transactional: it must be consumed by `step()`. Calling `zero_grad()` while
+work is pending would only discard the retained tangent after persistent state
+has advanced and is therefore rejected. Repeated preparation, gradient
+accumulation before `step()`, and optimizer closures with pending work are
+unsupported.
+
 ## Fallback path
 
-Every non-2D parameter uses ordinary AdamW with fp32 first and second moments,
-the group LR and weight decay, `eps=1e-8`, and default betas `(0.9,0.99)`. Matrix
-and fallback state are accounted separately. Sparse gradients are unsupported;
-ECC and parameter ECC fail explicitly.
+UsuiTrack accepts only 2D matrix parameters. A separate AdamW owns selected
+non-2D parameters, matching the standard Muon split. Its first and second
+moments are fp32, with LR `1e-4`, `betas=(0.9,0.99)`, `eps=1e-8`, and zero
+weight decay in the selected harness contract. Matrix and fallback state are
+accounted separately. Sparse gradients are unsupported; ECC and parameter ECC
+fail explicitly.
 
 ## Persistent state
 
@@ -249,10 +266,9 @@ ECC and parameter ECC fail explicitly.
 | Adafactor column variance | `[n]` | `[n]` | fp32 |
 | update counts and resolved side | scalar | scalar | Python |
 
-Adafactor state is absent in plain EMA mode. Target frames and tangents are
-transient. Basis-target and lag snapshots exist only when their diagnostics are
-enabled. Fallback parameters retain AdamW's fp32 first moment, second moment, and
-step tensor.
+Oja tangents are transient pending work. No target frame, second basis, or lag
+snapshot is stored. Fallback parameters retain AdamW's fp32 first moment, second
+moment, and step tensor in their separate optimizer.
 
 ## Decisions and reasons
 
@@ -264,21 +280,20 @@ These choices define the current design; they are redesignable.
    and attention-output use storage-left. Generic `auto` remains shape-only.
 3. **Side-Gram `eigh` initialization:** directly solves the one-sided target and
    has explicit fp32, finite-input, symmetrization, and jitter behavior.
-4. **One-state full-gradient Oja tracking:** the live frame follows conditioned
-   covariance action every step with harmonic motion `1/2, 1/3, ...` down to
-   `0.01` and no second basis.
+4. **One-state full-gradient basis tracking:** the live frame follows the Oja
+   covariance action on its configured cadence, with harmonic geodesic motion
+   `1/2, 1/3, ...` down to `0.01` and no second basis.
 5. **Moving-frame momentum:** identity coordinates preserve the projected
    moment's spectrum through the chosen frame rotation.
 6. **Adafactor before tracking and projection:** both consumers see the same
    SNR-conditioned signal; RMS restoration preserves tracker scale units.
 7. **Raw clipping before all consumers:** protects persistent Adafactor state and
-   transient basis targets, not just momentum.
+   Oja tangent construction, not just momentum.
 8. **Aurora plus full-shape Muon scale:** direction belongs to projected geometry;
    scale remains tied to parameter geometry.
-9. **Boundary controls are ablation-only:** burst cadence, EIGH fraction, and
-   rotate rank remain for explicit EIGH/tangent comparisons and do not govern Oja.
-10. **AdamW fallback:** non-matrix tensors remain trainable, with their full state
-    exposed separately rather than hidden in the matrix claim.
+9. **Separate AdamW fallback:** non-matrix tensors remain trainable under a
+   separate optimizer, with their full state exposed rather than hidden in the
+   matrix claim.
 
 ## Identities and edge behavior
 
@@ -288,13 +303,6 @@ These choices define the current design; they are redesignable.
 | transpose problem and swap left/right | transposed projected and ambient update |
 | Oja covariance action lies inside the current subspace | zero frame motion |
 | Oja tangent is rank-deficient | zero singular planes remain fixed |
-| EIGH ablation target equals current subspace | zero frame motion |
-| EIGH ablation fraction `eta=1`, all planes | target subspace along the selected shortest path |
 | full rank | projection/lift loses no component; Aurora can still alter direction |
-| gradient rescaling below raw clipping and away from epsilon floors | normalized Oja tangent unchanged; pre-Aurora magnitude follows the stated conditioning |
+| gradient rescaling below raw clipping and away from epsilon floors | Rayleigh-normalized Oja tangent unchanged; pre-Aurora magnitude follows the stated conditioning |
 | geodesic frame rotation | stored moment coordinates and singular values unchanged |
-| disable Adafactor | row/column state vanishes; clipped raw gradient feeds tracking |
-
-At a principal angle near 90 degrees, the EIGH ablation's shortest Grassmann path
-may be non-unique. Transport is exact along the selected path; that does not
-guarantee a noisy boundary target selects a temporally stable path.

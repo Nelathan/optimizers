@@ -69,14 +69,13 @@ finite raw gradient
   -> lift and parameter update
 ```
 
-The basis starts from stable side-Gram `eigh`, then one-state Oja moves the live
-frame from every conditioned full gradient with harmonic steps `1/2, 1/3, ...`
-down to `.01`. Its exact
-rank-space geodesic rotates every tracked plane and stores no second frame. The
-geodesic's rigid frame rotation parallel-transports projected momentum with
-identity coordinates, so tracking does not brake and rebuild the moment. Fixed
-`.25` boundary EIGH position control and tangent velocity control remain explicit
-ablations; cadence, boundary step, and rotation-rank controls govern only them.
+The basis starts from stable side-Gram `eigh`. UsuiTrack then conditions and
+projects every full gradient; when `basis_update_interval` is due (default every
+matrix step), Oja's covariance tangent moves the live frame with harmonic basis
+update steps `1, 1/2, 1/3, ...` down to `.01`. Its exact rank-space geodesic
+rotates every tracked plane and stores no second frame. The geodesic's rigid frame
+rotation parallel-transports projected momentum with identity coordinates, so
+tracking does not brake and rebuild the moment.
 
 Current redesignable decisions and their reasons live in `SPEC.md`. Do not infer
 the design from old commands or old result tables.
@@ -101,7 +100,7 @@ These claims survived the experiments that produced the present design:
   required one-sided initialization.
 - Adafactor-conditioned EMA beat plain EMA, no momentum, and second-moment-only
   variants in the matched rank-256 SYNTH ablation.
-- Raw clipping must precede Adafactor, target construction, and projection. A
+- Raw clipping must precede Adafactor, Oja tangent construction, and projection. A
   downstream projected clip cannot protect upstream state from a blip.
 - Tangent tracking was a noisy velocity controller. Fractional full-spectrum
   `eigh` aim converged as position control.
@@ -111,8 +110,8 @@ These claims survived the experiments that produced the present design:
   blind-spot frame with far less churn and no second basis state. Oja then
   led EIGH and a separate Oja-target controller at every checkpoint of a matched
   compiled 500-step run, finishing at `1.890727` versus `1.895432` and `1.891082`.
-  The separate target was deleted, and the surviving mechanism is now simply
-  named `oja`. At rank 128 and 1k steps, Oja then finished slightly better on
+  The separate target was deleted; the surviving basis-tracking mechanism uses
+  an Oja covariance tangent. At rank 128 and 1k steps, it then finished slightly better on
   target loss (`1.732211` versus `1.733106`) with slightly worse source retention,
   materially better capture, and clean 50-step basis convergence. Its current
   original per-gradient implementation was 36.9% slower. Profiling traced that
@@ -127,14 +126,14 @@ These claims survived the experiments that produced the present design:
   `.9229 s/step`. Oja is 12.9% faster under the real training contract, with the
   same small target/source trade seen before. The implementation-efficiency
   promotion gate is cleared.
-- Reprojecting momentum across basis refresh charged a principal-plane cosine
+- Reprojecting momentum across a basis update charged a principal-plane cosine
   tax before Aurora. Identity coordinates are exact transport along the selected
   rigid frame rotation and preserve the projected singular spectrum.
 - Round-robin refresh and two-sided square-core projection did not earn their
   complexity and were removed.
 - Projected-activation backward was correct but lost to compiled ordinary
-  backward plus repaired checkpointing at the measured LFM-350M shapes. That
-  lane is closed, not a current performance recommendation.
+  backward plus repaired checkpointing at the measured LFM-350M shapes. The
+  implementation was removed; its evidence remains historical only.
 
 Exact runs, false starts, and historical defaults remain in
 `archive/RESULTS.md`, `archive/SUBSPACE_TRACKING_ARC.md`, and
@@ -183,9 +182,9 @@ This is a space, not an ordered queue. The user chooses traversal.
 | Does tracking improve the product over frozen `eigh`? | long-enough frozen vs Oja run with capture, target, and source | keep tracking or delete it |
 | Does moving-frame momentum beat fixed-ambient history? | rotating toy reading lifted pre-Aurora direction, then narrow SYNTH survivor | keep identity, reproject, or reset |
 | Is the chosen frame path stable at cutoff churn and near 90 degrees? | gauge/sign and hostile-target stress | stabilize target/path or accept boundary |
-| Does tracking cadence cost meaningful walltime? | profile ordinary and telemetry Oja steps; separate EIGH boundary/non-boundary steps only for that ablation | retain per-gradient Oja unless a measured sparse estimator preserves quality |
-| Did Oja clear promotion over noisy boundary EIGH? | one-state Oja won rank-32 replay loss and the rank-128 1k target endpoint; optimized rank-space geometry preserved loss and beat EIGH walltime by 12.9% in a matched rank-128 500 replay | yes: Oja is released; retain EIGH as the position-control ablation and keep the slight source trade visible |
-| Can Oja close its early post-EIGH lag without losing its settled stability? | rank-128 sensor `ytqnw1ip` changed only the schedule to `1/2, 1/3, ...` down to `.01`; target loss improved at every checkpoint and settled geometry also improved | yes: mature Oja is the released schedule; fixed `.01` remains the steady-step ablation |
+| Does basis-update cadence cost meaningful walltime? | profile ordinary and telemetry basis-tracking steps under the selected harmonic geodesic schedule | keep the default interval `1` unless a measured sparse cadence preserves quality |
+| Did the selected tangent/geodesic mechanism clear promotion over noisy boundary EIGH? | one-state Oja won rank-32 replay loss and the rank-128 1k target endpoint; optimized rank-space geometry preserved loss and beat EIGH walltime by 12.9% in a matched rank-128 500 replay | yes: the selected basis tracker is released; the EIGH controller is closed historical evidence, not an active implementation path |
+| Can the tracker avoid early lag without losing settled stability? | rank-128 sensor `ytqnw1ip` established the harmonic `1, 1/2, 1/3, ...` basis-update schedule | yes: harmonic updates are selected; fixed-step schedules are closed historical ablations |
 | Does the well-aligned projected moment still need Aurora `pp=2/ns=5`? | `pp=1/ns=2` under-stepped badly; `pp=1/ns=5` preserved update norm but adapted more gently at 200, and the rank-128 `pp=1/ns=5` lane remains healthy through the selected LR `4e-4` run | use one Aurora pass with five NS steps; do not infer the separate effect of pass count from the chosen configuration run |
 | How much adaptation pressure should the rank-128 product lane use? | with mature Oja and `pp=1/ns=5` fixed, `qvtpskn2` separated matrix LR `4e-4` from fallback LR `1e-4` and reached `1.672156 / 3.037444` target/source at 1k, versus beta-.95 `3e-4` reference `6gkm9k8h` at `1.685367 / 3.022996`. The strict `5e-4` hillclimb `dbwc1x5o` adapted faster early but finished at `1.673074 / 3.056915`, slightly worse on both endpoints than `4e-4`. | select matrix `4e-4` and fallback `1e-4`: it is the measured local winner; more LR front-loads convergence but does not lower the 1k target floor |
 | Does the repaired moving-frame moment benefit from longer memory? | strict beta `.95` sensor `5lkubxig` was nearly tied through 200; the 1k replay `6gkm9k8h` remained healthy and monotonic, ending at `1.685367 / 3.022996` target/source versus beta `.9` control `cqokmxft` at `1.693917 / 3.010227` | yes: `.95` wins about as much target as it loses source, and its longer stable memory is now the constructor and harness default |
@@ -206,8 +205,8 @@ drift. New mechanism inventory is not progress.
 
 Before release, verify ordinary `loss.backward(); optimizer.step()` use across:
 
-- rectangular and square matrices, both sides, mixed fallback tensors, tied and
-  missing gradients, and multiple parameter groups;
+- rectangular and square matrices, both sides, tied and missing gradients, and
+  multiple parameter groups; separately verify the harness AdamW fallback;
 - fp32/bf16, autocast and GradScaler, accumulation, closure behavior, and
   deterministic state-dict continuation across devices and dtypes;
 - DDP as the first distributed boundary;
@@ -221,8 +220,8 @@ policy rather than a claim of architectural inference.
 
 ### Performance contract
 
-Profile optimizer steps at the product-candidate rank, with per-gradient Oja and
-explicit EIGH refresh/non-refresh ablation iterations separated where applicable:
+Profile optimizer steps at the product-candidate rank, with phase-one preparation
+and basis-geodesic work separated where useful:
 
 ```text
 sanitize + raw clip
@@ -242,11 +241,10 @@ Adafactor preparation, projected EMA bookkeeping, and a project-back GEMM
 epilogue that writes the parameter directly. cuBLAS GEMMs, Newton-Schulz products,
 Gram construction, and vendor `eigh` are not first targets.
 
-The current mechanism is still moving; do not begin Triton work while Oja startup
-and Aurora/NS depth remain live algorithmic questions. Sparse Oja cadence,
-stable-prefix rotation, and a new rank sweep are not active leads: per-gradient
-Oja is already fast, useful rank energy is broadly distributed, and rank remains
-an explicit cost/quality choice.
+The selected mechanism is fixed; do not begin Triton work without profiler evidence.
+Sparse basis cadence, stable-prefix rotation, and a new rank sweep are not active
+leads: the default tracker is already fast, useful rank energy is broadly
+distributed, and rank remains an explicit cost/quality choice.
 
 Current diagnostic cost is measured rather than assumed. On the rank-128
 LFM-350M topology, ordinary basis-step telemetry is negligible, while the old
@@ -275,24 +273,22 @@ only close decisions rather than performing ritual seed multiplication.
 
 The public artifact should contain the optimizer, projector, tested defaults, and
 short examples. Keep harness surgery and archived research out of the package.
-Classify controls as normal (`lr`, rank, weight decay), advanced (side, aim,
-Aurora iterations), or ablation/debug. Refresh interval, boundary rotation
-fraction, and rotation rank are ablation-only under the released Oja path.
+Classify controls as normal (`lr`, rank, weight decay), advanced (side,
+`basis_update_interval`), or diagnostic. Aurora is fixed; boundary controllers
+and rotation-rank controls are removed.
 
 ## Benchmark contract
 
 The harness defaults to the current 1k quality contract: `LiquidAI/LFM2.5-350M-Base`,
 broad no-embedding training, uniform rank 128, residual-facing projection, stable
 `eigh` init, right-padded no-mask SYNTH rows, `batch_size=16`, `seq_len=1024`, CCE,
-mature Oja, matrix LR `4e-4` with 50-step warmup, projected-moment beta `.95`, raw
-per-tensor clip `1`, Aurora `pp=1/ns=5`, source retention, decoder-layer regional
+mature basis tracking, matrix LR `4e-4` with 50-step warmup, projected-moment beta
+`.95`, raw per-tensor clip `1`, fixed Aurora, source retention, decoder-layer regional
 `torch.compile`, matrix-gradient release, target
 and source evaluation every 100 steps, telemetry every 25, and a final qualitative
 sample. Non-2D fallback tensors use a separate fp32-state AdamW at LR `1e-4`,
 betas `.9/.99`, epsilon `1e-8`, and zero weight decay.
-`experiments/llm_synth_smoke.py` is authoritative for CLI defaults; the
-retained interval-10 burst settings apply only when an explicit EIGH/tangent
-boundary ablation is selected.
+`experiments/llm_synth_smoke.py` is authoritative for CLI defaults.
 
 The practical run ladder is 200, 500, and at most 1k steps. A 200-step health
 sensor keeps the 1k algorithm/training contract unchanged except for the named

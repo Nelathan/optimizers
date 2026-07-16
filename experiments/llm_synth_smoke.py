@@ -7,7 +7,7 @@ import math
 import sys
 import time
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -20,12 +20,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from usuitrack import UsuiTrack, optimizer_state_bytes_by_category
-from usuitrack.projected_activation import (
-    OptimizerProjectedGradientSink,
-    projected_activation_gated_mlp,
-    projected_activation_linear,
-    set_projected_activation_compile,
-)
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
@@ -36,8 +30,6 @@ DEFAULT_LORA_ALPHA = 44
 
 ParamScope = Literal["full", "broad-no-embeddings", "matrices-no-embeddings"]
 ProjectionSidePolicy = Literal["auto", "residual-facing", "right"]
-ProjectedActivationBackend = Literal["off", "lfm"]
-BasisRefreshSchedule = Literal["burst", "layer-staggered"]
 BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
@@ -619,24 +611,17 @@ def build_usuitrack_param_groups(
     named_params: list[tuple[str, torch.nn.Parameter]],
     rank: int,
     projection_side_policy: ProjectionSidePolicy,
-    activation_projected_param_ids: set[int] | None = None,
-    basis_refresh_schedule: BasisRefreshSchedule = "burst",
 ) -> tuple[list[dict], dict[str, int]]:
     if rank <= 0:
         raise ValueError(f"rank must be positive, got {rank}")
-    if basis_refresh_schedule not in {"burst", "layer-staggered"}:  # pragma: no cover - argparse constrains this
-        raise ValueError(f"unknown basis refresh schedule: {basis_refresh_schedule}")
     policy_stats = {"effective_rank_min": 0, "effective_rank_max": 0, "side_policy_left_tensors": 0, "side_policy_right_tensors": 0, "side_policy_auto_tensors": 0}
 
     grouped: dict[str, list[torch.nn.Parameter]] = {}
-    refresh_offsets_by_side: dict[str, dict[int, int]] = {}
     for name, param in named_params:
         role = transformer_matrix_role(name, param)
         side = storage_side_for_residual_axis(role, projection_side_policy)
         grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
-            if basis_refresh_schedule == "layer-staggered":
-                refresh_offsets_by_side.setdefault(side, {})[id(param)] = transformer_layer_index(name)
             effective_rank = min(rank, *param.shape)
             policy_stats["effective_rank_min"] = effective_rank if not policy_stats["effective_rank_min"] else min(policy_stats["effective_rank_min"], effective_rank)
             policy_stats["effective_rank_max"] = max(policy_stats["effective_rank_max"], effective_rank)
@@ -644,183 +629,8 @@ def build_usuitrack_param_groups(
 
     groups = []
     for side, params in grouped.items():
-        group = {"params": params, "rank": rank, "side": side}
-        if basis_refresh_schedule == "layer-staggered" and refresh_offsets_by_side.get(side):
-            group["basis_refresh_offsets"] = refresh_offsets_by_side[side]
-        groups.append(group)
+        groups.append({"params": params, "rank": rank, "side": side})
     return groups, policy_stats
-
-
-def transformer_layer_index(name: str) -> int:
-    parts = name.split(".")
-    for layer_token in ("layers", "h", "blocks"):
-        if layer_token in parts:
-            index = parts.index(layer_token) + 1
-            if index < len(parts):
-                try:
-                    return int(parts[index])
-                except ValueError:
-                    return 0
-    return 0
-
-
-def lfm_mlp_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
-    modules = []
-    for _name, module in model.named_modules():
-        w1 = getattr(module, "w1", None)
-        w2 = getattr(module, "w2", None)
-        w3 = getattr(module, "w3", None)
-        if all(isinstance(linear, torch.nn.Linear) for linear in (w1, w2, w3)):
-            modules.append(module)
-    return modules
-
-
-def lfm_projected_linear_modules(model: torch.nn.Module) -> list[torch.nn.Linear]:
-    linears: list[torch.nn.Linear] = []
-    for _name, module in model.named_modules():
-        attention_linears = tuple(getattr(module, name, None) for name in ("q_proj", "k_proj", "v_proj", "out_proj"))
-        if all(isinstance(linear, torch.nn.Linear) for linear in attention_linears):
-            linears.extend(attention_linears)
-            continue
-
-        in_proj = getattr(module, "in_proj", None)
-        out_proj = getattr(module, "out_proj", None)
-        conv = getattr(module, "conv", None)
-        if isinstance(in_proj, torch.nn.Linear) and isinstance(out_proj, torch.nn.Linear) and isinstance(conv, torch.nn.Conv1d):
-            linears.extend((in_proj, out_proj))
-    return linears
-
-
-def projected_activation_param_ids(model: torch.nn.Module, backend: ProjectedActivationBackend) -> set[int]:
-    if backend == "off":
-        return set()
-    if backend != "lfm":  # pragma: no cover - argparse constrains this
-        raise ValueError(f"unknown projected activation backend: {backend}")
-    ids: set[int] = set()
-    for module in lfm_mlp_modules(model):
-        ids.add(id(module.w1.weight))
-        ids.add(id(module.w2.weight))
-        ids.add(id(module.w3.weight))
-    for linear in lfm_projected_linear_modules(model):
-        ids.add(id(linear.weight))
-    return ids
-
-
-def install_projected_activation_backend(model: torch.nn.Module, optimizer: UsuiTrack, backend: ProjectedActivationBackend) -> int:
-    if backend == "off":
-        return 0
-    if backend != "lfm":  # pragma: no cover - argparse constrains this
-        raise ValueError(f"unknown projected activation backend: {backend}")
-    sink = OptimizerProjectedGradientSink(optimizer)
-    installed = 0
-    for module in lfm_mlp_modules(model):
-        original_forward = module.forward
-        module.forward = _make_projected_activation_lfm_mlp_forward(module, optimizer, sink, original_forward)  # type: ignore[method-assign]
-        installed += 1
-    for linear in lfm_projected_linear_modules(model):
-        original_forward = linear.forward
-        linear.forward = _make_projected_activation_linear_forward(linear, optimizer, sink, original_forward)  # type: ignore[method-assign]
-        installed += 1
-    if installed == 0:
-        raise RuntimeError("projected activation backend lfm did not find any LFM MLP, attention, or short-conv projection modules")
-    return installed
-
-
-def _make_projected_activation_linear_forward(
-    linear: torch.nn.Linear,
-    optimizer: UsuiTrack,
-    sink: OptimizerProjectedGradientSink,
-    fallback_forward: Callable[[torch.Tensor], torch.Tensor],
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    def forward(x: torch.Tensor) -> torch.Tensor:
-        projected = _projected_activation_linear_basis(linear, optimizer)
-        if projected is None:
-            return fallback_forward(x)
-        basis, side = projected
-        return projected_activation_linear(x, linear.weight, basis, sink, linear.weight, linear.bias, side=side)
-
-    return forward
-
-
-def _make_projected_activation_lfm_mlp_forward(
-    module: torch.nn.Module,
-    optimizer: UsuiTrack,
-    sink: OptimizerProjectedGradientSink,
-    fallback_forward: Callable[[torch.Tensor], torch.Tensor],
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    def forward(x: torch.Tensor) -> torch.Tensor:
-        bases = _projected_activation_lfm_mlp_bases(module, optimizer)
-        if bases is None:
-            return fallback_forward(x)
-        gate_basis, up_basis, down_basis = bases
-        return projected_activation_gated_mlp(
-            x,
-            module.w1.weight,
-            module.w3.weight,
-            module.w2.weight,
-            gate_basis,
-            up_basis,
-            down_basis,
-            sink,
-            module.w1.weight,
-            module.w3.weight,
-            module.w2.weight,
-        )
-
-    return forward
-
-
-def _projected_activation_lfm_mlp_bases(module: torch.nn.Module, optimizer: UsuiTrack) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    params = (module.w1.weight, module.w3.weight, module.w2.weight)
-    bases = []
-    for param in params:
-        group = _optimizer_group_for_param(optimizer, param)
-        if group is None or _usuitrack_param_refresh_due(group, param):
-            return None
-        state = optimizer.state.get(param, {})
-        basis = state.get("basis")
-        if basis is None or not state.get("projection_side_is_right", False):
-            return None
-        if basis.ndim != 2 or basis.shape[1] != param.shape[1]:
-            return None
-        bases.append(basis)
-    return bases[0], bases[1], bases[2]
-
-
-def _projected_activation_linear_basis(linear: torch.nn.Linear, optimizer: UsuiTrack) -> tuple[torch.Tensor, str] | None:
-    group = _optimizer_group_for_param(optimizer, linear.weight)
-    if group is None or _usuitrack_param_refresh_due(group, linear.weight):
-        return None
-    state = optimizer.state.get(linear.weight, {})
-    basis = state.get("basis")
-    if basis is None:
-        return None
-    side = "right" if state.get("projection_side_is_right", False) else "left"
-    if side == "right" and (basis.ndim != 2 or basis.shape[1] != linear.weight.shape[1]):
-        return None
-    if side == "left" and (basis.ndim != 2 or basis.shape[0] != linear.weight.shape[0]):
-        return None
-    return basis, side
-
-
-def _optimizer_group_for_param(optimizer: torch.optim.Optimizer, param: torch.nn.Parameter) -> dict | None:
-    for group in optimizer.param_groups:
-        if any(param is candidate for candidate in group["params"]):
-            return group
-    return None
-
-
-def _usuitrack_param_refresh_due(group: dict, param: torch.nn.Parameter) -> bool:
-    step = group.get("basis_refresh_step", 0)
-    interval = group.get("basis_refresh_interval", 0)
-    if interval <= 0 or step <= 0:
-        return False
-    offsets = group.get("basis_refresh_offsets")
-    if offsets is None:
-        return step % interval == 0
-    if step < interval:
-        return False
-    return (step - offsets.get(id(param), 0)) % interval == 0
 
 
 def make_packed_batches(tokenizer, texts: list[str], device: torch.device, batch_size: int, seq_len: int, min_batches: int):
@@ -1118,8 +928,6 @@ def train_step(
     projected_grad_norm = optimizer_diagnostic(optimizer, "mean_projected_grad_norm") if collect_norms else float("nan")
     projected_grad_to_moment_ratio = optimizer_diagnostic(optimizer, "mean_projected_grad_to_moment_ratio") if collect_norms else float("nan")
     rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
-    basis_target_angle_mass = optimizer_diagnostic(optimizer, "mean_basis_target_angle_mass") if collect_basis else float("nan")
-    basis_step_angle_mass = rotation_angle
     basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
     aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
     moment_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
@@ -1136,8 +944,7 @@ def train_step(
         "update_to_param_ratio": update_to_param_ratio,
         "projected_grad_norm": projected_grad_norm,
         "projected_grad_to_moment_ratio": projected_grad_to_moment_ratio,
-        "basis_target_angle_mass": basis_target_angle_mass,
-        "basis_step_angle_mass": basis_step_angle_mass,
+        "basis_rotation_angle": rotation_angle,
         "basis_capture": basis_capture,
         "aurora_alignment": aurora_alignment,
         "moment_erank": moment_erank,
@@ -1175,15 +982,6 @@ def apply_lr_warmup(optimizer: torch.optim.Optimizer, base_lrs: Sequence[float],
     return scale
 
 
-def should_compile_projected_activation(args, optimizer_name: str) -> bool:
-    return args.torch_compile and optimizer_name == "usuitrack" and args.projected_activation_backend != "off"
-
-
-def validate_projected_activation_contract(args) -> None:
-    if args.projected_activation_backend != "off" and args.grassmann_aim == "oja":
-        raise ValueError("--projected-activation-backend is incompatible with --grassmann-aim oja, which requires full matrix gradients every step")
-
-
 def validate_gradient_release_contract(args) -> None:
     if not args.release_matrix_grads:
         return
@@ -1191,8 +989,6 @@ def validate_gradient_release_contract(args) -> None:
         raise ValueError("--release-matrix-grads requires --grad-accum-steps 1")
     if args.keep_grads_after_step:
         raise ValueError("--release-matrix-grads is incompatible with --keep-grads-after-step")
-    if args.projected_activation_backend != "off":
-        raise ValueError("--release-matrix-grads is incompatible with --projected-activation-backend")
 
 
 def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
@@ -1230,7 +1026,6 @@ def run_optimizer(
 ) -> dict[str, float | int | str]:
     fallback_lr = args.fallback_lr
     if optimizer_name == "usuitrack":
-        validate_projected_activation_contract(args)
         validate_gradient_release_contract(args)
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1239,8 +1034,6 @@ def run_optimizer(
     model, tokenizer = load_model_and_tokenizer(model_name, device, args.activation_checkpointing, args.attn_implementation)
     adapter_named: list[tuple[str, torch.nn.Parameter]] = []
     if optimizer_name == "lora":
-        if args.projected_activation_backend != "off":
-            raise RuntimeError("projected activation backend requires the usuitrack optimizer")
         adapter_named, fallback_named, param_stats = install_state_matched_lora(model, args.param_scope, args.lora_rank, args.lora_alpha)
         trainable_named = adapter_named + fallback_named
     else:
@@ -1252,14 +1045,11 @@ def run_optimizer(
     backward_memory_trace = BackwardMemoryTrace(device) if args.trace_backward_memory and optimizer_name == "usuitrack" else None
     if backward_memory_trace is not None:
         backward_memory_trace.install_before(matrix_named)
-    activation_projected_param_ids = projected_activation_param_ids(model, args.projected_activation_backend) if optimizer_name == "usuitrack" else set()
     if optimizer_name == "usuitrack":
         usuitrack_param_groups, policy_stats = build_usuitrack_param_groups(
             matrix_named,
             args.rank,
             args.projection_side_policy,
-            activation_projected_param_ids,
-            args.basis_refresh_schedule,
         )
     else:
         usuitrack_param_groups = []
@@ -1269,26 +1059,15 @@ def run_optimizer(
     val_batches = make_batches(tokenizer, val_texts, device, args.batch_size, args.seq_len, args.val_blocks, args.batching, "synth")
     retention_batches = make_batches(tokenizer, retention_texts, device, args.batch_size, args.seq_len, args.retention_val_blocks, args.batching, "source") if retention_texts else None
 
-    set_projected_activation_compile(should_compile_projected_activation(args, optimizer_name))
     fallback_optimizer = None
     if optimizer_name == "usuitrack":
         optimizer = UsuiTrack(
             usuitrack_param_groups,
             lr=args.usuitrack_lr,
             beta=args.beta,
-            basis_init=args.basis_init,
-            moment_mode=args.moment_mode,
             adafactor_beta2=args.adafactor_beta2,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
-            grassmann_step_size=args.grassmann_step_size,
-            grassmann_rotate_rank=args.grassmann_rotate_rank,
-            grassmann_aim=args.grassmann_aim,
-            oja_step_schedule=args.oja_step_schedule,
-            basis_refresh_interval=args.basis_refresh_interval,
-            aurora_pp_iterations=args.aurora_pp_iterations,
-            polar_ns_steps=args.polar_ns_steps,
-            projected_grad_clip_norm=args.projected_grad_clip_norm if args.projected_grad_clip_norm > 0 else None,
-            projected_grad_clip_ratio=args.projected_grad_clip_ratio if args.projected_grad_clip_ratio > 0 else None,
+            basis_update_interval=args.basis_update_interval,
             consume_grad=not args.keep_grads_after_step,
             release_matrix_grads=args.release_matrix_grads,
             compile_tensor_kernels=args.torch_compile,
@@ -1303,13 +1082,9 @@ def run_optimizer(
             )
         if backward_memory_trace is not None:
             backward_memory_trace.install_after(matrix_named)
-        projected_activation_modules = install_projected_activation_backend(model, optimizer, args.projected_activation_backend)
         model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name in {"adamw", "torch_adamw"}:
-        if args.projected_activation_backend != "off":
-            raise RuntimeError("projected activation backend requires the usuitrack optimizer")
         optimizer = torch.optim.AdamW(trainable, lr=args.adamw_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=device.type == "cuda")
-        projected_activation_modules = 0
         model = maybe_compile_training_model(model, args.torch_compile)
     elif optimizer_name == "lora":
         adapter_params = [param for _name, param in adapter_named]
@@ -1329,7 +1104,6 @@ def run_optimizer(
                 eps=1e-8,
                 weight_decay=0.0,
             )
-        projected_activation_modules = 0
         model = maybe_compile_training_model(model, args.torch_compile)
     else:  # pragma: no cover
         raise ValueError(optimizer_name)
@@ -1430,12 +1204,9 @@ def run_optimizer(
                 "opt/moment_erank_pct": scalar_or_none(step_result["moment_erank_pct"]),
                 "train/lr": optimizer.param_groups[0]["lr"],
             }
-            # Omit unavailable frame metrics rather than logging NaN. Oja moves
-            # every step, while EIGH/tangent emit motion only at boundaries.
-            for metric_name in ("basis_target_angle_mass", "basis_step_angle_mass"):
-                metric = scalar_or_none(step_result[metric_name])
-                if metric is not None and metric == metric:
-                    train_metrics[f"opt/{metric_name}"] = metric
+            rotation_angle = scalar_or_none(step_result["basis_rotation_angle"])
+            if rotation_angle is not None and rotation_angle == rotation_angle:
+                train_metrics["opt/basis_rotation_angle"] = rotation_angle
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1508,8 +1279,7 @@ def run_optimizer(
     measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
     measured_projected_grad_norms = [step["projected_grad_norm"] for step in measured_steps]
     measured_projected_grad_to_moment_ratios = [step["projected_grad_to_moment_ratio"] for step in measured_steps]
-    measured_basis_target_angle_mass = [step["basis_target_angle_mass"] for step in measured_steps]
-    measured_basis_step_angle_mass = [step["basis_step_angle_mass"] for step in measured_steps]
+    measured_basis_rotation_angles = [step["basis_rotation_angle"] for step in measured_steps]
     measured_basis_capture = [step["basis_capture"] for step in measured_steps]
     measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
     measured_moment_erank = [step["moment_erank"] for step in measured_steps]
@@ -1524,8 +1294,6 @@ def run_optimizer(
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
-        "projected_activation_backend": args.projected_activation_backend if optimizer_name == "usuitrack" else "n/a",
-        "projected_activation_modules": projected_activation_modules if optimizer_name == "usuitrack" else 0,
         "rank": args.rank if optimizer_name == "usuitrack" else args.lora_rank if optimizer_name == "lora" else 0,
         "lora_alpha": args.lora_alpha if optimizer_name == "lora" else 0,
         "lora_adapter_dtype": str(adapter_named[0][1].dtype).removeprefix("torch.") if optimizer_name == "lora" else "n/a",
@@ -1541,16 +1309,8 @@ def run_optimizer(
         "side_policy_left_tensors": policy_stats["side_policy_left_tensors"] if optimizer_name == "usuitrack" else 0,
         "side_policy_right_tensors": policy_stats["side_policy_right_tensors"] if optimizer_name == "usuitrack" else 0,
         "side_policy_auto_tensors": policy_stats["side_policy_auto_tensors"] if optimizer_name == "usuitrack" else 0,
-        "basis_init": args.basis_init if optimizer_name == "usuitrack" else "n/a",
-        "boundary_ablation_refresh_interval": args.basis_refresh_interval if optimizer_name == "usuitrack" else 0,
-        "boundary_ablation_refresh_schedule": args.basis_refresh_schedule if optimizer_name == "usuitrack" else "n/a",
-        "grassmann_aim": args.grassmann_aim if optimizer_name == "usuitrack" else "n/a",
-        "oja_step_schedule": args.oja_step_schedule if optimizer_name == "usuitrack" else "n/a",
+        "basis_update_interval": args.basis_update_interval if optimizer_name == "usuitrack" else 0,
         "lr_warmup_steps": args.lr_warmup_steps,
-        "aurora_pp_iterations": args.aurora_pp_iterations if optimizer_name == "usuitrack" else 0,
-        "polar_ns_steps": args.polar_ns_steps if optimizer_name == "usuitrack" else 0,
-        "projected_grad_clip_norm": args.projected_grad_clip_norm if optimizer_name == "usuitrack" else 0.0,
-        "projected_grad_clip_ratio": args.projected_grad_clip_ratio if optimizer_name == "usuitrack" else 0.0,
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
         "release_matrix_grads": args.release_matrix_grads if optimizer_name == "usuitrack" else False,
         "fallback_lr": fallback_lr if optimizer_name in {"usuitrack", "lora"} and fallback_params else 0.0,
@@ -1584,8 +1344,7 @@ def run_optimizer(
         "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
         "last_logged_projected_grad_norm": last_finite_scalar(measured_projected_grad_norms),
         "last_logged_projected_grad_to_moment_ratio": last_finite_scalar(measured_projected_grad_to_moment_ratios),
-        "last_logged_basis_target_angle_mass": last_finite_scalar(measured_basis_target_angle_mass),
-        "last_logged_basis_step_angle_mass": last_finite_scalar(measured_basis_step_angle_mass),
+        "last_logged_basis_rotation_angle": last_finite_scalar(measured_basis_rotation_angles),
         "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
         "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
         "last_logged_moment_erank": last_finite_scalar(measured_moment_erank),
@@ -1634,13 +1393,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batching", choices=("synth_right_padded_no_mask", "eos_packed_no_mask"), default="synth_right_padded_no_mask", help="batch construction policy; default is faithful SYNTH diagnostics; choose eos_packed_no_mask explicitly for throughput")
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--projection-side-policy", choices=("auto", "residual-facing", "right"), default="residual-facing")
-    parser.add_argument(
-        "--projected-activation-backend",
-        choices=("off", "lfm"),
-        default="off",
-        help="experimental UsuiTrack-only activation-projected backward backend; incompatible with Oja because it queues projected gradients instead of supplying the full matrix gradients Oja requires every step",
-    )
-    parser.add_argument("--basis-init", choices=("eigh", "random"), default="eigh")
     parser.add_argument("--usuitrack-lr", type=float, default=4e-4)
     parser.add_argument("--fallback-lr", type=float, default=DEFAULT_FALLBACK_LR, help="Non-matrix AdamW LR")
     parser.add_argument("--adamw-lr", type=float, default=2e-5)
@@ -1650,29 +1402,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-grad-clip-norm", type=float, default=1.0, help="global gradient clip for LoRA adapter parameters")
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.95)
-    parser.add_argument(
-        "--moment-mode",
-        choices=("ema", "adafactor_ema"),
-        default="adafactor_ema",
-        help="projected moment path: adafactor_ema (default) dampens the full gradient with a row/col factored second moment before basis tracking and projection, then feeds the result through the same first-moment EMA (--beta) as ema mode; ema is the plain first-moment path, kept as a comparator. A moment_mode ablation (none/second_moment/plain adafactor) found adafactor_ema beats plain ema on both target and source loss at matched LR/rank/steps; see commit db62ca2 for the losing arms' code",
-    )
-    parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for --moment-mode adafactor_ema's row/col factored second-moment tracking")
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="clip the RAW gradient PER TENSOR to this norm before adafactor/basis/projection; 0 disables. Protects adafactor's row/col second moment from blip batches before they can poison tracking or moment state. The released rank-128 lane uses 1.0; this is upstream of everything, unlike the moment-only projected-grad clip.")
-    parser.add_argument("--grassmann-step-size", type=float, default=0.25, help="ablation-only boundary step: EIGH target fraction (1.0 = snap) or tangent multiplier. Oja ignores this control")
-    parser.add_argument("--grassmann-rotate-rank", type=int, default=None, help="ablation-only number of planes rotated by EIGH/tangent boundary updates. None rotates all planes; Oja always rotates every tracked plane and ignores this control")
-    parser.add_argument("--grassmann-aim", choices=("tangent", "eigh", "oja"), default="oja", help="basis update law. oja (default) updates the one live frame from every full gradient; eigh is the fixed-.25 boundary position-control ablation; tangent is the historical SubTrack ablation")
-    parser.add_argument("--oja-step-schedule", choices=("fixed", "mature"), default="mature", help="Oja step law. mature (default) uses 1/2, 1/3, ... down to the 0.01 floor after EIGH initialization; fixed is the steady-0.01 ablation")
-    parser.add_argument("--basis-refresh-interval", type=int, default=10, help="ablation-only cadence for EIGH/tangent boundary updates; Oja updates every gradient and ignores this interval")
-    parser.add_argument(
-        "--basis-refresh-schedule",
-        choices=("burst", "layer-staggered"),
-        default="burst",
-        help="ablation-only EIGH/tangent boundary timing; Oja updates every gradient and ignores this schedule",
-    )
-    parser.add_argument("--aurora-pp-iterations", type=int, default=1)
-    parser.add_argument("--polar-ns-steps", type=int, default=5)
-    parser.add_argument("--projected-grad-clip-norm", type=float, default=0.0, help="per-matrix projected-gradient norm clip before the projected moment update; 0 disables. OFF now: raw-grad clipping (--grad-clip-norm) bounds the gradient upstream of adafactor/projection, which makes this downstream moment-only clip redundant (and it could not stop a blip from poisoning adafactor's second moment anyway -- that damage is upstream). Re-enable only if a specific moment-scale failure reappears.")
-    parser.add_argument("--projected-grad-clip-ratio", type=float, default=0.0, help="per-matrix projected-gradient/moment norm ratio clip before the projected moment update; 0 disables. adafactor_ema's projected-grad norm is stable so this rail is unnecessary there; --moment-mode ema needs it re-enabled, e.g. 6.0")
+    parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for the full-gradient row/column factored second moment")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="clip the raw gradient per tensor before Adafactor, Oja, and projection; 0 disables")
+    parser.add_argument("--basis-update-interval", type=int, default=1, help="basis geodesic cadence in matrix optimizer steps; phase-one conditioning and projected EMA still run every step")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="model gradient checkpointing; default ON (bs16@seq1024 OOMs a 12GB card without it); --no-activation-checkpointing to disable")
     parser.add_argument(
         "--torch-compile",
@@ -1714,7 +1446,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    validate_projected_activation_contract(args)
     validate_gradient_release_contract(args)
 
     if args.warmup_steps < 0:
@@ -1757,22 +1488,12 @@ def main() -> None:
         raise ValueError("lora_alpha must be positive")
     if args.lora_grad_clip_norm <= 0:
         raise ValueError("lora_grad_clip_norm must be positive")
-    if args.basis_refresh_interval <= 0:
-        raise ValueError("basis_refresh_interval must be positive")
-    if args.projected_grad_clip_norm < 0:
-        raise ValueError("projected_grad_clip_norm must be non-negative")
-    if args.projected_grad_clip_ratio < 0:
-        raise ValueError("projected_grad_clip_ratio must be non-negative")
+    if args.basis_update_interval <= 0:
+        raise ValueError("basis_update_interval must be positive")
     if args.lr_warmup_steps < 0:
         raise ValueError("lr_warmup_steps must be non-negative")
     if not 0 <= args.adafactor_beta2 < 1:
         raise ValueError("adafactor_beta2 must be in [0, 1)")
-    if args.moment_mode == "adafactor_ema" and args.projected_activation_backend != "off":
-        raise ValueError("--moment-mode adafactor_ema dampens the full gradient before projection and is incompatible with --projected-activation-backend")
-    if args.aurora_pp_iterations <= 0:
-        raise ValueError("aurora_pp_iterations must be positive")
-    if not 1 <= args.polar_ns_steps <= 5:
-        raise ValueError("polar_ns_steps must be in [1, 5]")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -1835,10 +1556,9 @@ def main() -> None:
         f"warmup_steps={args.warmup_steps} max_steps={args.max_steps} param_scope={args.param_scope} "
         f"rank={args.rank} projection_side_policy={args.projection_side_policy} "
         f"lora_rank={args.lora_rank} lora_alpha={args.lora_alpha} lora_lr={args.lora_lr} lora_grad_clip_norm={args.lora_grad_clip_norm} "
-        f"basis_init={args.basis_init} grassmann_aim={args.grassmann_aim} oja_step_schedule={args.oja_step_schedule} "
-        f"boundary_ablation_refresh_interval={args.basis_refresh_interval} boundary_ablation_refresh_schedule={args.basis_refresh_schedule} "
+        f"basis_update_interval={args.basis_update_interval} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
-        f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
+        f"orthogonalization=aurora "
         f"activation_checkpointing={args.activation_checkpointing} torch_compile={'decoder_layer' if args.torch_compile else 'off'} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce release_matrix_grads={args.release_matrix_grads} trace_backward_memory={args.trace_backward_memory} "
         f"skip_validation={args.skip_validation} eval_every={args.eval_every} "

@@ -187,7 +187,7 @@ Packed four-bit state does not imply four-bit optimizer arithmetic. RTX 4070
 SUPER (Ada, SM 8.9) already supports signed/unsigned INT4 tensor-core MMA; RTX
 5080 (Blackwell, SM 12.0) supports INT4 and additionally native FP4 tensor-core
 formats. Neither generation automatically accelerates this codec: packing,
-scaling, elementwise EMA, basis refresh, and Aurora are not an eligible INT4 GEMM
+scaling, elementwise EMA, basis updates, and Aurora are not an eligible INT4 GEMM
 merely because state is stored in nibbles. A specialized kernel and compatible
 layout would be required. Therefore the product gate is measured codec walltime
 and memory traffic on the target GPU, not advertised low-bit tensor-core TOPS.
@@ -267,20 +267,19 @@ Read the quantization-induced noise floor in:
 - one-step error versus accumulated drift.
 
 This stage decides whether low precision merely adds bounded observation noise or
-changes the Oja tracker and moving-frame history semantics.
+changes the basis tracker and moving-frame history semantics.
 
 ### E. Faithful training
 
 Only geometry survivors enter the default right-padded no-mask SYNTH lane on
 `LiquidAI/LFM2.5-350M-Base`, broad no-embedding scope, rank `128`, residual-facing
-projection, per-gradient Oja, CCE, and the current compile policy. Change only the
-state codec. The retained interval `10` is an EIGH/tangent ablation control and is
-inert under this default lane.
+projection, per-gradient basis updates, CCE, and the current compile policy.
+Change only the state codec. Any non-default `basis_update_interval` is a separate
+cadence experiment, not a quantization variable.
 
 Read target loss and source retention beside pre-Aurora moment health, Aurora
 output agreement where affordable, lifted update/parameter ratio, state bytes,
-peak allocated VRAM, tokens/sec, and per-gradient tracker walltime. Explicit EIGH
-comparators additionally separate boundary from non-boundary cost. Loss parity is
+peak allocated VRAM, tokens/sec, and per-gradient tracker walltime. Loss parity is
 judged against matched bf16 run noise, not an invented decimal threshold.
 
 The first training table contains only offline survivors and their direct
@@ -314,8 +313,9 @@ Hadamard flattening to help. The outlier capture, not taste, decides both.
   row/column variances, or fallback AdamW state;
 - ECC, parameter ECC, or bit-corruption protection;
 - adding error-feedback machinery before plain low-bit storage is shown useful;
-- changing tracking aim, refresh cadence, Adafactor conditioning, Aurora, Muon
-  scale, rank allocation, or benchmark formatting;
+- changing the selected basis-tracking mechanism, `basis_update_interval`,
+  Adafactor conditioning, Aurora, Muon scale, rank allocation, or benchmark
+  formatting;
 - kernel work before a quality-preserving storage format exists;
 - importing Comfy model classification, inference GEMM, or MSE-clipping policy.
 

@@ -170,11 +170,12 @@ The car holds a four-wheel slide through the whole spectrum. Each principal plan
 turns by its own angle. The cutoff planes dance; the stable planes pull. The line
 emerges from their argument.
 
-That controller remains in the notebook as the boundary EIGH test car. The road
-car now reads every full contact patch: one-state Oja turns the same live frame a
-fixed hundredth-step along its covariance tangent, through every tracked plane,
-then squares the chassis with a Polar Express correction. No second frame rides
-along. The quarter-turn boundary controls belong to the test car, not this one.
+That controller remains historical evidence, not a current test car. The road car
+conditions every full contact patch, forms an Oja covariance tangent in the held
+frame, and moves the same live frame by harmonic basis-update steps `1, 1/2,
+1/3, ...` through every tracked plane before a Polar Express correction. No second
+frame rides along. The quarter-turn boundary controls belong to the old test car,
+not this one.
 
 ---
 
