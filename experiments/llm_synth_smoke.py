@@ -1121,21 +1121,26 @@ def validate_gradient_release_contract(args) -> None:
 
 
 def maybe_compile_training_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
-    """Compile the module that the CCE training loss actually calls.
+    """Compile decoder layers independently while leaving their outer loop eager.
 
     `cce_causal_lm_loss()` bypasses the CausalLM wrapper and calls the inner
-    base model plus `lm_head` directly to avoid materializing full logits. If we
-    only compile the outer wrapper, the hot transformer path remains eager.
+    base model directly. Keeping that base model eager makes each compiled layer
+    a separate AOTAutograd region, so released matrix gradients need not wait for
+    one whole-model compiled backward to return.
     """
 
     if not enabled:
         return model
     base = getattr(model, "model", None)
-    lm_head = getattr(model, "lm_head", None)
-    if isinstance(base, torch.nn.Module) and isinstance(lm_head, torch.nn.Module):
-        model.model = torch.compile(base)  # type: ignore[assignment]
-        return model
-    return torch.compile(model)
+    if not isinstance(base, torch.nn.Module):
+        raise RuntimeError("regional compilation requires a causal LM with a .model module")
+    layers = getattr(base, "layers", None)
+    if not isinstance(layers, torch.nn.ModuleList) or not layers:
+        raise RuntimeError("regional compilation requires a causal LM with a nonempty .model.layers ModuleList")
+    for layer in layers:
+        layer.compile()
+    setattr(base, "_usuitrack_compiled_layer_count", len(layers))
+    return model
 
 
 def run_optimizer(
@@ -1399,6 +1404,7 @@ def run_optimizer(
     fallback_state_bytes = optimizer_state_bytes_by_category(fallback_optimizer)["total"] if fallback_optimizer is not None else state_bytes["fallback"]
     matrix_state_bytes = state_bytes["matrix"]
     total_state_bytes = matrix_state_bytes + fallback_state_bytes if optimizer_name == "usuitrack" else state_bytes["total"]
+    compiled_layer_count = int(getattr(getattr(model, "model", None), "_usuitrack_compiled_layer_count", 0))
     result = {
         "optimizer": optimizer_name,
         "projection_side_policy": args.projection_side_policy if optimizer_name == "usuitrack" else "n/a",
@@ -1426,6 +1432,8 @@ def run_optimizer(
         "fallback_state_dtype": "fp32" if optimizer_name == "usuitrack" and fallback_params else "n/a",
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
+        "compile_scope": "decoder_layer" if args.torch_compile else "off",
+        "compiled_layer_count": compiled_layer_count,
         "attn_implementation": getattr(getattr(model, "config", None), "_attn_implementation", "n/a"),
         "batching": args.batching,
         "loss_impl": "cce",
@@ -1540,7 +1548,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--torch-compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="compile the model forward/backward and UsuiTrack tensor kernels with torch.compile (default on); the Python optimizer step remains eager",
+        help="compile each decoder layer independently plus UsuiTrack tensor kernels with torch.compile (default on); the outer model loop and Python optimizer orchestration remain eager",
     )
     parser.add_argument("--attn-implementation", default="sdpa", help="Transformers attention implementation; local default is sdpa until real flash kernels are available")
     parser.add_argument("--skip-validation", action="store_true", help="skip initial/final validation for throughput-only runs")
@@ -1693,7 +1701,7 @@ def main() -> None:
         f"boundary_ablation_refresh_interval={args.basis_refresh_interval} boundary_ablation_refresh_schedule={args.basis_refresh_schedule} "
         f"lr_warmup_steps={args.lr_warmup_steps} "
         f"orthogonalization=aurora aurora_pp_iterations={args.aurora_pp_iterations} polar_ns_steps={args.polar_ns_steps} "
-        f"activation_checkpointing={args.activation_checkpointing} torch_compile={args.torch_compile} attn_implementation={args.attn_implementation or 'default'} "
+        f"activation_checkpointing={args.activation_checkpointing} torch_compile={'decoder_layer' if args.torch_compile else 'off'} attn_implementation={args.attn_implementation or 'default'} "
         f"batching={args.batching} loss_impl=cce release_matrix_grads={args.release_matrix_grads} trace_backward_memory={args.trace_backward_memory} "
         f"skip_validation={args.skip_validation} eval_every={args.eval_every} "
         f"final_sample={args.final_sample} final_sample_max_seq_len={args.final_sample_max_seq_len} "

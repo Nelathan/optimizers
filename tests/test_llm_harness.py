@@ -2,12 +2,13 @@ import math
 import sys
 import types
 import unittest
+from unittest import mock
 
 import torch
 
 from usuitrack import UsuiTrack
 
-from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FALLBACK_LR_RATIO, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
+from experiments.llm_synth_smoke import BackwardMemoryTrace, DEFAULT_MODEL, DEFAULT_SOURCE_HF_DATASET, FALLBACK_LR_RATIO, FP32StateAdamW, build_parser, build_usuitrack_param_groups, install_projected_activation_backend, maybe_compile_training_model, packed_text_limit, partition_usuitrack_params, projected_activation_param_ids, repair_lfm2_gradient_checkpointing, select_trainable_params, validate_gradient_release_contract, validate_projected_activation_contract, wandb_log
 from experiments.llm_synth_smoke import cce_causal_lm_loss, gradient_norm_statistics, make_packed_batches, make_right_padded_batches, synth_masked_examples
 
 
@@ -98,6 +99,26 @@ class TinyLfmForCausalLM(torch.nn.Module):
 
 
 class LlmHarnessParamScopeTest(unittest.TestCase):
+    def test_compile_training_model_compiles_layers_in_place_only(self):
+        model = TinyLfmForCausalLM()
+        compiled = []
+
+        def record_compile(layer, *args, **kwargs):
+            compiled.append(layer)
+
+        with mock.patch.object(torch.nn.Module, "compile", autospec=True, side_effect=record_compile):
+            returned = maybe_compile_training_model(model, True)
+
+        self.assertIs(returned, model)
+        self.assertEqual(compiled, list(model.model.layers))
+        self.assertEqual(model.model._usuitrack_compiled_layer_count, 2)
+
+    def test_compile_training_model_disabled_leaves_layers_eager(self):
+        model = TinyLfmForCausalLM()
+
+        self.assertIs(maybe_compile_training_model(model, False), model)
+        self.assertFalse(hasattr(model.model, "_usuitrack_compiled_layer_count"))
+
     def test_usuitrack_partition_leaves_only_matrices_in_matrix_optimizer(self):
         model = TinyTopology()
         named = [(name, param) for name, param in model.named_parameters()]
