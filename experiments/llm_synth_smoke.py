@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import math
 import sys
 import time
 import types
@@ -17,9 +16,17 @@ import torch
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Measure the optimizer we actually ship. `usuitrack-release` symlinks the
+# release repo, whose package directory shadows this repo's own `usuitrack/`
+# because it goes on sys.path first. Without this the harness silently measured
+# a fork: the lab copy has no rank cap and no stochastic rounding, so a rank-128
+# run here would not have been the same optimizer a user gets.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "usuitrack-release"))
 
-from usuitrack import UsuiTrack, optimizer_state_bytes_by_category
+from usuitrack import StochasticAdamW, SubspaceProjector, UsuiTrack, optimizer_state_bytes_by_category
+
+if "usuitrack-release" not in sys.modules["usuitrack"].__file__:
+    raise RuntimeError(f"expected the released UsuiTrack, imported {sys.modules['usuitrack'].__file__}")
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-350M-Base"
@@ -34,56 +41,6 @@ BatchingMode = Literal["eos_packed_no_mask", "synth_right_padded_no_mask"]
 DatasetFormat = Literal["auto", "synth", "profile_text", "text"]
 SYNTH_DIVIDER = "\n---\n"
 PROFILE_TEXT_DIVIDER = "\n\n---\n\n"
-
-
-class FP32StateAdamW(torch.optim.Optimizer):
-    """AdamW for the small fallback set, with moments kept in fp32."""
-
-    def __init__(self, params, *, lr: float, betas=(0.9, 0.99), eps: float = 1e-8, weight_decay: float = 0.0):
-        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            for param in group["params"]:
-                grad = param.grad
-                if grad is None:
-                    continue
-                if grad.is_sparse:
-                    raise RuntimeError("FP32StateAdamW does not support sparse gradients")
-                state = self.state[param]
-                if not state:
-                    state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
-                    state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-                torch.optim._functional.adamw(
-                    [param],
-                    [grad.detach().float()],
-                    [state["exp_avg"]],
-                    [state["exp_avg_sq"]],
-                    [],
-                    [state["step"]],
-                    foreach=False,
-                    capturable=False,
-                    differentiable=False,
-                    fused=False,
-                    grad_scale=None,
-                    found_inf=None,
-                    has_complex=False,
-                    amsgrad=False,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    eps=group["eps"],
-                    maximize=False,
-                )
-        return loss
 
 
 @dataclass(frozen=True)
@@ -245,19 +202,6 @@ def gradient_norm_statistics(
     return norms.norm(), norms.median(), clipped_fraction
 
 
-def optimizer_update_norm(optimizer: torch.optim.Optimizer) -> float | None:
-    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
-    if not diagnostics:
-        return None
-    value = diagnostics.get("update_norm")
-    return float(value) if value is not None else None
-
-
-@torch.no_grad()
-def parameter_delta_norm(params: Sequence[torch.nn.Parameter], before: Sequence[torch.Tensor]) -> torch.Tensor:
-    return tensor_global_norm(param.detach().float() - old.float() for param, old in zip(params, before, strict=True))
-
-
 def scalar(value: float | int | torch.Tensor) -> float:
     if isinstance(value, (float, int)):
         return float(value)
@@ -282,20 +226,17 @@ def last_finite_scalar(values: list[float | int | torch.Tensor | None]) -> float
     return float("nan")
 
 
-def optimizer_rotation_angle(optimizer: torch.optim.Optimizer) -> float | None:
-    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
-    if not diagnostics:
-        return None
-    value = diagnostics.get("mean_rotation_angle")
-    return float(value) if value is not None else None
+def pop_optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    """Drain UsuiTrack's telemetry for the interval since the last read.
 
+    Accumulated every step and read here, so a logged point is the mean over the
+    whole logging interval rather than a sample of one step -- smooth lines
+    without an EMA laid over noise. Duck-typed: an optimizer without the method
+    contributes nothing.
+    """
 
-def optimizer_diagnostic(optimizer: torch.optim.Optimizer, key: str) -> float | None:
-    diagnostics = getattr(optimizer, "last_step_diagnostics", None)
-    if not diagnostics:
-        return None
-    value = diagnostics.get(key)
-    return float(value) if value is not None else None
+    pop = getattr(optimizer, "pop_diagnostics", None)
+    return {f"opt/{key}": value for key, value in pop().items()} if pop is not None else {}
 
 
 def parquet_table_to_texts(table, dataset_format: DatasetFormat = "auto") -> list[str]:
@@ -622,7 +563,7 @@ def build_usuitrack_param_groups(
         side = storage_side_for_residual_axis(role, projection_side_policy)
         grouped.setdefault(side, []).append(param)
         if param.ndim == 2:
-            effective_rank = min(rank, *param.shape)
+            effective_rank = SubspaceProjector(rank=rank, side=side).effective_rank(param)
             policy_stats["effective_rank_min"] = effective_rank if not policy_stats["effective_rank_min"] else min(policy_stats["effective_rank_min"], effective_rank)
             policy_stats["effective_rank_max"] = max(policy_stats["effective_rank_max"], effective_rank)
             policy_stats[f"side_policy_{side}_tensors"] += 1
@@ -855,7 +796,6 @@ def train_step(
     grad_accum_steps: int,
     grad_clip_norm: float,
     collect_norms: bool,
-    collect_basis: bool,
     fallback_optimizer: torch.optim.Optimizer | None = None,
     fallback_params: Sequence[torch.nn.Parameter] = (),
     consume_fallback_grads: bool = True,
@@ -864,14 +804,6 @@ def train_step(
     global_clip_params: Sequence[torch.nn.Parameter] = (),
     global_clip_norm: float | None = None,
 ) -> dict[str, float | torch.Tensor | None]:
-    if hasattr(optimizer, "diagnostics_enabled"):
-        optimizer.diagnostics_enabled = collect_norms or collect_basis
-    if hasattr(optimizer, "diagnostics_leverage_enabled"):
-        optimizer.diagnostics_leverage_enabled = False
-    if hasattr(optimizer, "diagnostics_basis_enabled"):
-        optimizer.diagnostics_basis_enabled = collect_basis
-    if hasattr(optimizer, "diagnostics_aurora_health_enabled"):
-        optimizer.diagnostics_aurora_health_enabled = collect_norms
     optimizer.zero_grad(set_to_none=True)
     if fallback_optimizer is not None:
         fallback_optimizer.zero_grad(set_to_none=True)
@@ -904,8 +836,6 @@ def train_step(
     if global_clip_norm is not None:
         torch.nn.utils.clip_grad_norm_(global_clip_params, global_clip_norm)
     param_norm = parameter_norm(trainable) if collect_norms else float("nan")
-    has_primary_update_diagnostics = hasattr(optimizer, "diagnostics_enabled")
-    fallback_before = [param.detach().clone() for param in fallback_params] if collect_norms and fallback_optimizer is not None and has_primary_update_diagnostics else []
     optimizer.step()
     if fallback_optimizer is not None:
         fallback_optimizer.step()
@@ -914,41 +844,12 @@ def train_step(
                 param.grad = None
     if sensors is not None:
         sensors.mark("optimizer")
-    if collect_norms:
-        matrix_update_norm = optimizer_update_norm(optimizer)
-        fallback_update_norm = parameter_delta_norm(fallback_params, fallback_before) if fallback_before else None
-        if matrix_update_norm is None:
-            update_norm = None
-        elif fallback_update_norm is None:
-            update_norm = matrix_update_norm
-        else:
-            update_norm = math.sqrt(matrix_update_norm**2 + scalar(fallback_update_norm) ** 2)
-    else:
-        update_norm = float("nan")
-    projected_grad_norm = optimizer_diagnostic(optimizer, "mean_projected_grad_norm") if collect_norms else float("nan")
-    projected_grad_to_moment_ratio = optimizer_diagnostic(optimizer, "mean_projected_grad_to_moment_ratio") if collect_norms else float("nan")
-    rotation_angle = optimizer_rotation_angle(optimizer) if collect_basis else float("nan")
-    basis_capture = optimizer_diagnostic(optimizer, "mean_basis_capture") if collect_norms else float("nan")
-    aurora_alignment = optimizer_diagnostic(optimizer, "mean_aurora_alignment") if collect_norms else float("nan")
-    moment_erank = optimizer_diagnostic(optimizer, "mean_aurora_erank") if collect_norms else float("nan")
-    moment_erank_pct = optimizer_diagnostic(optimizer, "mean_aurora_erank_pct") if collect_norms else float("nan")
-    param_norm_scalar = scalar(param_norm) if collect_norms else float("nan")
-    update_to_param_ratio = update_norm / param_norm_scalar if update_norm is not None and param_norm_scalar > 0 else None
     result = {
         "loss": torch.stack(losses).mean(),
         "grad_norm": grad_norm,
         "grad_norm_median_tensor": grad_norm_median_tensor,
         "grad_clip_fraction": grad_clip_fraction,
         "param_norm": param_norm,
-        "update_norm": update_norm,
-        "update_to_param_ratio": update_to_param_ratio,
-        "projected_grad_norm": projected_grad_norm,
-        "projected_grad_to_moment_ratio": projected_grad_to_moment_ratio,
-        "basis_rotation_angle": rotation_angle,
-        "basis_capture": basis_capture,
-        "aurora_alignment": aurora_alignment,
-        "moment_erank": moment_erank,
-        "moment_erank_pct": moment_erank_pct,
     }
     if sensors is not None:
         for phase, reading in sensors.readings.items():
@@ -1065,15 +966,17 @@ def run_optimizer(
             usuitrack_param_groups,
             lr=args.usuitrack_lr,
             beta=args.beta,
-            adafactor_beta2=args.adafactor_beta2,
-            grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
+            grad_clip_norm=args.grad_clip_norm,
             basis_update_interval=args.basis_update_interval,
             consume_grad=not args.keep_grads_after_step,
             release_matrix_grads=args.release_matrix_grads,
             compile_tensor_kernels=args.torch_compile,
         )
+        # Accumulated every step and drained on the logging cadence, so each
+        # logged point is the interval's mean rather than one sampled step.
+        optimizer.diagnostics_enabled = True
         if fallback_params:
-            fallback_optimizer = FP32StateAdamW(
+            fallback_optimizer = StochasticAdamW(
                 fallback_params,
                 lr=fallback_lr,
                 betas=(0.9, 0.99),
@@ -1097,7 +1000,7 @@ def run_optimizer(
             fused=device.type == "cuda",
         )
         if fallback_params:
-            fallback_optimizer = FP32StateAdamW(
+            fallback_optimizer = StochasticAdamW(
                 fallback_params,
                 lr=fallback_lr,
                 betas=(0.9, 0.99),
@@ -1124,6 +1027,7 @@ def run_optimizer(
     )
     measured_steps = []
     loss_window = []
+    last_diagnostics: dict[str, float] = {}
     last_eval_val = float("nan")
 
     for step in range(args.warmup_steps):
@@ -1139,7 +1043,6 @@ def run_optimizer(
             batch_index,
             args.grad_accum_steps,
             args.grad_clip_norm,
-            False,
             False,
             fallback_optimizer,
             fallback_params,
@@ -1164,7 +1067,6 @@ def run_optimizer(
         should_log_train = args.wandb_log_every > 0 and global_step % args.wandb_log_every == 0
         should_eval = args.eval_every > 0 and global_step % args.eval_every == 0
         collect_norms = should_log_train
-        collect_basis = should_log_train
         step_result = train_step(
             model,
             optimizer,
@@ -1174,7 +1076,6 @@ def run_optimizer(
             args.grad_accum_steps,
             args.grad_clip_norm,
             collect_norms,
-            collect_basis,
             fallback_optimizer,
             fallback_params,
             not args.keep_grads_after_step,
@@ -1194,19 +1095,11 @@ def run_optimizer(
                 "train/grad_norm": scalar(step_result["grad_norm"]),
                 "train/grad_norm_median_tensor": scalar(step_result["grad_norm_median_tensor"]),
                 "train/grad_clip_fraction": scalar_or_none(step_result["grad_clip_fraction"]),
-                "train/update_norm": scalar_or_none(step_result["update_norm"]),
-                "train/update_to_param_ratio": scalar_or_none(step_result["update_to_param_ratio"]),
-                "opt/projected_grad_norm": scalar_or_none(step_result["projected_grad_norm"]),
-                "opt/projected_grad_to_moment_ratio": scalar_or_none(step_result["projected_grad_to_moment_ratio"]),
-                "opt/basis_capture": scalar_or_none(step_result["basis_capture"]),
-                "opt/aurora_alignment": scalar_or_none(step_result["aurora_alignment"]),
-                "opt/moment_erank": scalar_or_none(step_result["moment_erank"]),
-                "opt/moment_erank_pct": scalar_or_none(step_result["moment_erank_pct"]),
+                "train/param_norm": scalar_or_none(step_result["param_norm"]),
                 "train/lr": optimizer.param_groups[0]["lr"],
             }
-            rotation_angle = scalar_or_none(step_result["basis_rotation_angle"])
-            if rotation_angle is not None and rotation_angle == rotation_angle:
-                train_metrics["opt/basis_rotation_angle"] = rotation_angle
+            last_diagnostics = pop_optimizer_diagnostics(optimizer)
+            train_metrics.update(last_diagnostics)
             wandb_log(
                 wandb_run,
                 train_metrics,
@@ -1275,15 +1168,6 @@ def run_optimizer(
     measured_losses = [step["loss"] for step in measured_steps]
     measured_grad_norms = [step["grad_norm"] for step in measured_steps]
     measured_param_norms = [step["param_norm"] for step in measured_steps]
-    measured_update_norms = [step["update_norm"] for step in measured_steps]
-    measured_update_to_param_ratios = [step["update_to_param_ratio"] for step in measured_steps]
-    measured_projected_grad_norms = [step["projected_grad_norm"] for step in measured_steps]
-    measured_projected_grad_to_moment_ratios = [step["projected_grad_to_moment_ratio"] for step in measured_steps]
-    measured_basis_rotation_angles = [step["basis_rotation_angle"] for step in measured_steps]
-    measured_basis_capture = [step["basis_capture"] for step in measured_steps]
-    measured_aurora_alignment = [step["aurora_alignment"] for step in measured_steps]
-    measured_moment_erank = [step["moment_erank"] for step in measured_steps]
-    measured_moment_erank_pct = [step["moment_erank_pct"] for step in measured_steps]
     state_bytes = optimizer_state_bytes_by_category(optimizer)
     fallback_state_bytes = optimizer_state_bytes_by_category(fallback_optimizer)["total"] if fallback_optimizer is not None else state_bytes["fallback"]
     adapter_param_bytes = sum(param.numel() * param.element_size() for _name, param in adapter_named)
@@ -1314,7 +1198,15 @@ def run_optimizer(
         "consume_grad": (not args.keep_grads_after_step) if optimizer_name == "usuitrack" else False,
         "release_matrix_grads": args.release_matrix_grads if optimizer_name == "usuitrack" else False,
         "fallback_lr": fallback_lr if optimizer_name in {"usuitrack", "lora"} and fallback_params else 0.0,
-        "fallback_state_dtype": "fp32" if optimizer_name in {"usuitrack", "lora"} and fallback_params else "n/a",
+        # StochasticAdamW dispatches per parameter: bf16 parameters get bf16
+        # moments accumulated in fp32 and written back stochastically, fp32
+        # parameters get plain fp32 state. So this reports what the fallback set
+        # actually holds rather than a single assumed dtype.
+        "fallback_state_dtype": (
+            "/".join(sorted({str(param.dtype).removeprefix("torch.") for param in fallback_params}))
+            if optimizer_name in {"usuitrack", "lora"} and fallback_params
+            else "n/a"
+        ),
         "activation_checkpointing": args.activation_checkpointing,
         "torch_compile": args.torch_compile,
         "compile_scope": "decoder_layer" if args.torch_compile else "off",
@@ -1340,15 +1232,7 @@ def run_optimizer(
         "last_measured_train_loss": scalar(measured_losses[-1]),
         "last_logged_grad_norm": last_finite_scalar(measured_grad_norms),
         "last_logged_param_norm": last_finite_scalar(measured_param_norms),
-        "last_logged_update_norm": last_finite_scalar(measured_update_norms),
-        "last_logged_update_to_param_ratio": last_finite_scalar(measured_update_to_param_ratios),
-        "last_logged_projected_grad_norm": last_finite_scalar(measured_projected_grad_norms),
-        "last_logged_projected_grad_to_moment_ratio": last_finite_scalar(measured_projected_grad_to_moment_ratios),
-        "last_logged_basis_rotation_angle": last_finite_scalar(measured_basis_rotation_angles),
-        "last_logged_basis_capture": last_finite_scalar(measured_basis_capture),
-        "last_logged_aurora_alignment": last_finite_scalar(measured_aurora_alignment),
-        "last_logged_moment_erank": last_finite_scalar(measured_moment_erank),
-        "last_logged_moment_erank_pct": last_finite_scalar(measured_moment_erank_pct),
+        **{f"last_logged_{key.removeprefix('opt/')}": value for key, value in last_diagnostics.items()},
         "measured_elapsed_seconds": measured_elapsed,
         "measured_train_elapsed_seconds": training_elapsed,
         "measured_eval_elapsed_seconds": eval_elapsed,
@@ -1402,9 +1286,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-grad-clip-norm", type=float, default=1.0, help="global gradient clip for LoRA adapter parameters")
     parser.add_argument("--lr-warmup-steps", type=int, default=50, help="linearly ramp optimizer learning rates over this many optimizer steps; 0 disables")
     parser.add_argument("--beta", type=float, default=0.95)
-    parser.add_argument("--adafactor-beta2", type=float, default=0.99, help="EMA beta for the full-gradient row/column factored second moment")
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="clip the raw gradient per tensor before Adafactor, Oja, and projection; 0 disables")
-    parser.add_argument("--basis-update-interval", type=int, default=1, help="basis geodesic cadence in matrix optimizer steps; phase-one conditioning and projected EMA still run every step")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="clip the raw gradient per tensor before Adafactor, Oja, and projection; must be positive for usuitrack, where the clip protects Adafactor's second-moment memory and has no off switch")
+    parser.add_argument("--basis-update-interval", type=int, default=1, help="basis geodesic cadence in matrix optimizer steps; the held-frame projection and projected EMA still run every step")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="model gradient checkpointing; default ON (bs16@seq1024 OOMs a 12GB card without it); --no-activation-checkpointing to disable")
     parser.add_argument(
         "--torch-compile",
@@ -1486,14 +1369,14 @@ def main() -> None:
         raise ValueError("lora_rank must be positive")
     if args.lora_alpha <= 0:
         raise ValueError("lora_alpha must be positive")
+    if args.grad_clip_norm <= 0 and "usuitrack" in args.optimizers:
+        raise ValueError("usuitrack requires a positive --grad-clip-norm; the raw clip guards Adafactor's second-moment memory and cannot be disabled")
     if args.lora_grad_clip_norm <= 0:
         raise ValueError("lora_grad_clip_norm must be positive")
     if args.basis_update_interval <= 0:
         raise ValueError("basis_update_interval must be positive")
     if args.lr_warmup_steps < 0:
         raise ValueError("lr_warmup_steps must be non-negative")
-    if not 0 <= args.adafactor_beta2 < 1:
-        raise ValueError("adafactor_beta2 must be in [0, 1)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
